@@ -506,7 +506,7 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
     away_score = play.get("away_score", 0)
     type_text_lower = type_text.lower()
 
-    is_kickoff = "kickoff" in type_text_lower
+    is_kickoff = "kickoff" in type_text_lower and "return" not in type_text_lower
     if is_kickoff:
         possession = away_team_display if drive_team_id == home_team_id else home_team_display
     elif drive_team_id == home_team_id:
