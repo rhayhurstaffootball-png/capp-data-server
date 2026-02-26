@@ -444,6 +444,8 @@ def _infer_missing_pats(all_plays):
                 play["point_after_attempt"] = {"text": "Extra Point Good", "value": 1}
             elif delta == 8:
                 play["point_after_attempt"] = {"text": "Two-Point Conversion", "value": 2}
+            elif delta == 6:
+                play["point_after_attempt"] = {"text": "Extra Point Attempt - No Good", "value": 0}
         prev_home = curr_home
         prev_away = curr_away
 
