@@ -423,6 +423,31 @@ def apply_scoreboard_lag(entries, initial_home=0, initial_away=0):
 # Play Parsing
 # ============================================================
 
+def _infer_missing_pats(all_plays):
+    """
+    For TD plays with no embedded PAT data, infer the result from the
+    score jump on that play vs the previous play and inject a synthetic
+    point_after_attempt so map_espn_play() can generate the EP/2PT row.
+
+    Score jumped by 7 = EP good, 8 = 2PT good, 6 = EP missed (no row needed).
+    """
+    prev_home = 0
+    prev_away = 0
+    for play in all_plays:
+        curr_home = play.get("home_score", 0)
+        curr_away = play.get("away_score", 0)
+        if play.get("score_value") == 6 and play.get("point_after_attempt") is None:
+            home_delta = curr_home - prev_home
+            away_delta = curr_away - prev_away
+            delta = max(home_delta, away_delta)
+            if delta == 7:
+                play["point_after_attempt"] = {"text": "Extra Point Good", "value": 1}
+            elif delta == 8:
+                play["point_after_attempt"] = {"text": "Two-Point Conversion", "value": 2}
+        prev_home = curr_home
+        prev_away = curr_away
+
+
 def _parse_play(play, drive_team_id, home_team_id, away_team_id):
     play_id = str(play.get("id", ""))
     if not play_id:
@@ -777,6 +802,9 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
                 all_plays.append(parsed)
 
     all_plays.sort(key=lambda p: p.get("sequence_number", 0))
+
+    # Infer missing PAT data from score jumps
+    _infer_missing_pats(all_plays)
 
     # Fix clocks, estimate snap times
     fix_clock_anomalies(all_plays)
