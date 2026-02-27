@@ -533,7 +533,18 @@ def _qc_flag_entries(entries, home_name, away_name):
                 # If the +6 delta lands on a KO entry the missing EP belongs to
                 # the preceding TD — flag that row so the red highlight appears
                 # on the TD play, not the kickoff.
-                flag_idx = i - 1 if n1 == "KO" and i > 0 else i
+                if n1 == "KO" and i > 0:
+                    flag_idx = i - 1
+                elif str(entries[i - 1].get("down", "")) == "KO" and i >= 2:
+                    # +6 appeared right after a KO. If that KO opened a new
+                    # period (different quarter than the play before it), the
+                    # score jump is from end-of-period plays filtered by the
+                    # pipeline — not a missing EP we can reliably detect here.
+                    if entries[i - 1].get("quarter", 0) != entries[i - 2].get("quarter", 0):
+                        continue
+                    flag_idx = i
+                else:
+                    flag_idx = i
                 flags.setdefault(flag_idx, []).append("Missing EP after TD")
 
     return {idx: " · ".join(msgs) for idx, msgs in flags.items()}
