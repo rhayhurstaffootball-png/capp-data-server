@@ -56,6 +56,8 @@ ESPN_NAME_OVERRIDES = {
     "Southern Miss Golden Eagles": "Southern Miss",
     "Southern Mississippi Golden Eagles": "Southern Miss",
     "TCU Horned Frogs": "TCU",
+    "Texas Christian Horned Frogs": "TCU",
+    "Texas Christian": "TCU",
     "UAB Blazers": "UAB",
     "UCF Knights": "UCF",
     "UCLA Bruins": "UCLA",
@@ -420,8 +422,115 @@ def apply_scoreboard_lag(entries, initial_home=0, initial_away=0):
     return prev_home, prev_away
 
 # ============================================================
+# QC Flagging
+# ============================================================
+
+_QC_VALID_POS    = {0, 1, 2, 3, 6, 7, 8}   # valid positive score deltas
+_QC_BUNDLED_ART  = {-7, -8}                 # lag mirrors of bundled TD+EP — skip
+_QC_STUCK_THRESH = 4
+
+def _qc_flag_entries(entries, home_name, away_name):
+    """
+    Run QC checks on fully mapped + lagged entries.
+    Returns {play_index: "short description"} for plays that have issues
+    our pipeline could NOT automatically fix.
+    Clean plays are absent from the dict (not returned as empty string here;
+    caller sets entry["qc_issue"] = flags.get(i, "")).
+    """
+    flags = {}   # {play_index: [msg, ...]}
+
+    # Score jumps
+    for i in range(1, len(entries)):
+        hd = entries[i]["home_score"] - entries[i - 1]["home_score"]
+        ad = entries[i]["away_score"] - entries[i - 1]["away_score"]
+        for delta in (hd, ad):
+            if delta == 0 or delta in _QC_BUNDLED_ART:
+                continue
+            if delta < 0:
+                flags.setdefault(i, []).append(f"Score dropped {delta}")
+            elif delta not in _QC_VALID_POS:
+                flags.setdefault(i, []).append(f"Score jumped +{delta}")
+
+    # Stuck clock (4+ consecutive same clock in same quarter, non-special down)
+    streak = 1
+    for i in range(1, len(entries)):
+        c, p = entries[i], entries[i - 1]
+        if (c.get("clock") == p.get("clock")
+                and c.get("quarter") == p.get("quarter")
+                and str(c.get("down", "")) not in ("KO", "EP", "2PT")):
+            streak += 1
+            if streak == _QC_STUCK_THRESH:
+                flags.setdefault(i, []).append(f"Clock stuck ({streak}+ plays)")
+        else:
+            streak = 1
+
+    # Missing EP — only fires when _infer_missing_pats also failed
+    for i in range(1, len(entries)):
+        hd = entries[i]["home_score"] - entries[i - 1]["home_score"]
+        ad = entries[i]["away_score"] - entries[i - 1]["away_score"]
+        if hd == 6 or ad == 6:
+            n1 = str(entries[i].get("down", ""))
+            n2 = str(entries[i + 1].get("down", "")) if i + 1 < len(entries) else ""
+            if n1 not in ("EP", "2PT") and n2 not in ("EP", "2PT"):
+                # If the +6 delta lands on a KO entry the missing EP belongs to
+                # the preceding TD — flag that row so the red highlight appears
+                # on the TD play, not the kickoff.
+                flag_idx = i - 1 if n1 == "KO" and i > 0 else i
+                flags.setdefault(flag_idx, []).append("Missing EP after TD")
+
+    return {idx: " · ".join(msgs) for idx, msgs in flags.items()}
+
+
+# ============================================================
 # Play Parsing
 # ============================================================
+
+def _annotate_td_scoring_teams(all_plays):
+    """
+    Set play["_td_scoring_team"] = "home" or "away" on every play that
+    carries PAT data (native or injected by _infer_missing_pats).
+
+    Uses actual score deltas — NOT drive_team_id — so defensive TDs
+    (pick-6, fumble return, blocked-kick TD, punt return TD) are
+    attributed correctly.  drive_team_id is the OFFENSIVE team that had
+    the ball; for a defensive or special-teams TD that is the WRONG team
+    to credit with the score.
+
+    ESPN sometimes lags the score update to the NEXT play (especially on
+    special-teams scoring plays like punt returns).  If the delta on the
+    scoring play itself is < 6 we look ahead up to 2 plays to find
+    where the score actually changed.
+
+    Must be called AFTER _infer_missing_pats.
+    """
+    prev_home = 0
+    prev_away = 0
+    for i, play in enumerate(all_plays):
+        curr_home = play.get("home_score", 0)
+        curr_away = play.get("away_score", 0)
+        if play.get("point_after_attempt") is not None:
+            home_delta = curr_home - prev_home
+            away_delta = curr_away - prev_away
+            # ESPN sometimes lags the score update to the following play
+            # (common on special-teams TDs like punt returns).  Look
+            # ahead to find where the score actually jumped.
+            if home_delta < 6 and away_delta < 6:
+                for look in range(1, 3):
+                    if i + look < len(all_plays):
+                        fwd = all_plays[i + look]
+                        fwd_hd = fwd.get("home_score", 0) - prev_home
+                        fwd_ad = fwd.get("away_score", 0) - prev_away
+                        if fwd_hd >= 6 or fwd_ad >= 6:
+                            home_delta = fwd_hd
+                            away_delta = fwd_ad
+                            break
+            if home_delta >= 6:
+                play["_td_scoring_team"] = "home"
+            elif away_delta >= 6:
+                play["_td_scoring_team"] = "away"
+        prev_home = curr_home
+        prev_away = curr_away
+
 
 def _infer_missing_pats(all_plays):
     """
@@ -429,23 +538,36 @@ def _infer_missing_pats(all_plays):
     score jump on that play vs the previous play and inject a synthetic
     point_after_attempt so map_espn_play() can generate the EP/2PT row.
 
-    Score jumped by 7 = EP good, 8 = 2PT good, 6 = EP missed (no row needed).
+    Only injects when there is NO separate EP/2PT play already following
+    in the next 2 plays (avoids double-injecting when ESPN reports both).
+
+    Score jumped by 7 = EP good, 8 = 2PT good, 6 = EP missed.
     """
     prev_home = 0
     prev_away = 0
-    for play in all_plays:
+    for i, play in enumerate(all_plays):
         curr_home = play.get("home_score", 0)
         curr_away = play.get("away_score", 0)
         if play.get("score_value") == 6 and play.get("point_after_attempt") is None:
-            home_delta = curr_home - prev_home
-            away_delta = curr_away - prev_away
-            delta = max(home_delta, away_delta)
-            if delta == 7:
-                play["point_after_attempt"] = {"text": "Extra Point Good", "value": 1}
-            elif delta == 8:
-                play["point_after_attempt"] = {"text": "Two-Point Conversion", "value": 2}
-            elif delta == 6:
-                play["point_after_attempt"] = {"text": "Extra Point Attempt - No Good", "value": 0}
+            # Check if ESPN already has a separate EP/2PT play following
+            next_has_pat = False
+            for look in range(1, 3):
+                if i + look < len(all_plays):
+                    nt = all_plays[i + look].get("play_type_text", "").lower()
+                    if ("extra point" in nt or "two-point" in nt
+                            or "two point" in nt or "pat" in nt):
+                        next_has_pat = True
+                        break
+            if not next_has_pat:
+                home_delta = curr_home - prev_home
+                away_delta = curr_away - prev_away
+                delta = max(home_delta, away_delta)
+                if delta == 7:
+                    play["point_after_attempt"] = {"text": "Extra Point Good", "value": 1}
+                elif delta == 8:
+                    play["point_after_attempt"] = {"text": "Two-Point Conversion", "value": 2}
+                elif delta == 6:
+                    play["point_after_attempt"] = {"text": "Extra Point Attempt - No Good", "value": 0}
         prev_home = curr_home
         prev_away = curr_away
 
@@ -602,7 +724,20 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
     if pat and not is_kickoff and not is_field_goal and not is_extra_point and not is_two_point:
         pat_value = pat.get("value", 0)
         if pat_value > 0:
-            if drive_team_id == home_team_id:
+            # Use score-delta annotation when available — drive_team_id is the
+            # OFFENSIVE team and is wrong for defensive / special-teams TDs
+            # (pick-6, fumble return, blocked-kick TD, punt return TD).
+            td_scorer = play.get("_td_scoring_team")
+            if td_scorer:
+                scored_home = (td_scorer == "home")
+            elif is_punt:
+                # Punt plays: drive_team_id is the PUNTING team.
+                # A scoring punt must be a punt return TD — the RECEIVING
+                # team scored, which is the opposite of the drive team.
+                scored_home = (drive_team_id != home_team_id)
+            else:
+                scored_home = (drive_team_id == home_team_id)
+            if scored_home:
                 td_home_score = home_score - pat_value
             else:
                 td_away_score = away_score - pat_value
@@ -807,6 +942,8 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
 
     # Infer missing PAT data from score jumps
     _infer_missing_pats(all_plays)
+    # Annotate which team scored each TD (uses score deltas, not drive_team_id)
+    _annotate_td_scoring_teams(all_plays)
 
     # Fix clocks, estimate snap times
     fix_clock_anomalies(all_plays)
@@ -824,6 +961,11 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
 
     fill_missing_field_positions(entries)
     actual_home, actual_away = apply_scoreboard_lag(entries)
+
+    # QC-flag each entry — operator sees these as red rows in CAPP treeview
+    qc_flags = _qc_flag_entries(entries, capp_home, capp_away)
+    for i, entry in enumerate(entries):
+        entry["qc_issue"] = qc_flags.get(i, "")
 
     return {
         "entries": entries,
