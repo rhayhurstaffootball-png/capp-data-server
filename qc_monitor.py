@@ -149,6 +149,7 @@ class QCMonitor:
         self._qc_game_list         = []    # all games from last historical QC run
         self._qc_games_with_issues = set() # game IDs that had ERROR or WARNING
         self._filter_issues_only   = False
+        self._qc_cancel    = threading.Event()  # set to abort in-progress historical run
 
         self._build_ui()
         self._start_polling()
@@ -175,6 +176,11 @@ class QCMonitor:
             fg_color=ORANGE, hover_color="#c86000",
             width=90, height=34, corner_radius=8)
         self.pause_btn.pack(side="right", padx=(0, 8), pady=14)
+
+        ctk.CTkButton(hdr, text="Reset All", command=self._reset_all,
+            font=ctk.CTkFont("Segoe UI", 13, "bold"),
+            fg_color=RED, hover_color="#a02020",
+            width=100, height=34, corner_radius=8).pack(side="right", padx=(0, 4))
 
         ctk.CTkButton(hdr, text="Clear Alerts", command=self._clear_alerts,
             font=ctk.CTkFont("Segoe UI", 13, "bold"),
@@ -714,6 +720,7 @@ class QCMonitor:
                          args=(league, year, week), daemon=True).start()
 
     def _historical_qc_worker(self, league, year, week):
+        self._qc_cancel.clear()
         try:
             r = requests.get(f"{SERVER_URL}/games",
                              params={"league": league, "year": year, "week": week},
@@ -738,6 +745,8 @@ class QCMonitor:
             flagged_play_keys = set()   # (gid, play_index) — unique flagged plays
 
             for idx, g in enumerate(games):
+                if self._qc_cancel.is_set():
+                    return  # Reset was pressed — abandon this run
                 gid    = g["game_id"]
                 gleague = g.get("league", league)
                 home   = g.get("home_team", g.get("home", ""))
@@ -941,6 +950,58 @@ class QCMonitor:
         self.alert_badge.configure(text="")
         for iid, gid in self._game_iid_map.items():
             self._refresh_game_row(iid, gid)
+
+    def _reset_all(self):
+        """Stop any in-progress QC run and reset the entire monitor to a clean state."""
+        # Cancel a running historical QC worker (it checks this flag between games)
+        self._qc_cancel.set()
+
+        # Clear all state
+        self._monitored.clear()
+        self._play_counts.clear()
+        self._game_entries.clear()
+        self._seen_keys.clear()
+        self._all_alerts.clear()
+        self._selected_id = None
+        self._qc_game_list = []
+        self._qc_games_with_issues = set()
+        self._filter_issues_only = False
+
+        # Clear all three trees
+        self.alert_tree.delete(*self.alert_tree.get_children())
+        self.play_tree.delete(*self.play_tree.get_children())
+        for iid in list(self._game_iid_map.keys()):
+            try:
+                self.game_tree.delete(iid)
+            except Exception:
+                pass
+        self._game_iid_map.clear()
+
+        # Reset header
+        self.alert_badge.configure(text="")
+        self.status_lbl.configure(text="Reset — waiting for next poll", text_color=MUTED)
+
+        # Reset QC summary panel
+        self.summary_lbl.configure(text="Run a QC check to see results", text_color=MUTED)
+        self.bd_score_lbl.configure(text="—", text_color=MUTED)
+        self.bd_clock_lbl.configure(text="—", text_color=MUTED)
+        self.bd_ep_lbl.configure(text="—",    text_color=MUTED)
+        self.bd_plays_lbl.configure(text="")
+        self.filter_btn.configure(
+            state="disabled", text="Show Issues Only",
+            fg_color=BG_MID, hover_color=BORDER, border_color=BORDER)
+
+        # Reset play log header
+        self.play_lbl.configure(
+            text="Play Log — double-click a game to monitor", text_color=MUTED)
+        self.play_count_lbl.configure(text="")
+
+        # Reset historical progress label and re-enable Run button
+        self.hist_progress.configure(text="", text_color=MUTED)
+        self.run_qc_btn.configure(state="normal", text="Run QC Check")
+
+        # Re-arm the cancel event for future runs
+        self._qc_cancel.clear()
 
 
 if __name__ == "__main__":
