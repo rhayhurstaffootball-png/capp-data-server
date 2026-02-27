@@ -486,28 +486,28 @@ def _auto_fix_entries(entries):
 def _fill_scoring_gaps(entries, home_display, away_display):
     """
     After scoreboard lag: detect period-opening KOs where the score
-    jumped vs. the previous period's last entry — indicating ESPN
-    omitted the scoring play(s) from its play-by-play feed entirely.
+    jumped vs. the previous period's last entry, meaning the scoring
+    play(s) were omitted from the live feed entirely (e.g. tagged as
+    'End Period'/'End of Half' type and filtered by the pipeline).
 
-    This happens when a TD (and sometimes EP) occurs on a play ESPN
-    tags as "End Period" or "End of Half", which our pipeline filters.
-    The score jump then appears silently on the Q3/Q4 opening KO.
+    What we can deduce from the score delta alone:
+      - WHO scored: home vs away is certain from which score changed
+      - EP/2PT outcome: certain — delta of 6 means EP no good,
+        7 means EP good, 8 means 2PT conversion good
+      - Exact play details (down, type, player): UNKNOWN — operator
+        must enter these manually
 
-    Inserts synthetic TD + EP/2PT placeholder entries BEFORE the KO
-    so the operator sees them as red "Manual entry required" rows in
-    SBENTRY and knows to enter the actual play data.
-
-    Also updates the KO entry's lag score to the correct post-scoring
-    value so the rest of the scoreboard remains accurate.
+    Inserts a synthetic TD row (red — manual entry required) and a
+    synthetic EP/2PT row (clean — outcome is known) before the KO.
+    Updates the KO's lag score to the correct post-scoring value so
+    the rest of the scoreboard is accurate.
 
     Only handles TD-range deltas (6, 7, 8). Other deltas are left for
-    _qc_flag_entries to handle.
-
-    Modifies entries in-place. Returns number of gaps patched.
+    _qc_flag_entries. Modifies entries in-place.
     """
-    _MANUAL_QC = "Manual entry required — scoring play not in ESPN feed"
-    _TD_DELTAS  = {6, 7, 8}
-    gaps_found  = 0
+    _TD_QC     = "Manual entry required — TD play details missing from feed"
+    _TD_DELTAS = {6, 7, 8}
+    gaps_found = 0
     i = 1
     while i < len(entries):
         entry = entries[i]
@@ -522,7 +522,7 @@ def _fill_scoring_gaps(entries, home_display, away_display):
             continue
 
         # After lag: entry[i] shows last-period end score;
-        # entry[i+1] shows ESPN's post-KO score (includes filtered scoring).
+        # entry[i+1] shows the post-KO score (includes filtered scoring).
         if i + 1 >= len(entries):
             i += 1
             continue
@@ -542,23 +542,35 @@ def _fill_scoring_gaps(entries, home_display, away_display):
         td_h = entry["home_score"]
         td_a = entry["away_score"]
 
-        # Score after TD (always +6, regardless of EP outcome)
+        # Score after TD — always +6 regardless of EP/2PT outcome
         after_td_h = td_h + (6 if dh > 0 else 0)
         after_td_a = td_a + (6 if da > 0 else 0)
 
-        # EP or 2PT based on total delta
-        pat_down = "2PT" if total_delta == 8 else "EP"
-
-        # Score after full sequence (what the KO should show as "before play")
+        # Score after full scoring sequence (what the KO should show pre-play)
         after_pat_h = td_h + dh
         after_pat_a = td_a + da
 
-        # Possession = scoring team (best guess; operator may correct)
+        # EP/2PT outcome is mathematically certain from the total delta:
+        #   delta == 6 → EP no good (or 2PT failed)
+        #   delta == 7 → EP good
+        #   delta == 8 → 2PT conversion good
+        if total_delta == 8:
+            pat_down   = "2PT"
+            pat_text   = "2-Point Conversion — Good (confirmed by period-start score)"
+        elif total_delta == 7:
+            pat_down   = "EP"
+            pat_text   = "Extra Point — Good (confirmed by period-start score)"
+        else:  # delta == 6
+            pat_down   = "EP"
+            pat_text   = "Extra Point — No Good (confirmed by period-start score)"
+
+        # Scoring team is certain from which score changed
         scoring_team = home_display if dh > 0 else away_display
 
         # Synthetic entries belong to the previous period at 0:00
         prev_qtr = str(prev.get("quarter", entry.get("quarter", "1")))
 
+        # TD row — operator must fill in down, play type, player, field pos
         td_entry = {
             "quarter":        prev_qtr,
             "clock":          "0:00",
@@ -572,11 +584,12 @@ def _fill_scoring_gaps(entries, home_display, away_display):
             "home_time_out":  "No",
             "away_time_out":  "No",
             "run_clock":      "No",
-            "play_text":      "Scoring play — data not in ESPN feed (enter manually)",
+            "play_text":      f"Touchdown scored by {scoring_team} — play details missing from feed",
             "wallclock":      "",
-            "qc_issue":       _MANUAL_QC,
+            "qc_issue":       _TD_QC,
         }
 
+        # EP/2PT row — outcome is known, no manual entry needed
         pat_entry = {
             "quarter":        prev_qtr,
             "clock":          "0:00",
@@ -590,9 +603,9 @@ def _fill_scoring_gaps(entries, home_display, away_display):
             "home_time_out":  "No",
             "away_time_out":  "No",
             "run_clock":      "No",
-            "play_text":      f"{pat_down} — data not in ESPN feed (enter manually)",
+            "play_text":      pat_text,
             "wallclock":      "",
-            "qc_issue":       _MANUAL_QC,
+            "qc_issue":       "",   # outcome confirmed — no red flag needed
         }
 
         # Update the KO's lag score to the correct post-scoring value
@@ -1164,7 +1177,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     # Post-lag auto-fix: correct errors that survived the pre-mapping pipeline
     _auto_fix_entries(entries)
 
-    # Insert placeholder entries for TD/EP plays ESPN omitted from the feed
+    # Insert placeholder entries for scoring plays missing from the feed
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
     _fill_scoring_gaps(entries, capp_home, capp_away)
 
