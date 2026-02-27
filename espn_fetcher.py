@@ -1139,15 +1139,16 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
         entry["qc_issue"] = qc_flags.get(i, "")
 
     return {
-        "entries": entries,
+        "entries":    entries,
         "actual_home": actual_home,
         "actual_away": actual_away,
-        "home_name": capp_home,
-        "away_name": capp_away,
+        "home_name":  capp_home,
+        "away_name":  capp_away,
         "home_abbrev": home_team_abbrev,
         "away_abbrev": away_team_abbrev,
-        "status": game_status,
-        "league": league,
+        "status":     game_status,
+        "league":     league,
+        "fetched_at": time.time(),   # unix timestamp — clients poll this to detect changes
     }
 
 # ============================================================
@@ -1195,6 +1196,13 @@ def get_live_games(league="all", year=None, week=None, seasontype=2):
     if league != "all":
         games = [g for g in games if g["league"] == league]
     return games
+
+def get_game_version(game_id):
+    """Return the fetched_at timestamp for a cached game without triggering
+    a fetch.  Returns 0 if the game is not in cache yet."""
+    with _lock:
+        cached = _plays_cache.get(game_id)
+    return cached.get("fetched_at", 0) if cached else 0
 
 def get_game_plays(game_id, league="cfb", force_refresh=False):
     if force_refresh:

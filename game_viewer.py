@@ -3,6 +3,7 @@ from tkinter import ttk
 import customtkinter as ctk
 import threading
 import requests
+from datetime import datetime
 
 SERVER_URL = "https://capp-data-server.onrender.com"
 
@@ -239,7 +240,7 @@ class GameViewer:
     # ─────────────────────────────────────────────────────────────
     def _load_games(self):
         self.load_btn.configure(state="disabled", text="Loading...")
-        self.status_label.configure(text="Fetching games...")
+        self.status_label.configure(text="Fetching games... (server may take ~30s to wake up)", text_color=MUTED)
         threading.Thread(target=self._fetch_games, daemon=True).start()
 
     def _fetch_games(self):
@@ -293,7 +294,8 @@ class GameViewer:
 
         total = len(games)
         self.game_count_label.configure(text=f"{total} game{'s' if total != 1 else ''}")
-        self.status_label.configure(text="Games loaded", text_color=MUTED)
+        now = datetime.now().strftime("%I:%M:%S %p")
+        self.status_label.configure(text=f"Last updated: {now}", text_color=MUTED)
         self.load_btn.configure(state="normal", text="Load Games")
 
     def _on_game_select(self, event):
