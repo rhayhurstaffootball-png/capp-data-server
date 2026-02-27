@@ -486,34 +486,32 @@ def _auto_fix_entries(entries):
 def _fill_scoring_gaps(entries, home_display, away_display):
     """
     After scoreboard lag: detect period-opening KOs where the score
-    jumped vs. the previous period's last entry, meaning the scoring
-    play(s) were omitted from the live feed entirely (e.g. tagged as
-    'End Period'/'End of Half' type and filtered by the pipeline).
+    jumped vs. the previous period's last entry, meaning one or more
+    scoring plays were omitted from the feed entirely.
 
-    What we can deduce from the score delta alone:
-      - WHO scored: home vs away is certain from which score changed
-      - EP/2PT outcome: certain — delta of 6 means EP no good,
-        7 means EP good, 8 means 2PT conversion good
-      - Exact play details (down, type, player): UNKNOWN — operator
-        must enter these manually
+    We insert a single generic placeholder entry so the operator can
+    see the gap and enter the correct play(s) manually.  We deliberately
+    do NOT assert what type of play occurred (TD, FG, etc.) because the
+    score delta alone is not reliable enough — ESPN sometimes also has
+    its own score errors layered on top of the real gap, making the
+    delta misleading.
 
-    Inserts a synthetic TD row (red — manual entry required) and a
-    synthetic EP/2PT row (clean — outcome is known) before the KO.
-    Updates the KO's lag score to the correct post-scoring value so
-    the rest of the scoreboard is accurate.
+    The placeholder entry:
+      - Is flagged red (qc_issue set) so it stands out in SBENTRY
+      - Shows the score BEFORE the gap (period-ending score)
+      - Reports the observed delta so the operator knows what to look for
+      - Leaves the KO's lag score unchanged (operator should verify it too)
 
-    Only handles TD-range deltas (6, 7, 8). Other deltas are left for
-    _qc_flag_entries. Modifies entries in-place.
+    Handles any non-zero positive delta. Modifies entries in-place.
     """
-    _TD_QC     = "Manual entry required — TD play details missing from feed"
-    _TD_DELTAS = {6, 7, 8}
+    _GAP_QC    = "Manual entry required — scoring play(s) missing from feed"
     gaps_found = 0
     i = 1
     while i < len(entries):
         entry = entries[i]
         prev  = entries[i - 1]
 
-        # Only period-opening KO entries
+        # Only period-opening KO entries (quarter changes)
         if str(entry.get("down", "")) != "KO":
             i += 1
             continue
@@ -522,7 +520,7 @@ def _fill_scoring_gaps(entries, home_display, away_display):
             continue
 
         # After lag: entry[i] shows last-period end score;
-        # entry[i+1] shows the post-KO score (includes filtered scoring).
+        # entry[i+1] shows the post-KO score (may include missing scoring).
         if i + 1 >= len(entries):
             i += 1
             continue
@@ -530,94 +528,48 @@ def _fill_scoring_gaps(entries, home_display, away_display):
         nxt = entries[i + 1]
         dh = nxt["home_score"] - entry["home_score"]
         da = nxt["away_score"] - entry["away_score"]
-        total_delta = max(abs(dh), abs(da))
 
-        if total_delta == 0 or total_delta not in _TD_DELTAS:
+        # Only act on positive deltas — a score can never legitimately drop
+        if dh <= 0 and da <= 0:
             i += 1
-            continue  # No gap, or non-TD delta — skip
+            continue
 
         gaps_found += 1
 
-        # Score before the missing TD (= KO's current lag score = period end)
-        td_h = entry["home_score"]
-        td_a = entry["away_score"]
+        # Build a human-readable delta string for the operator
+        parts = []
+        if dh > 0:
+            parts.append(f"{home_display} +{dh}")
+        if da > 0:
+            parts.append(f"{away_display} +{da}")
+        delta_str = ", ".join(parts)
 
-        # Score after TD — always +6 regardless of EP/2PT outcome
-        after_td_h = td_h + (6 if dh > 0 else 0)
-        after_td_a = td_a + (6 if da > 0 else 0)
-
-        # Score after full scoring sequence (what the KO should show pre-play)
-        after_pat_h = td_h + dh
-        after_pat_a = td_a + da
-
-        # EP/2PT outcome is mathematically certain from the total delta:
-        #   delta == 6 → EP no good (or 2PT failed)
-        #   delta == 7 → EP good
-        #   delta == 8 → 2PT conversion good
-        if total_delta == 8:
-            pat_down   = "2PT"
-            pat_text   = "2-Point Conversion — Good (confirmed by period-start score)"
-        elif total_delta == 7:
-            pat_down   = "EP"
-            pat_text   = "Extra Point — Good (confirmed by period-start score)"
-        else:  # delta == 6
-            pat_down   = "EP"
-            pat_text   = "Extra Point — No Good (confirmed by period-start score)"
-
-        # Scoring team is certain from which score changed
-        scoring_team = home_display if dh > 0 else away_display
-
-        # Synthetic entries belong to the previous period at 0:00
         prev_qtr = str(prev.get("quarter", entry.get("quarter", "1")))
 
-        # TD row — operator must fill in down, play type, player, field pos
-        td_entry = {
+        gap_entry = {
             "quarter":        prev_qtr,
             "clock":          "0:00",
-            "down":           "1",        # unknown — operator must correct
+            "down":           "?",
             "distance":       0,
             "field_position": 0,
-            "gain":           6,
-            "home_score":     td_h,
-            "away_score":     td_a,
-            "possession":     scoring_team,
-            "home_time_out":  "No",
-            "away_time_out":  "No",
-            "run_clock":      "No",
-            "play_text":      f"Touchdown scored by {scoring_team} — play details missing from feed",
-            "wallclock":      "",
-            "qc_issue":       _TD_QC,
-        }
-
-        # EP/2PT row — outcome is known, no manual entry needed
-        pat_entry = {
-            "quarter":        prev_qtr,
-            "clock":          "0:00",
-            "down":           pat_down,
-            "distance":       3,
-            "field_position": 3,
             "gain":           0,
-            "home_score":     after_td_h,
-            "away_score":     after_td_a,
-            "possession":     scoring_team,
+            "home_score":     entry["home_score"],   # score before the gap
+            "away_score":     entry["away_score"],
+            "possession":     "",
             "home_time_out":  "No",
             "away_time_out":  "No",
             "run_clock":      "No",
-            "play_text":      pat_text,
+            "play_text":      f"Score gap at period boundary ({delta_str}) — enter missing play(s) manually",
             "wallclock":      "",
-            "qc_issue":       "",   # outcome confirmed — no red flag needed
+            "qc_issue":       _GAP_QC,
         }
 
-        # Update the KO's lag score to the correct post-scoring value
-        entry["home_score"] = after_pat_h
-        entry["away_score"] = after_pat_a
+        # Insert the placeholder before the KO
+        entries.insert(i, gap_entry)
 
-        # Insert synthetic entries before the KO (at position i)
-        entries.insert(i, pat_entry)
-        entries.insert(i, td_entry)
-
-        # Skip past: synthetic TD, synthetic EP/2PT, and updated KO
-        i += 3
+        # Skip past the placeholder and the KO; let _qc_flag_entries
+        # handle whatever score anomalies remain after the KO
+        i += 2
 
     return gaps_found
 
