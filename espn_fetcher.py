@@ -480,6 +480,136 @@ def _auto_fix_entries(entries):
 
 
 # ============================================================
+# Scoring Gap Detection (period boundaries)
+# ============================================================
+
+def _fill_scoring_gaps(entries, home_display, away_display):
+    """
+    After scoreboard lag: detect period-opening KOs where the score
+    jumped vs. the previous period's last entry — indicating ESPN
+    omitted the scoring play(s) from its play-by-play feed entirely.
+
+    This happens when a TD (and sometimes EP) occurs on a play ESPN
+    tags as "End Period" or "End of Half", which our pipeline filters.
+    The score jump then appears silently on the Q3/Q4 opening KO.
+
+    Inserts synthetic TD + EP/2PT placeholder entries BEFORE the KO
+    so the operator sees them as red "Manual entry required" rows in
+    SBENTRY and knows to enter the actual play data.
+
+    Also updates the KO entry's lag score to the correct post-scoring
+    value so the rest of the scoreboard remains accurate.
+
+    Only handles TD-range deltas (6, 7, 8). Other deltas are left for
+    _qc_flag_entries to handle.
+
+    Modifies entries in-place. Returns number of gaps patched.
+    """
+    _MANUAL_QC = "Manual entry required — scoring play not in ESPN feed"
+    _TD_DELTAS  = {6, 7, 8}
+    gaps_found  = 0
+    i = 1
+    while i < len(entries):
+        entry = entries[i]
+        prev  = entries[i - 1]
+
+        # Only period-opening KO entries
+        if str(entry.get("down", "")) != "KO":
+            i += 1
+            continue
+        if str(entry.get("quarter", "")) == str(prev.get("quarter", "")):
+            i += 1
+            continue
+
+        # After lag: entry[i] shows last-period end score;
+        # entry[i+1] shows ESPN's post-KO score (includes filtered scoring).
+        if i + 1 >= len(entries):
+            i += 1
+            continue
+
+        nxt = entries[i + 1]
+        dh = nxt["home_score"] - entry["home_score"]
+        da = nxt["away_score"] - entry["away_score"]
+        total_delta = max(abs(dh), abs(da))
+
+        if total_delta == 0 or total_delta not in _TD_DELTAS:
+            i += 1
+            continue  # No gap, or non-TD delta — skip
+
+        gaps_found += 1
+
+        # Score before the missing TD (= KO's current lag score = period end)
+        td_h = entry["home_score"]
+        td_a = entry["away_score"]
+
+        # Score after TD (always +6, regardless of EP outcome)
+        after_td_h = td_h + (6 if dh > 0 else 0)
+        after_td_a = td_a + (6 if da > 0 else 0)
+
+        # EP or 2PT based on total delta
+        pat_down = "2PT" if total_delta == 8 else "EP"
+
+        # Score after full sequence (what the KO should show as "before play")
+        after_pat_h = td_h + dh
+        after_pat_a = td_a + da
+
+        # Possession = scoring team (best guess; operator may correct)
+        scoring_team = home_display if dh > 0 else away_display
+
+        # Synthetic entries belong to the previous period at 0:00
+        prev_qtr = str(prev.get("quarter", entry.get("quarter", "1")))
+
+        td_entry = {
+            "quarter":        prev_qtr,
+            "clock":          "0:00",
+            "down":           "1",        # unknown — operator must correct
+            "distance":       0,
+            "field_position": 0,
+            "gain":           6,
+            "home_score":     td_h,
+            "away_score":     td_a,
+            "possession":     scoring_team,
+            "home_time_out":  "No",
+            "away_time_out":  "No",
+            "run_clock":      "No",
+            "play_text":      "Scoring play — data not in ESPN feed (enter manually)",
+            "wallclock":      "",
+            "qc_issue":       _MANUAL_QC,
+        }
+
+        pat_entry = {
+            "quarter":        prev_qtr,
+            "clock":          "0:00",
+            "down":           pat_down,
+            "distance":       3,
+            "field_position": 3,
+            "gain":           0,
+            "home_score":     after_td_h,
+            "away_score":     after_td_a,
+            "possession":     scoring_team,
+            "home_time_out":  "No",
+            "away_time_out":  "No",
+            "run_clock":      "No",
+            "play_text":      f"{pat_down} — data not in ESPN feed (enter manually)",
+            "wallclock":      "",
+            "qc_issue":       _MANUAL_QC,
+        }
+
+        # Update the KO's lag score to the correct post-scoring value
+        entry["home_score"] = after_pat_h
+        entry["away_score"] = after_pat_a
+
+        # Insert synthetic entries before the KO (at position i)
+        entries.insert(i, pat_entry)
+        entries.insert(i, td_entry)
+
+        # Skip past: synthetic TD, synthetic EP/2PT, and updated KO
+        i += 3
+
+    return gaps_found
+
+
+# ============================================================
 # QC Flagging
 # ============================================================
 
@@ -1033,6 +1163,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
 
     # Post-lag auto-fix: correct errors that survived the pre-mapping pipeline
     _auto_fix_entries(entries)
+
+    # Insert placeholder entries for TD/EP plays ESPN omitted from the feed
+    # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
+    _fill_scoring_gaps(entries, capp_home, capp_away)
 
     # QC-flag remaining issues — operator sees these as red rows in CAPP
     qc_flags = _qc_flag_entries(entries, capp_home, capp_away)
