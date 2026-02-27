@@ -422,6 +422,64 @@ def apply_scoreboard_lag(entries, initial_home=0, initial_away=0):
     return prev_home, prev_away
 
 # ============================================================
+# Post-Lag Auto-Fix Pass
+# ============================================================
+
+def _auto_fix_entries(entries):
+    """
+    Post-mapping, post-scoreboard-lag auto-fix pass.
+
+    Runs AFTER apply_scoreboard_lag(), BEFORE _qc_flag_entries().
+    Detects and corrects errors that survived the pre-mapping pipeline.
+    Modifies entries in-place.
+
+    Fixes applied
+    -------------
+    1. EP/2PT row score regression (wrong-team EP)
+       After lag, an EP row where one team's score is LOWER than the
+       previous row means the EP value was subtracted from the wrong
+       team in map_espn_play.  We reverse the regression and credit
+       the correct team.  This catches any defensive/special-teams TD
+       cases where _annotate_td_scoring_teams still missed the scorer.
+
+    2. Score regression on non-EP rows
+       A negative delta on a regular play row cannot be safely
+       auto-corrected without knowing the true score — flagged only.
+
+    Returns {index: "fix description"} for entries that were corrected.
+    """
+    fixes = {}
+
+    for i in range(1, len(entries)):
+        entry = entries[i]
+        prev  = entries[i - 1]
+        down  = str(entry.get("down", ""))
+
+        # ── Fix 1: EP/2PT row score regression ───────────────────────────
+        # One team's displayed score went DOWN entering an EP/2PT play.
+        # That means the EP was subtracted from the wrong side earlier.
+        # Reverse the regression: restore the decreased team, reduce the
+        # other team by the same amount.
+        if down in ("EP", "2PT"):
+            hd = entry["home_score"] - prev["home_score"]
+            ad = entry["away_score"] - prev["away_score"]
+            if hd < 0 <= ad:
+                # Home score wrongly reduced — give it back, take from away
+                correction = abs(hd)
+                entry["home_score"] += correction
+                entry["away_score"] -= correction
+                fixes[i] = f"Auto-fixed: EP credited to wrong team (home restored +{correction})"
+            elif ad < 0 <= hd:
+                # Away score wrongly reduced — give it back, take from home
+                correction = abs(ad)
+                entry["away_score"] += correction
+                entry["home_score"] -= correction
+                fixes[i] = f"Auto-fixed: EP credited to wrong team (away restored +{correction})"
+
+    return fixes
+
+
+# ============================================================
 # QC Flagging
 # ============================================================
 
@@ -962,7 +1020,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     fill_missing_field_positions(entries)
     actual_home, actual_away = apply_scoreboard_lag(entries)
 
-    # QC-flag each entry — operator sees these as red rows in CAPP treeview
+    # Post-lag auto-fix: correct errors that survived the pre-mapping pipeline
+    _auto_fix_entries(entries)
+
+    # QC-flag remaining issues — operator sees these as red rows in CAPP
     qc_flags = _qc_flag_entries(entries, capp_home, capp_away)
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
