@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query
 from typing import Optional
 from espn_fetcher import get_live_games, get_game_plays, start_poller
 
+
 app = FastAPI(title="CAPP Data Server")
 
 @app.on_event("startup")
@@ -25,5 +26,6 @@ def games(
 def plays(
     game_id: str,
     league: str = Query("cfb", description="cfb or nfl"),
+    force_refresh: bool = Query(False, description="Bypass cache and re-fetch from API"),
 ):
-    return get_game_plays(game_id, league=league)
+    return get_game_plays(game_id, league=league, force_refresh=force_refresh)

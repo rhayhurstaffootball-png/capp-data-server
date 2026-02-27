@@ -1196,9 +1196,15 @@ def get_live_games(league="all", year=None, week=None, seasontype=2):
         games = [g for g in games if g["league"] == league]
     return games
 
-def get_game_plays(game_id, league="cfb"):
+def get_game_plays(game_id, league="cfb", force_refresh=False):
+    if force_refresh:
+        with _lock:
+            _plays_cache.pop(game_id, None)   # evict this game only; all others stay cached
     with _lock:
         cached = _plays_cache.get(game_id)
     if cached:
         return cached
-    return _fetch_game_plays_mapped(game_id, league)
+    result = _fetch_game_plays_mapped(game_id, league)
+    with _lock:
+        _plays_cache[game_id] = result        # cache fresh result for subsequent requests
+    return result
