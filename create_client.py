@@ -22,13 +22,12 @@ import uuid
 import hashlib
 import httpx
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("ERROR: SUPABASE_URL and SUPABASE_SERVICE_KEY must be set as environment variables.")
-    print("Set them or run: set SUPABASE_URL=... && set SUPABASE_SERVICE_KEY=...")
-    exit(1)
+SUPABASE_URL = "https://ftyfxwsiihljrugzvcry.supabase.co"
+SUPABASE_KEY = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ0eWZ4"
+    "d3NpaWhsanJ1Z3p2Y3J5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjM3MTYxNSwiZX"
+    "hwIjoyMDg3OTQ3NjE1fQ.iv0J2pC0gaX2ux_iKlEjbMdWaHaNVVw0-0sPpLu4Ytk"
+)
 
 def _supabase_headers():
     return {
