@@ -1,10 +1,28 @@
-from fastapi import FastAPI, Query, Header, HTTPException, Depends
+from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body
+from fastapi.responses import JSONResponse
 from typing import Optional
 import os
+import json
+import httpx
+
 from espn_fetcher import get_live_games, get_game_plays, get_game_version, start_poller
 
 
 app = FastAPI(title="CAPP Data Server")
+
+# --- Supabase config ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_BUCKET = "capp-workflow"
+
+def _supabase_headers():
+    return {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+    }
+
+def _storage_path(client_id: str, filename: str) -> str:
+    return f"{client_id}/{filename}"
 
 # --- API Key Auth ---
 def _valid_keys() -> set:
@@ -46,3 +64,56 @@ def game_version(game_id: str):
     cached entry.  Clients poll this every 60 s to detect retroactive data
     corrections without re-downloading the full play list each time."""
     return {"game_id": game_id, "fetched_at": get_game_version(game_id)}
+
+
+# ── Storage Endpoints ──────────────────────────────────────────────────────────
+
+@app.post("/storage/save", dependencies=[Depends(verify_api_key)])
+def storage_save(
+    client_id: str = Query(...),
+    filename: str = Query(...),
+    payload: dict = Body(...),
+):
+    """Save a JSON file to Supabase storage for this client."""
+    path = _storage_path(client_id, filename)
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    data = json.dumps(payload).encode()
+    with httpx.Client() as client:
+        # Try update first, then insert
+        r = client.put(url, content=data, headers={
+            **_supabase_headers(),
+            "Content-Type": "application/json",
+            "x-upsert": "true",
+        })
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=f"Supabase save failed: {r.text}")
+    return {"status": "saved", "path": path}
+
+
+@app.get("/storage/load", dependencies=[Depends(verify_api_key)])
+def storage_load(
+    client_id: str = Query(...),
+    filename: str = Query(...),
+):
+    """Load a JSON file from Supabase storage for this client."""
+    path = _storage_path(client_id, filename)
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    with httpx.Client() as client:
+        r = client.get(url, headers=_supabase_headers())
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="File not found")
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Supabase load failed: {r.text}")
+    return r.json()
+
+
+@app.get("/storage/list", dependencies=[Depends(verify_api_key)])
+def storage_list(client_id: str = Query(...)):
+    """List all stored files for this client."""
+    url = f"{SUPABASE_URL}/storage/v1/object/list/{SUPABASE_BUCKET}"
+    with httpx.Client() as client:
+        r = client.post(url, json={"prefix": f"{client_id}/"},
+                        headers={**_supabase_headers(), "Content-Type": "application/json"})
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Supabase list failed: {r.text}")
+    return r.json()
