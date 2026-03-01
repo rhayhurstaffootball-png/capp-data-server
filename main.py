@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from typing import Optional
 import os
 import json
+import hashlib
 import httpx
 
 from espn_fetcher import get_live_games, get_game_plays, get_game_version, start_poller
@@ -64,6 +65,29 @@ def game_version(game_id: str):
     cached entry.  Clients poll this every 60 s to detect retroactive data
     corrections without re-downloading the full play list each time."""
     return {"game_id": game_id, "fetched_at": get_game_version(game_id)}
+
+
+# ── Auth Endpoints ─────────────────────────────────────────────────────────────
+
+@app.post("/auth/login")
+def auth_login(
+    username: str = Body(..., embed=True),
+    password: str = Body(..., embed=True),
+):
+    """Validate username/password and return client_id + api_key. No API key required."""
+    url = f"{SUPABASE_URL}/rest/v1/capp_clients"
+    params = {"username": f"eq.{username}", "select": "client_id,password_hash,salt,api_key,active"}
+    with httpx.Client() as client:
+        r = client.get(url, params=params, headers=_supabase_headers())
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    user = r.json()[0]
+    if not user.get("active"):
+        raise HTTPException(status_code=401, detail="Account is not active")
+    expected = hashlib.sha256((password + user["salt"]).encode()).hexdigest()
+    if expected != user["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return {"client_id": user["client_id"], "api_key": user["api_key"]}
 
 
 # ── Storage Endpoints ──────────────────────────────────────────────────────────
