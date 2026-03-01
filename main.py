@@ -26,13 +26,15 @@ def _storage_path(client_id: str, filename: str) -> str:
     return f"{client_id}/{filename}"
 
 # --- API Key Auth ---
-def _valid_keys() -> set:
-    raw = os.environ.get("CAPP_API_KEYS", "")
-    return {k.strip() for k in raw.split(",") if k.strip()}
-
 def verify_api_key(x_api_key: str = Header(..., description="CAPP API key")):
-    if x_api_key not in _valid_keys():
+    url = f"{SUPABASE_URL}/rest/v1/capp_clients"
+    params = {"api_key": f"eq.{x_api_key}", "select": "client_id,active"}
+    with httpx.Client() as client:
+        r = client.get(url, params=params, headers=_supabase_headers())
+    if r.status_code != 200 or not r.json():
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    if not r.json()[0].get("active"):
+        raise HTTPException(status_code=401, detail="Account is not active")
 
 @app.on_event("startup")
 def startup():
