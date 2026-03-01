@@ -75,10 +75,15 @@ def game_version(game_id: str):
 def auth_login(
     username: str = Body(..., embed=True),
     password: str = Body(..., embed=True),
+    seat: str = Body(..., embed=True),       # "seat_1" or "seat_2"
+    machine_id: str = Body(..., embed=True), # hashed machine fingerprint
 ):
-    """Validate username/password and return client_id + api_key. No API key required."""
+    """Validate credentials, enforce machine binding, return client_id + api_key."""
     url = f"{SUPABASE_URL}/rest/v1/capp_clients"
-    params = {"username": f"eq.{username}", "select": "client_id,password_hash,salt,api_key,active"}
+    params = {
+        "username": f"eq.{username}",
+        "select": "client_id,password_hash,salt,api_key,active,is_admin,seat_1_machine,seat_2_machine"
+    }
     with httpx.Client() as client:
         r = client.get(url, params=params, headers=_supabase_headers())
     if r.status_code != 200 or not r.json():
@@ -89,6 +94,26 @@ def auth_login(
     expected = hashlib.sha256((password + user["salt"]).encode()).hexdigest()
     if expected != user["password_hash"]:
         raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    # --- Machine binding (skipped for admin accounts) ---
+    if not user.get("is_admin"):
+        seat_col = "seat_1_machine" if seat == "seat_1" else "seat_2_machine"
+        bound_machine = user.get(seat_col)
+        if bound_machine is None:
+            # First activation on this seat — bind this machine
+            with httpx.Client() as client:
+                client.patch(
+                    f"{SUPABASE_URL}/rest/v1/capp_clients",
+                    params={"username": f"eq.{username}"},
+                    json={seat_col: machine_id},
+                    headers={**_supabase_headers(), "Prefer": "return=minimal"},
+                )
+        elif bound_machine != machine_id:
+            raise HTTPException(
+                status_code=403,
+                detail="This seat is already activated on a different machine. Contact your administrator."
+            )
+
     return {"client_id": user["client_id"], "api_key": user["api_key"]}
 
 
