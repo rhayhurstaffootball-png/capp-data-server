@@ -36,6 +36,19 @@ def verify_api_key(x_api_key: str = Header(..., description="CAPP API key")):
     if not r.json()[0].get("active"):
         raise HTTPException(status_code=401, detail="Account is not active")
 
+def get_client_id(x_api_key: str = Header(..., description="CAPP API key")) -> str:
+    """Like verify_api_key but returns the client_id for use in endpoints."""
+    url = f"{SUPABASE_URL}/rest/v1/capp_clients"
+    params = {"api_key": f"eq.{x_api_key}", "select": "client_id,active"}
+    with httpx.Client() as client:
+        r = client.get(url, params=params, headers=_supabase_headers())
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    row = r.json()[0]
+    if not row.get("active"):
+        raise HTTPException(status_code=401, detail="Account is not active")
+    return row["client_id"]
+
 @app.on_event("startup")
 def startup():
     start_poller()
@@ -168,3 +181,84 @@ def storage_list(client_id: str = Query(...)):
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=f"Supabase list failed: {r.text}")
     return r.json()
+
+
+# ── CAPP Nodes Endpoints ────────────────────────────────────────────────────────
+
+NODES_FILE = "capp_nodes.json"
+
+def _load_nodes(client_id: str) -> list:
+    path = _storage_path(client_id, NODES_FILE)
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    with httpx.Client() as client:
+        r = client.get(url, headers=_supabase_headers())
+    if r.status_code == 404:
+        return []
+    if r.status_code != 200:
+        return []
+    return r.json().get("nodes", [])
+
+def _save_nodes(client_id: str, nodes: list):
+    path = _storage_path(client_id, NODES_FILE)
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    data = json.dumps({"nodes": nodes}).encode()
+    with httpx.Client() as client:
+        client.put(url, content=data, headers={
+            **_supabase_headers(),
+            "Content-Type": "application/json",
+            "x-upsert": "true",
+        })
+
+
+@app.post("/nodes/register")
+def nodes_register(
+    client_id: str = Depends(get_client_id),
+    machine_name: str = Body(..., embed=True),
+    rustdesk_id: str = Body(..., embed=True),
+    notes: str = Body("", embed=True),
+):
+    """Register or update a node for this client. Identified by rustdesk_id."""
+    from datetime import datetime, timezone
+    import uuid
+
+    nodes = _load_nodes(client_id)
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Update if rustdesk_id already exists, otherwise add
+    existing = next((n for n in nodes if n.get("rustdesk_id") == rustdesk_id), None)
+    if existing:
+        existing["machine_name"] = machine_name
+        existing["last_seen"] = now
+        existing["status"] = "online"
+        if notes:
+            existing["notes"] = notes
+    else:
+        nodes.append({
+            "id": str(uuid.uuid4()),
+            "machine_name": machine_name,
+            "rustdesk_id": rustdesk_id,
+            "notes": notes,
+            "added": now,
+            "last_seen": now,
+            "status": "online",
+        })
+
+    _save_nodes(client_id, nodes)
+    return {"status": "registered", "machine_name": machine_name, "rustdesk_id": rustdesk_id}
+
+
+@app.get("/nodes")
+def nodes_list(client_id: str = Depends(get_client_id)):
+    """List all registered nodes for this client."""
+    return {"nodes": _load_nodes(client_id)}
+
+
+@app.delete("/nodes/{node_id}")
+def nodes_delete(node_id: str, client_id: str = Depends(get_client_id)):
+    """Remove a node by its id."""
+    nodes = _load_nodes(client_id)
+    updated = [n for n in nodes if n.get("id") != node_id]
+    if len(updated) == len(nodes):
+        raise HTTPException(status_code=404, detail="Node not found")
+    _save_nodes(client_id, updated)
+    return {"status": "deleted"}
