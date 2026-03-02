@@ -84,6 +84,31 @@ def game_version(game_id: str):
 
 # ── Auth Endpoints ─────────────────────────────────────────────────────────────
 
+@app.post("/nodes/login")
+def nodes_login(
+    username: str = Body(..., embed=True),
+    password: str = Body(..., embed=True),
+):
+    """Authenticate a CAPP Node agent by username/password.
+    Returns the api_key for that account — no seat or machine binding."""
+    url = f"{SUPABASE_URL}/rest/v1/capp_clients"
+    params = {
+        "username": f"eq.{username}",
+        "select": "client_id,password_hash,salt,api_key,active"
+    }
+    with httpx.Client() as client:
+        r = client.get(url, params=params, headers=_supabase_headers())
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    user = r.json()[0]
+    if not user.get("active"):
+        raise HTTPException(status_code=401, detail="Account is not active")
+    expected = hashlib.sha256((password + user["salt"]).encode()).hexdigest()
+    if expected != user["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return {"api_key": user["api_key"], "client_id": user["client_id"]}
+
+
 @app.post("/auth/login")
 def auth_login(
     username: str = Body(..., embed=True),
