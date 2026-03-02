@@ -215,6 +215,7 @@ def nodes_register(
     client_id: str = Depends(get_client_id),
     machine_name: str = Body(..., embed=True),
     rustdesk_id: str = Body(..., embed=True),
+    password: str = Body("", embed=True),
     notes: str = Body("", embed=True),
 ):
     """Register or update a node for this client. Identified by rustdesk_id."""
@@ -230,6 +231,8 @@ def nodes_register(
         existing["machine_name"] = machine_name
         existing["last_seen"] = now
         existing["status"] = "online"
+        if password:
+            existing["password"] = password
         if notes:
             existing["notes"] = notes
     else:
@@ -237,6 +240,7 @@ def nodes_register(
             "id": str(uuid.uuid4()),
             "machine_name": machine_name,
             "rustdesk_id": rustdesk_id,
+            "password": password,
             "notes": notes,
             "added": now,
             "last_seen": now,
