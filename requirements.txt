@@ -1,4 +1,5 @@
-  fastapi
-  uvicorn
-  requests
-  httpx
+fastapi
+uvicorn[standard]
+requests
+httpx
+websockets
