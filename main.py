@@ -55,7 +55,7 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2"}
 
 @app.get("/games", dependencies=[Depends(verify_api_key)])
 def games(
