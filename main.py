@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body
+from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from typing import Optional
+from typing import Optional, Dict
 import os
 import json
 import hashlib
@@ -266,3 +266,87 @@ def nodes_delete(node_id: str, client_id: str = Depends(get_client_id)):
         raise HTTPException(status_code=404, detail="Node not found")
     _save_nodes(client_id, updated)
     return {"status": "deleted"}
+
+
+# ── VNC Relay ───────────────────────────────────────────────────────────────
+# Bridges screen-share sessions between client agent (host) and CAPP Launcher (viewer).
+# Session key = "{client_id}:{machine_id}" — scoped per account for security.
+
+_vnc_sessions: Dict[str, Dict[str, object]] = {}
+
+
+async def _verify_api_key_async(x_api_key: str) -> Optional[str]:
+    """Async API key validation — returns client_id or None."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/capp_clients",
+                params={"api_key": f"eq.{x_api_key}", "select": "client_id,active"},
+                headers=_supabase_headers(),
+                timeout=8,
+            )
+        if r.status_code != 200 or not r.json():
+            return None
+        row = r.json()[0]
+        return row["client_id"] if row.get("active") else None
+    except Exception:
+        return None
+
+
+@app.websocket("/vnc/{machine_id}/{role}")
+async def vnc_relay(
+    websocket: WebSocket,
+    machine_id: str,
+    role: str,
+    x_api_key: str = Query(None),
+):
+    """
+    WebSocket relay that bridges host (client machine) and viewer (CAPP Launcher).
+    role must be 'host' or 'viewer'.
+    Both sides authenticate with their CAPP API key.
+    """
+    if role not in ("host", "viewer"):
+        await websocket.close(code=4002)
+        return
+
+    if not x_api_key:
+        await websocket.close(code=4001)
+        return
+
+    client_id = await _verify_api_key_async(x_api_key)
+    if not client_id:
+        await websocket.close(code=4001)
+        return
+
+    session_key = f"{client_id}:{machine_id}"
+    other_role = "viewer" if role == "host" else "host"
+
+    await websocket.accept()
+
+    if session_key not in _vnc_sessions:
+        _vnc_sessions[session_key] = {"host": None, "viewer": None}
+    _vnc_sessions[session_key][role] = websocket
+
+    try:
+        while True:
+            data = await websocket.receive()
+            msg_type = data.get("type", "")
+            if msg_type == "websocket.disconnect":
+                break
+
+            other_ws = _vnc_sessions.get(session_key, {}).get(other_role)
+            if other_ws is not None:
+                try:
+                    if data.get("text") is not None:
+                        await other_ws.send_text(data["text"])
+                    elif data.get("bytes") is not None:
+                        await other_ws.send_bytes(data["bytes"])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        if session_key in _vnc_sessions:
+            _vnc_sessions[session_key][role] = None
+            if all(v is None for v in _vnc_sessions[session_key].values()):
+                del _vnc_sessions[session_key]
