@@ -270,6 +270,25 @@ def db_download():
             return {"download_url": signed}
     raise HTTPException(status_code=502, detail="Could not generate download URL")
 
+@app.get("/agent/download")
+def agent_download():
+    """
+    Public endpoint — returns a signed Supabase URL for downloading CAPPNodes_Agent.exe.
+    No auth required so new clients can download before they have an API key.
+    File transfer goes Supabase -> Client (not through Render).
+    """
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/CAPPNodes_Agent.exe"
+    headers = {**_supabase_headers(), "Content-Type": "application/json"}
+    import httpx as _httpx
+    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
+    if r.status_code == 200:
+        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
+        if signed:
+            if signed.startswith("/"):
+                signed = f"{SUPABASE_URL}/storage/v1{signed}"
+            return {"download_url": signed}
+    raise HTTPException(status_code=502, detail="Could not generate download URL")
+
 @app.post("/db/update", dependencies=[Depends(verify_api_key)])
 def db_force_update():
     """
