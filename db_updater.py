@@ -1,9 +1,13 @@
 """
 db_updater.py
 =============
-Runs twice daily. Updates workflow_server.db with latest CFBD data,
-then uploads the file to Supabase Storage for clients to download.
+Runs twice daily. Updates workflow_server.db with:
+  1. Game results (result, team_score, opponent_score) for completed games
+  2. team_conferences for current season (handles mid-season conference changes)
+  3. Bumps db_meta.version so clients know to download
+  4. Uploads updated DB to Supabase Storage
 
+Does NOT insert new games or schedules — that is handled by the CAPP Toolkit.
 Called by APScheduler in main.py, or run manually: python db_updater.py
 """
 
@@ -26,7 +30,7 @@ SUPABASE_PATH   = "shared/workflow.db"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "workflow_server.db")
 
-CURRENT_SEASON = 2026   # Update each year
+CURRENT_SEASON = datetime.utcnow().year   # Auto-rolls each year
 
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(__file__), "db_updater.log"),
@@ -48,112 +52,95 @@ def cfbd(path, params=None):
             time.sleep(2)
     return []
 
-# ── Supabase helpers ──────────────────────────────────────────────────────────
-def supabase_headers():
-    return {
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "apikey": SUPABASE_KEY,
-    }
-
+# ── Supabase upload ───────────────────────────────────────────────────────────
 def upload_to_supabase(db_path):
-    """Upload workflow_server.db to Supabase Storage."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.warning("No Supabase credentials — skipping upload")
+        return False
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{SUPABASE_PATH}"
     with open(db_path, "rb") as f:
         data = f.read()
     headers = {
-        **supabase_headers(),
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
         "Content-Type": "application/octet-stream",
-        "x-upsert": "true",   # overwrite if exists
+        "x-upsert": "true",
     }
-    r = requests.post(url, data=data, headers=headers, timeout=60)
+    r = requests.post(url, data=data, headers=headers, timeout=120)
     if r.status_code in (200, 201):
-        log.info(f"Uploaded {db_path} to Supabase ({len(data)/1024:.1f} KB)")
+        log.info(f"Uploaded to Supabase ({len(data)//1024} KB)")
         return True
     else:
         log.error(f"Supabase upload failed: {r.status_code} {r.text[:200]}")
         return False
 
-# ── Update logic ──────────────────────────────────────────────────────────────
-def update_current_season(conn):
+# ── Update game results ───────────────────────────────────────────────────────
+def update_game_results(conn):
     """
-    Pull latest games + results for the current season.
-    Updates scores on completed games, inserts new schedule entries.
+    Pull completed game results from CFBD and write into the existing games table.
+    Two-pass matching to handle both title case (game_id rows) and
+    uppercase (older toolkit rows) team names.
     """
     cur = conn.cursor()
     updated = 0
-    inserted = 0
 
     for stype in ["regular", "postseason"]:
         games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype})
         time.sleep(0.5)
 
         for g in games:
-            gid       = g.get("id")
-            home_pts  = g.get("homePoints")
-            away_pts  = g.get("awayPoints")
-            completed = g.get("completed", False)
-            home      = g.get("homeTeam", "")
-            away      = g.get("awayTeam", "")
-            home_id   = g.get("homeId")
-            away_id   = g.get("awayId")
-            date      = g.get("startDate", "")
-            week      = str(g.get("week", ""))
-            neutral   = g.get("neutralSite", False)
-            conf_game = g.get("conferenceGame", False)
-            venue     = g.get("venue", "")
-            notes     = g.get("notes") or ""
+            if not g.get("completed"):
+                continue
+            home_pts = g.get("homePoints")
+            away_pts = g.get("awayPoints")
+            if home_pts is None or away_pts is None:
+                continue
 
-            # Upsert game
+            game_id   = g.get("id")
+            home_cfbd = g.get("homeTeam", "").strip()
+            away_cfbd = g.get("awayTeam", "").strip()
+            date_str  = (g.get("startDate", "") or "")[:10]
+
+            home_result = "W" if home_pts > away_pts else ("L" if home_pts < away_pts else "T")
+            away_result = "W" if away_pts > home_pts else ("L" if away_pts < home_pts else "T")
+
+            # Pass 1: match by game_id (title case rows imported directly from CFBD)
             cur.execute("""
-                INSERT INTO games (game_id, season, week, season_type, date,
-                    home_team, home_team_id, away_team, away_team_id,
-                    home_score, away_score, neutral_site, conference_game, venue, notes, completed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(game_id) DO UPDATE SET
-                    home_score=excluded.home_score,
-                    away_score=excluded.away_score,
-                    completed=excluded.completed,
-                    notes=excluded.notes
-            """, (gid, str(CURRENT_SEASON), week, stype, date,
-                  home, home_id, away, away_id,
-                  home_pts, away_pts, neutral, conf_game, venue, notes, completed))
+                UPDATE games SET result=?, team_score=?, opponent_score=?
+                WHERE game_id=? AND team=?
+            """, (home_result, home_pts, away_pts, game_id, home_cfbd))
+            updated += cur.rowcount
 
-            if cur.rowcount:
-                inserted += 1
+            cur.execute("""
+                UPDATE games SET result=?, team_score=?, opponent_score=?
+                WHERE game_id=? AND team=?
+            """, (away_result, away_pts, home_pts, game_id, away_cfbd))
+            updated += cur.rowcount
 
-            # Upsert schedule rows for each team
-            for team, team_id, opp, opp_id, tscore, oscore, ha in [
-                (home, home_id, away, away_id, home_pts, away_pts, "home"),
-                (away, away_id, home, home_id, away_pts, home_pts, "away"),
-            ]:
-                result = None
-                if tscore is not None and oscore is not None:
-                    result = "W" if tscore > oscore else ("L" if tscore < oscore else "T")
+            # Pass 2: match by UPPER(team) + date (uppercase rows without game_id)
+            cur.execute("""
+                UPDATE games SET result=?, team_score=?, opponent_score=?, game_id=?
+                WHERE game_id IS NULL AND date=? AND UPPER(team)=?
+            """, (home_result, home_pts, away_pts, game_id, date_str, home_cfbd.upper()))
+            updated += cur.rowcount
 
-                cur.execute("""
-                    INSERT INTO schedules (game_id, team, team_id, opponent, opponent_id,
-                        season, week, season_type, date, home_away,
-                        team_score, opponent_score, result,
-                        conference_game, neutral_site, venue)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(game_id, team_id) DO UPDATE SET
-                        team_score=excluded.team_score,
-                        opponent_score=excluded.opponent_score,
-                        result=excluded.result
-                """, (gid, team, team_id, opp, opp_id,
-                      str(CURRENT_SEASON), week, stype, date, ha,
-                      tscore, oscore, result,
-                      conf_game, neutral, venue))
-
-                if completed and tscore is not None:
-                    updated += 1
+            cur.execute("""
+                UPDATE games SET result=?, team_score=?, opponent_score=?, game_id=?
+                WHERE game_id IS NULL AND date=? AND UPPER(team)=?
+            """, (away_result, away_pts, home_pts, game_id, date_str, away_cfbd.upper()))
+            updated += cur.rowcount
 
     conn.commit()
-    log.info(f"Season {CURRENT_SEASON}: {inserted} games upserted, {updated} results updated")
-    return inserted, updated
+    log.info(f"Season {CURRENT_SEASON}: {updated} game result rows updated")
+    return updated
 
+# ── Update conference memberships ─────────────────────────────────────────────
 def update_conference_memberships(conn):
-    """Refresh team_conferences for current season (handles mid-season moves)."""
+    """
+    Refresh team_conferences for the current season.
+    Handles mid-season conference changes and new teams.
+    Team names stored UPPERCASE to match the rest of the DB.
+    """
     cur = conn.cursor()
     fbs = cfbd("/teams/fbs", {"year": CURRENT_SEASON})
     time.sleep(0.5)
@@ -165,14 +152,14 @@ def update_conference_memberships(conn):
             ON CONFLICT(team_id, season) DO UPDATE SET
                 conference=excluded.conference,
                 division=excluded.division
-        """, (t["id"], t["school"], CURRENT_SEASON,
-              t.get("conference",""), t.get("division","")))
+        """, (t["id"], t["school"].strip().upper(), CURRENT_SEASON,
+              t.get("conference", ""), t.get("division", "")))
 
     conn.commit()
     log.info(f"Refreshed {len(fbs)} FBS conference memberships for {CURRENT_SEASON}")
 
+# ── Bump version ──────────────────────────────────────────────────────────────
 def bump_version(conn, notes=""):
-    """Increment db_meta version."""
     cur = conn.cursor()
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     cur.execute("""
@@ -184,8 +171,7 @@ def bump_version(conn, notes=""):
         WHERE id = 1
     """, (now, str(CURRENT_SEASON), notes or f"Auto-update {now}"))
     conn.commit()
-    cur.execute("SELECT version FROM db_meta WHERE id=1")
-    version = cur.fetchone()[0]
+    version = cur.execute("SELECT version FROM db_meta WHERE id=1").fetchone()[0]
     log.info(f"DB version bumped to {version}")
     return version
 
@@ -196,7 +182,7 @@ def run_update():
     start = time.time()
 
     if not os.path.exists(DB_PATH):
-        log.error(f"DB not found at {DB_PATH} — run build_server_db.py first")
+        log.error(f"DB not found at {DB_PATH} — run build_merged_db.py first")
         return False
 
     try:
@@ -204,11 +190,10 @@ def run_update():
         conn.execute("PRAGMA journal_mode=WAL")
 
         update_conference_memberships(conn)
-        ins, upd = update_current_season(conn)
-        version = bump_version(conn, f"Games: +{ins} new, {upd} results updated")
+        updated = update_game_results(conn)
+        version = bump_version(conn, f"{updated} result rows updated")
         conn.close()
 
-        # Upload to Supabase
         success = upload_to_supabase(DB_PATH)
 
         elapsed = time.time() - start
@@ -220,6 +205,11 @@ def run_update():
         return False
 
 if __name__ == "__main__":
-    print("Running manual DB update...")
+    print(f"Running manual DB update for season {CURRENT_SEASON}...")
     ok = run_update()
-    print("Done." if ok else "Failed — check db_updater.log")
+    if ok:
+        print("Done — DB updated and uploaded to Supabase.")
+    elif not SUPABASE_URL:
+        print("DB updated locally. No SUPABASE_URL set — upload skipped (normal for local dev).")
+    else:
+        print("Failed — check db_updater.log")
