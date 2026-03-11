@@ -29,9 +29,34 @@ def get_db_meta():
         pass
     return None
 
+def _bootstrap_db():
+    """
+    On startup, download workflow_server.db from Supabase if not present locally.
+    Render's filesystem is ephemeral — the DB gets wiped on every deploy.
+    """
+    if os.path.exists(SERVER_DB_PATH):
+        return  # already there (local dev)
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    if not supabase_url or not supabase_key:
+        print("WARNING: No Supabase credentials — cannot bootstrap DB")
+        return
+    url = f"{supabase_url}/storage/v1/object/capp-workflow/shared/workflow.db"
+    headers = {"Authorization": f"Bearer {supabase_key}", "apikey": supabase_key}
+    print("Bootstrapping workflow_server.db from Supabase...")
+    r = httpx.get(url, headers=headers, timeout=120, follow_redirects=True)
+    if r.status_code == 200:
+        with open(SERVER_DB_PATH, "wb") as f:
+            f.write(r.content)
+        print(f"DB bootstrapped ({len(r.content)//1024} KB)")
+    else:
+        print(f"WARNING: DB bootstrap failed ({r.status_code})")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start scheduler on app startup
+    # Download DB from Supabase if not present (Render ephemeral disk)
+    _bootstrap_db()
+    # Start scheduler
     scheduler = AsyncIOScheduler()
     # Run at 6:00 AM and 6:00 PM UTC daily
     scheduler.add_job(lambda: run_update(), "cron", hour="6,18", minute=0,
