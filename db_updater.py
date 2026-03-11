@@ -74,6 +74,88 @@ def upload_to_supabase(db_path):
         log.error(f"Supabase upload failed: {r.status_code} {r.text[:200]}")
         return False
 
+# ── Insert new schedule games ─────────────────────────────────────────────────
+def insert_new_games(conn):
+    """
+    Pull the current season schedule from CFBD and insert any games not already
+    in the DB. Inserts one row per team in games, and one row per team in schedules.
+    Team names stored UPPERCASE to match existing data convention.
+    """
+    cur = conn.cursor()
+    games_added = 0
+    schedules_added = 0
+
+    for stype in ["regular", "postseason"]:
+        games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype})
+        time.sleep(0.5)
+
+        for g in games:
+            game_id    = g.get("id")
+            home_cfbd  = g.get("homeTeam", "").strip().upper()
+            away_cfbd  = g.get("awayTeam", "").strip().upper()
+            date_str   = (g.get("startDate", "") or "")[:10]
+            week       = str(g.get("week", ""))
+            venue      = g.get("venue", "") or ""
+            neutral    = g.get("neutralSite", False)
+            conf_game  = g.get("conferenceGame", False)
+            home_pts   = g.get("homePoints")
+            away_pts   = g.get("awayPoints")
+            completed  = g.get("completed", False)
+
+            # Results if game is completed
+            home_result = None
+            away_result = None
+            if completed and home_pts is not None and away_pts is not None:
+                home_result = "W" if home_pts > away_pts else ("L" if home_pts < away_pts else "T")
+                away_result = "W" if away_pts > home_pts else ("L" if away_pts < home_pts else "T")
+
+            # Insert into games table — one row per team
+            for team, opp, tscore, oscore, result in [
+                (home_cfbd, away_cfbd, home_pts, away_pts, home_result),
+                (away_cfbd, home_cfbd, away_pts, home_pts, away_result),
+            ]:
+                cur.execute("""
+                    INSERT INTO games
+                        (team, opponent, date, home_team, away_team, venue,
+                         neutral_site, conference_game, week, season, game_id,
+                         result, team_score, opponent_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(team, opponent, date) DO UPDATE SET
+                        game_id=excluded.game_id,
+                        result=excluded.result,
+                        team_score=excluded.team_score,
+                        opponent_score=excluded.opponent_score
+                """, (team, opp, date_str, home_cfbd, away_cfbd, venue,
+                      neutral, conf_game, week, str(CURRENT_SEASON), game_id,
+                      result, tscore, oscore))
+                if cur.rowcount:
+                    games_added += 1
+
+            # Insert into schedules — one row per team (only if not already there)
+            for team, opp, loc in [
+                (home_cfbd, away_cfbd, "vs"),
+                (away_cfbd, home_cfbd, "at"),
+            ]:
+                exists = cur.execute("""
+                    SELECT 1 FROM schedules
+                    WHERE team=? AND opponent=? AND date=? AND season=?
+                """, (team, opp, date_str, str(CURRENT_SEASON))).fetchone()
+
+                if not exists:
+                    cur.execute("""
+                        INSERT INTO schedules
+                            (team, opponent, date, location, home_team, away_team,
+                             season, game_id, week)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (team, opp, date_str, loc, home_cfbd, away_cfbd,
+                          str(CURRENT_SEASON), game_id, week))
+                    schedules_added += 1
+
+    conn.commit()
+    log.info(f"Season {CURRENT_SEASON}: {games_added} game rows, {schedules_added} schedule rows inserted/updated")
+    return games_added, schedules_added
+
+
 # ── Update game results ───────────────────────────────────────────────────────
 def update_game_results(conn):
     """
@@ -190,8 +272,9 @@ def run_update():
         conn.execute("PRAGMA journal_mode=WAL")
 
         update_conference_memberships(conn)
+        g_added, s_added = insert_new_games(conn)
         updated = update_game_results(conn)
-        version = bump_version(conn, f"{updated} result rows updated")
+        version = bump_version(conn, f"+{g_added} games, +{s_added} schedules, {updated} results updated")
         conn.close()
 
         success = upload_to_supabase(DB_PATH)
