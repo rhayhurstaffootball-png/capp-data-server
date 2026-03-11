@@ -375,13 +375,14 @@ def nodes_register(
     # Update if rustdesk_id already exists, otherwise add
     existing = next((n for n in nodes if n.get("rustdesk_id") == rustdesk_id), None)
     if existing:
-        existing["machine_name"] = machine_name
+        existing["machine_name"] = machine_name   # raw hostname, always updated by agent
         existing["last_seen"] = now
         existing["status"] = "online"
         if password:
             existing["password"] = password
         if notes:
             existing["notes"] = notes
+        # display_name is user-set nickname — never touched by agent re-registration
     else:
         nodes.append({
             "id": str(uuid.uuid4()),
@@ -406,14 +407,14 @@ def nodes_list(client_id: str = Depends(get_client_id)):
 
 @app.patch("/nodes/{node_id}")
 def nodes_rename(node_id: str, body: dict, client_id: str = Depends(get_client_id)):
-    """Rename a node (update its display name)."""
+    """Set a user-facing nickname (display_name) for a node. Never overwritten by agent."""
     new_name = body.get("machine_name", "").strip()
     if not new_name:
         raise HTTPException(status_code=400, detail="machine_name is required")
     nodes = _load_nodes(client_id)
     for n in nodes:
         if n.get("id") == node_id:
-            n["machine_name"] = new_name
+            n["display_name"] = new_name   # stored separately from machine_name (hostname)
             _save_nodes(client_id, nodes)
             return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Node not found")
