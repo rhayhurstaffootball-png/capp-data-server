@@ -263,9 +263,10 @@ def db_download():
     if r.status_code == 200:
         signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
         if signed:
-            # Prepend Supabase base URL if relative
+            # Supabase returns a relative path like /object/sign/...
+            # The full URL needs the /storage/v1 prefix
             if signed.startswith("/"):
-                signed = SUPABASE_URL + signed
+                signed = f"{SUPABASE_URL}/storage/v1{signed}"
             return {"download_url": signed}
     raise HTTPException(status_code=502, detail="Could not generate download URL")
 
