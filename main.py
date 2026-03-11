@@ -385,6 +385,21 @@ def nodes_list(client_id: str = Depends(get_client_id)):
     return {"nodes": _load_nodes(client_id)}
 
 
+@app.patch("/nodes/{node_id}")
+def nodes_rename(node_id: str, body: dict, client_id: str = Depends(get_client_id)):
+    """Rename a node (update its display name)."""
+    new_name = body.get("machine_name", "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="machine_name is required")
+    nodes = _load_nodes(client_id)
+    for n in nodes:
+        if n.get("id") == node_id:
+            n["machine_name"] = new_name
+            _save_nodes(client_id, nodes)
+            return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="Node not found")
+
+
 @app.delete("/nodes/{node_id}")
 def nodes_delete(node_id: str, client_id: str = Depends(get_client_id)):
     """Remove a node by its id."""
