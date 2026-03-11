@@ -1,0 +1,9 @@
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+.env
+workflow_server.db
+db_updater.log

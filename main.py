@@ -1,15 +1,46 @@
 from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from typing import Optional, Dict
 import os
 import json
 import hashlib
 import httpx
+import sqlite3
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from contextlib import asynccontextmanager
 
 from espn_fetcher import get_live_games, get_game_plays, get_game_version, start_poller
+from db_updater import run_update
 
 
-app = FastAPI(title="CAPP Data Server")
+SERVER_DB_PATH = os.path.join(os.path.dirname(__file__), "workflow_server.db")
+
+def get_db_meta():
+    """Read current version info from workflow_server.db."""
+    try:
+        conn = sqlite3.connect(SERVER_DB_PATH)
+        cur  = conn.cursor()
+        cur.execute("SELECT version, updated_at, season FROM db_meta WHERE id=1")
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {"version": row[0], "updated_at": row[1], "season": row[2]}
+    except Exception:
+        pass
+    return None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start scheduler on app startup
+    scheduler = AsyncIOScheduler()
+    # Run at 6:00 AM and 6:00 PM UTC daily
+    scheduler.add_job(lambda: run_update(), "cron", hour="6,18", minute=0,
+                      id="db_update", replace_existing=True)
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(title="CAPP Data Server", lifespan=lifespan)
 
 # --- Supabase config ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -178,6 +209,52 @@ def storage_save(
         raise HTTPException(status_code=500, detail=f"Supabase save failed: {r.text}")
     return {"status": "saved", "path": path}
 
+
+# ── DB Update Endpoints ───────────────────────────────────────────────────────
+
+@app.get("/db/version")
+def db_version():
+    """
+    Public endpoint — returns current DB version and timestamp.
+    Clients call this first to decide whether to download a new DB.
+    """
+    meta = get_db_meta()
+    if not meta:
+        raise HTTPException(status_code=503, detail="DB metadata unavailable")
+    return meta
+
+@app.get("/db/download", dependencies=[Depends(verify_api_key)])
+def db_download():
+    """
+    Returns a signed Supabase URL for the client to download workflow.db directly.
+    Auth required — client must have a valid API key.
+    File transfer goes Supabase -> Client (not through Render).
+    """
+    # Generate a signed URL (1 hour expiry)
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/workflow.db"
+    headers = {**_supabase_headers(), "Content-Type": "application/json"}
+    import httpx as _httpx
+    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
+    if r.status_code == 200:
+        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
+        if signed:
+            # Prepend Supabase base URL if relative
+            if signed.startswith("/"):
+                signed = SUPABASE_URL + signed
+            return {"download_url": signed}
+    raise HTTPException(status_code=502, detail="Could not generate download URL")
+
+@app.post("/db/update", dependencies=[Depends(verify_api_key)])
+def db_force_update():
+    """
+    Admin endpoint — manually trigger a DB update cycle immediately.
+    Useful for pushing a fix without waiting for the scheduled run.
+    """
+    import threading
+    threading.Thread(target=run_update, daemon=True).start()
+    return {"status": "update started"}
+
+# ── Storage Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/storage/load", dependencies=[Depends(verify_api_key)])
 def storage_load(
