@@ -1,0 +1,12 @@
+[Unit]
+Description=CAPP VNC Relay
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/uvicorn capp_relay:app --host 0.0.0.0 --port 8000
+WorkingDirectory=/opt
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
