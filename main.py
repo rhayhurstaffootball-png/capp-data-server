@@ -270,6 +270,33 @@ def db_download():
             return {"download_url": signed}
     raise HTTPException(status_code=502, detail="Could not generate download URL")
 
+@app.get("/contacts/version")
+def contacts_version():
+    """
+    Public endpoint — returns current contacts.xlsx version.
+    Increment CONTACTS_VERSION env var when uploading a new contacts.xlsx to Supabase.
+    """
+    version = int(os.environ.get("CONTACTS_VERSION", "1"))
+    return {"version": version}
+
+@app.get("/contacts/download", dependencies=[Depends(verify_api_key)])
+def contacts_download():
+    """
+    Returns a signed Supabase URL for downloading contacts.xlsx.
+    Auth required — client must have a valid API key.
+    """
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/contacts.xlsx"
+    headers = {**_supabase_headers(), "Content-Type": "application/json"}
+    import httpx as _httpx
+    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
+    if r.status_code == 200:
+        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
+        if signed:
+            if signed.startswith("/"):
+                signed = f"{SUPABASE_URL}/storage/v1{signed}"
+            return {"download_url": signed}
+    raise HTTPException(status_code=502, detail="Could not generate download URL")
+
 @app.get("/agent/download")
 def agent_download():
     """
