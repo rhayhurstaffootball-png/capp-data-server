@@ -463,6 +463,9 @@ def nodes_delete(node_id: str, client_id: str = Depends(get_client_id)):
 # Session key = "{client_id}:{machine_id}" — scoped per account for security.
 
 _vnc_sessions: Dict[str, Dict[str, object]] = {}
+_active_relay:  Dict[str, str]              = {}   # session_key → relay URL agent is on
+
+SELF_URL = os.environ.get("SERVER_SELF_URL", "https://capp-data-server.onrender.com")
 
 
 async def _verify_api_key_async(x_api_key: str) -> Optional[str]:
@@ -517,6 +520,10 @@ async def vnc_relay(
         _vnc_sessions[session_key] = {"host": None, "viewer": None}
     _vnc_sessions[session_key][role] = websocket
 
+    # Track which relay the agent is on so the viewer can find it
+    if role == "host":
+        _active_relay[session_key] = SELF_URL
+
     try:
         while True:
             data = await websocket.receive()
@@ -553,6 +560,31 @@ async def vnc_relay(
             _vnc_sessions[session_key][role] = None
             if all(v is None for v in _vnc_sessions[session_key].values()):
                 del _vnc_sessions[session_key]
+        if role == "host":
+            _active_relay.pop(session_key, None)
+
+
+@app.post("/nodes/active_relay")
+async def set_active_relay(body: dict = Body(...), x_api_key: str = Header(None)):
+    """Agent calls this after connecting to a relay so the viewer knows where to find it."""
+    client_id = await _verify_api_key_async(x_api_key)
+    if not client_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    machine_id = body.get("machine_id", "")
+    relay_url  = body.get("relay_url", "")
+    if machine_id and relay_url:
+        _active_relay[f"{client_id}:{machine_id}"] = relay_url
+    return {"ok": True}
+
+
+@app.get("/nodes/{machine_id}/relay")
+async def get_agent_relay(machine_id: str, x_api_key: str = Header(None)):
+    """Viewer calls this before connecting — finds out which relay the agent is on."""
+    client_id = await _verify_api_key_async(x_api_key)
+    if not client_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    relay = _active_relay.get(f"{client_id}:{machine_id}", SELF_URL)
+    return {"relay_url": relay}
 
 
 # ── HTTPS Polling Relay (fallback for networks that block WebSocket) ─────────
