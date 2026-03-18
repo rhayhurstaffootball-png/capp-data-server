@@ -274,6 +274,13 @@ def run_update():
         update_conference_memberships(conn)
         g_added, s_added = insert_new_games(conn)
         updated = update_game_results(conn)
+
+        if not (g_added or s_added or updated):
+            conn.close()
+            elapsed = time.time() - start
+            log.info(f"=== No changes — skipping version bump and upload ({elapsed:.1f}s) ===")
+            return True
+
         version = bump_version(conn, f"+{g_added} games, +{s_added} schedules, {updated} results updated")
         conn.close()
 
