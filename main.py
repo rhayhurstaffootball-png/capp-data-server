@@ -533,6 +533,19 @@ async def vnc_relay(
                         await other_ws.send_bytes(data["bytes"])
                 except Exception:
                     pass
+
+            # If viewer sends input and host is NOT on WebSocket (HTTP polling
+            # fallback), store in _poll_inputs so the agent can pick it up
+            if role == "viewer" and data.get("text") is not None:
+                host_ws = _vnc_sessions.get(session_key, {}).get("host")
+                if host_ws is None:
+                    try:
+                        import json as _json
+                        ev = _json.loads(data["text"])
+                        _poll_inputs.setdefault(session_key, []).append(ev)
+                        _poll_inputs[session_key] = _poll_inputs[session_key][-50:]
+                    except Exception:
+                        pass
     except Exception:
         pass
     finally:
@@ -557,8 +570,20 @@ async def poll_push_frame(
     request: Request,
     client_id: str = Depends(get_client_id),
 ):
-    """Agent pushes latest JPEG frame."""
-    _poll_frames[f"{client_id}:{machine_id}"] = await request.body()
+    """Agent pushes latest frame. Stored for HTTP viewers and forwarded to any
+    WebSocket viewer that is already connected via the WS relay."""
+    key = f"{client_id}:{machine_id}"
+    frame = await request.body()
+    _poll_frames[key] = frame
+
+    # Bridge to WebSocket viewer if one is connected
+    ws_viewer = _vnc_sessions.get(key, {}).get("viewer")
+    if ws_viewer is not None:
+        try:
+            await ws_viewer.send_bytes(frame)
+        except Exception:
+            pass
+
     return {"ok": True}
 
 
