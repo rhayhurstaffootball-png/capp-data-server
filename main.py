@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, RedirectResponse
-from typing import Optional, Dict
+from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from typing import Optional, Dict, List
 import os
 import json
 import hashlib
@@ -540,3 +540,59 @@ async def vnc_relay(
             _vnc_sessions[session_key][role] = None
             if all(v is None for v in _vnc_sessions[session_key].values()):
                 del _vnc_sessions[session_key]
+
+
+# ── HTTPS Polling Relay (fallback for networks that block WebSocket) ─────────
+# Agent pushes frames via PUT, viewer polls via GET.
+# Input events go viewer→server→agent via POST/GET.
+# Scoped per client_id:machine_id — same auth as WS relay.
+
+_poll_frames: Dict[str, bytes] = {}   # "{client_id}:{machine_id}" → latest JPEG
+_poll_inputs: Dict[str, List]  = {}   # "{client_id}:{machine_id}" → pending events
+
+
+@app.put("/poll/{machine_id}/frame")
+async def poll_push_frame(
+    machine_id: str,
+    request: Request,
+    client_id: str = Depends(get_client_id),
+):
+    """Agent pushes latest JPEG frame."""
+    _poll_frames[f"{client_id}:{machine_id}"] = await request.body()
+    return {"ok": True}
+
+
+@app.get("/poll/{machine_id}/frame")
+async def poll_get_frame(
+    machine_id: str,
+    client_id: str = Depends(get_client_id),
+):
+    """Viewer polls for latest JPEG frame."""
+    frame = _poll_frames.get(f"{client_id}:{machine_id}")
+    if not frame:
+        raise HTTPException(status_code=404, detail="No frame available")
+    return Response(content=frame, media_type="image/jpeg")
+
+
+@app.post("/poll/{machine_id}/input")
+async def poll_push_input(
+    machine_id: str,
+    request: Request,
+    client_id: str = Depends(get_client_id),
+):
+    """Viewer pushes an input event (mouse/keyboard)."""
+    ev = await request.json()
+    key = f"{client_id}:{machine_id}"
+    _poll_inputs.setdefault(key, []).append(ev)
+    _poll_inputs[key] = _poll_inputs[key][-50:]   # cap queue
+    return {"ok": True}
+
+
+@app.get("/poll/{machine_id}/inputs")
+async def poll_get_inputs(
+    machine_id: str,
+    client_id: str = Depends(get_client_id),
+):
+    """Agent polls for pending input events, clears queue on read."""
+    key = f"{client_id}:{machine_id}"
+    return {"events": _poll_inputs.pop(key, [])}
