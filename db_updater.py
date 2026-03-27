@@ -85,8 +85,9 @@ def insert_new_games(conn):
     games_added = 0
     schedules_added = 0
 
-    for stype in ["regular", "postseason"]:
-        games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype})
+    for classification in ["fbs", "fcs"]:
+      for stype in ["regular", "postseason"]:
+        games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype, "classification": classification})
         time.sleep(0.5)
 
         for g in games:
@@ -152,7 +153,7 @@ def insert_new_games(conn):
                     schedules_added += 1
 
     conn.commit()
-    log.info(f"Season {CURRENT_SEASON}: {games_added} game rows, {schedules_added} schedule rows inserted/updated")
+    log.info(f"Season {CURRENT_SEASON}: {games_added} game rows, {schedules_added} schedule rows inserted/updated (FBS+FCS)")
     return games_added, schedules_added
 
 
@@ -166,8 +167,9 @@ def update_game_results(conn):
     cur = conn.cursor()
     updated = 0
 
-    for stype in ["regular", "postseason"]:
-        games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype})
+    for classification in ["fbs", "fcs"]:
+      for stype in ["regular", "postseason"]:
+        games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype, "classification": classification})
         time.sleep(0.5)
 
         for g in games:
@@ -226,19 +228,22 @@ def update_conference_memberships(conn):
     cur = conn.cursor()
     fbs = cfbd("/teams/fbs", {"year": CURRENT_SEASON})
     time.sleep(0.5)
+    fcs = cfbd("/teams", {"year": CURRENT_SEASON, "classification": "fcs"})
+    time.sleep(0.5)
 
-    for t in fbs:
-        cur.execute("""
-            INSERT INTO team_conferences (team_id, team, season, conference, division, classification)
-            VALUES (?, ?, ?, ?, ?, 'fbs')
-            ON CONFLICT(team_id, season) DO UPDATE SET
-                conference=excluded.conference,
-                division=excluded.division
-        """, (t["id"], t["school"].strip().upper(), CURRENT_SEASON,
-              t.get("conference", ""), t.get("division", "")))
+    for classification, teams in [("fbs", fbs), ("fcs", fcs)]:
+        for t in teams:
+            cur.execute("""
+                INSERT INTO team_conferences (team_id, team, season, conference, division, classification)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(team_id, season) DO UPDATE SET
+                    conference=excluded.conference,
+                    division=excluded.division
+            """, (t["id"], t["school"].strip().upper(), CURRENT_SEASON,
+                  t.get("conference", ""), t.get("division", ""), classification))
 
     conn.commit()
-    log.info(f"Refreshed {len(fbs)} FBS conference memberships for {CURRENT_SEASON}")
+    log.info(f"Refreshed {len(fbs)} FBS + {len(fcs)} FCS conference memberships for {CURRENT_SEASON}")
 
 # ── Bump version ──────────────────────────────────────────────────────────────
 def bump_version(conn, notes=""):
