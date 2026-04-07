@@ -786,26 +786,43 @@ def admin_page():
 
 @app.get("/admin/api/teams", dependencies=[Depends(_require_admin)])
 def admin_teams():
-    """Return all teams grouped by division → conference for the admin panel."""
+    """Return all teams grouped by division → conference for the admin panel.
+    Uses team_conferences table with the latest season for accurate realignment data."""
     try:
         conn = sqlite3.connect(SERVER_DB_PATH)
         cur  = conn.cursor()
+        # Find the latest season in team_conferences
+        cur.execute("SELECT MAX(season) FROM team_conferences")
+        latest = cur.fetchone()[0] or 2026
+        # FBS and FCS from season-aware table
+        cur.execute("""
+            SELECT team, conference, UPPER(classification) as division
+            FROM team_conferences
+            WHERE season = ?
+              AND conference IS NOT NULL
+              AND team NOT LIKE 'ZZZZZZ%%'
+            ORDER BY classification, conference, team
+        """, (latest,))
+        rows = cur.fetchall()
+        # NFL from teams table (not in team_conferences)
         cur.execute("""
             SELECT team, conference, division
             FROM teams
-            WHERE division IS NOT NULL
+            WHERE division = 'NFL'
               AND conference IS NOT NULL
-              AND team NOT LIKE 'ZZZZZZ%'
-            ORDER BY division, conference, team
+            ORDER BY conference, team
         """)
-        rows = cur.fetchall()
+        nfl_rows = cur.fetchall()
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     grouped: dict = {}
     for team, conference, division in rows:
-        grouped.setdefault(division, {}).setdefault(conference, []).append(team)
+        div_label = "FBS" if division == "FBS" else "FCS"
+        grouped.setdefault(div_label, {}).setdefault(conference, []).append(team)
+    for team, conference, _ in nfl_rows:
+        grouped.setdefault("NFL", {}).setdefault(conference, []).append(team)
     return grouped
 
 
