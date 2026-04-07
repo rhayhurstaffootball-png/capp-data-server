@@ -784,6 +784,31 @@ def admin_page():
     return HTMLResponse(_ADMIN_HTML)
 
 
+@app.get("/admin/api/teams", dependencies=[Depends(_require_admin)])
+def admin_teams():
+    """Return all teams grouped by division → conference for the admin panel."""
+    try:
+        conn = sqlite3.connect(SERVER_DB_PATH)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT team, conference, division
+            FROM teams
+            WHERE division IS NOT NULL
+              AND conference IS NOT NULL
+              AND team NOT LIKE 'ZZZZZZ%'
+            ORDER BY division, conference, team
+        """)
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    grouped: dict = {}
+    for team, conference, division in rows:
+        grouped.setdefault(division, {}).setdefault(conference, []).append(team)
+    return grouped
+
+
 @app.post("/admin/api/clients", dependencies=[Depends(_require_admin)])
 def admin_create_client(
     username:  str = Body(...),
@@ -934,6 +959,10 @@ _ADMIN_HTML = """<!DOCTYPE html>
     cursor: pointer; font-weight: 700; }
   #refresh-btn { float: right; }
   .loading { color: #8b95a1; font-size: 13px; padding: 20px 0; text-align: center; }
+  select { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white;
+    font-size: 13px; padding: 8px 12px; outline: none; width: 100%; cursor: pointer; }
+  select:focus { border-color: #3a7ebf; }
+  select:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -971,22 +1000,38 @@ _ADMIN_HTML = """<!DOCTYPE html>
       <h2>Create New Account</h2>
       <div class="form-row">
         <div class="form-group">
-          <label>School Name</label>
-          <input type="text" id="c-school" placeholder="Air Force Falcons">
+          <label>League</label>
+          <select id="c-division" onchange="onDivisionChange()">
+            <option value="">— Select League —</option>
+          </select>
         </div>
         <div class="form-group">
-          <label>Username</label>
-          <input type="text" id="c-username" placeholder="airforce">
+          <label>Conference</label>
+          <select id="c-conference" onchange="onConferenceChange()" disabled>
+            <option value="">— Select Conference —</option>
+          </select>
         </div>
       </div>
       <div class="form-row">
         <div class="form-group">
-          <label>Client ID</label>
-          <input type="text" id="c-clientid" placeholder="airforce">
+          <label>Team</label>
+          <select id="c-team" onchange="onTeamChange()" disabled>
+            <option value="">— Select Team —</option>
+          </select>
         </div>
         <div class="form-group">
           <label>Password (blank = auto-generate)</label>
           <input type="text" id="c-password" placeholder="Leave blank to generate">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Username <span style="color:#8b95a1;font-weight:400">(auto-filled, editable)</span></label>
+          <input type="text" id="c-username" placeholder="auto-filled from team">
+        </div>
+        <div class="form-group">
+          <label>Client ID <span style="color:#8b95a1;font-weight:400">(auto-filled, editable)</span></label>
+          <input type="text" id="c-clientid" placeholder="auto-filled from team">
         </div>
       </div>
       <button class="btn btn-primary" onclick="createClient()">Create Account</button>
@@ -1030,6 +1075,7 @@ function showTab(id, btn) {
   document.getElementById(id).classList.add("active");
   btn.classList.add("active");
   if (id === "clients-tab") loadClients();
+  if (id === "create-tab") loadTeams();
 }
 
 function api(method, path, body) {
@@ -1093,8 +1139,71 @@ function toggleActive(username, newState) {
     .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
 }
 
+let _teamsData = {};
+
+function loadTeams() {
+  api("GET", "/teams").then(data => {
+    _teamsData = data;
+    const divSel = document.getElementById("c-division");
+    divSel.innerHTML = '<option value="">— Select League —</option>';
+    // Order: NFL first, then FBS, then FCS
+    const order = ["NFL", "FBS", "FCS"];
+    const divs = order.filter(d => data[d]).concat(Object.keys(data).filter(d => !order.includes(d)));
+    divs.forEach(div => {
+      const opt = document.createElement("option");
+      opt.value = div;
+      opt.textContent = div === "FBS" ? "College — FBS" : div === "FCS" ? "College — FCS" : div;
+      divSel.appendChild(opt);
+    });
+  });
+}
+
+function onDivisionChange() {
+  const div  = document.getElementById("c-division").value;
+  const conf = document.getElementById("c-conference");
+  const team = document.getElementById("c-team");
+  conf.innerHTML = '<option value="">— Select Conference —</option>';
+  team.innerHTML = '<option value="">— Select Team —</option>';
+  team.disabled = true;
+  if (!div) { conf.disabled = true; return; }
+  conf.disabled = false;
+  const confs = Object.keys(_teamsData[div] || {}).sort();
+  confs.forEach(c => {
+    const opt = document.createElement("option");
+    opt.value = c; opt.textContent = c;
+    conf.appendChild(opt);
+  });
+}
+
+function onConferenceChange() {
+  const div  = document.getElementById("c-division").value;
+  const conf = document.getElementById("c-conference").value;
+  const team = document.getElementById("c-team");
+  team.innerHTML = '<option value="">— Select Team —</option>';
+  if (!conf) { team.disabled = true; return; }
+  team.disabled = false;
+  const teams = (_teamsData[div] || {})[conf] || [];
+  teams.forEach(t => {
+    const opt = document.createElement("option");
+    opt.value = t; opt.textContent = toTitle(t);
+    team.appendChild(opt);
+  });
+}
+
+function onTeamChange() {
+  const team = document.getElementById("c-team").value;
+  if (!team) return;
+  const slug = team.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  document.getElementById("c-username").value = slug;
+  document.getElementById("c-clientid").value  = slug;
+}
+
+function toTitle(str) {
+  return str.toLowerCase().replace(/\\b\\w/g, c => c.toUpperCase());
+}
+
 function createClient() {
-  const school   = document.getElementById("c-school").value.trim();
+  const school   = toTitle(document.getElementById("c-team").value.trim());
   const username = document.getElementById("c-username").value.trim().toLowerCase();
   const clientId = document.getElementById("c-clientid").value.trim().toLowerCase();
   const password = document.getElementById("c-password").value.trim();
@@ -1103,7 +1212,7 @@ function createClient() {
   if (!school || !username || !clientId) {
     result.className = "result err";
     result.style.display = "block";
-    result.textContent = "School name, username, and client ID are required.";
+    result.textContent = "Please select a team and confirm username / client ID.";
     return;
   }
 
@@ -1136,7 +1245,9 @@ function createClient() {
           "Questions? Contact roger@cappvcs.com",
         ].join("\\n");
         // Clear form
-        ["c-school","c-username","c-clientid","c-password"].forEach(id => document.getElementById(id).value = "");
+        ["c-username","c-clientid","c-password"].forEach(id => document.getElementById(id).value = "");
+        document.getElementById("c-division").value = "";
+        onDivisionChange();
       } else {
         result.className = "result err";
         result.textContent = "Error: " + (d.detail || JSON.stringify(d));
