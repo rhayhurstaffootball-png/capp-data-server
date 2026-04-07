@@ -909,6 +909,19 @@ def admin_deactivate(username: str, active: bool = Body(..., embed=True)):
     return {"ok": True}
 
 
+@app.delete("/admin/api/clients/{username}", dependencies=[Depends(_require_admin)])
+def admin_delete_client(username: str):
+    """Permanently delete a client account from Supabase."""
+    r = httpx.delete(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"username": f"eq.{username}"},
+        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+    )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
 _ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1131,6 +1144,7 @@ function loadClients() {
           <div class="action-btns">
             <button class="btn btn-warning" onclick="resetSeats('${c.username}')">Reset Seats</button>
             <button class="btn ${toggleCls}" onclick="toggleActive('${c.username}', ${!c.active})">${toggleLbl}</button>
+            <button class="btn btn-danger" onclick="deleteAccount('${c.username}')">Delete</button>
           </div>
         </td>
       </tr>`;
@@ -1146,6 +1160,17 @@ function loadClients() {
 function resetSeats(username) {
   if (!confirm("Clear both seat bindings for " + username + "?\\nThey will be able to activate on 2 new machines.")) return;
   api("PATCH", "/clients/" + username + "/reset-seats")
+    .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
+}
+
+function deleteAccount(username) {
+  if (!confirm(
+    "DELETE account: " + username + "\\n\\n" +
+    "This permanently removes their account from the database.\\n" +
+    "Their CAPP app will stop working immediately.\\n\\n" +
+    "This cannot be undone. Are you sure?"
+  )) return;
+  api("DELETE", "/clients/" + username)
     .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
 }
 
