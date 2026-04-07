@@ -326,6 +326,89 @@ def db_force_update():
     threading.Thread(target=run_update, daemon=True).start()
     return {"status": "update started"}
 
+
+# ── App Update Endpoints ──────────────────────────────────────────────────────
+
+@app.get("/app/version")
+def app_version():
+    """
+    Public endpoint — returns current app version.
+    Clients compare this to their local APP_VERSION to decide whether to update.
+    Bump APP_VERSION env var on Render when a new installer is uploaded to Supabase.
+    """
+    version = os.environ.get("APP_VERSION", "2.0.0")
+    return {"version": version}
+
+@app.get("/app/download", dependencies=[Depends(verify_api_key)])
+def app_download():
+    """
+    Returns a signed Supabase URL for downloading the latest CAPP installer.
+    Auth required. File transfer goes Supabase -> Client (not through Render).
+    Upload new installer to Supabase at: capp-workflow/shared/CAPP_Setup.exe
+    """
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/CAPP_Setup.exe"
+    headers = {**_supabase_headers(), "Content-Type": "application/json"}
+    import httpx as _httpx
+    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
+    if r.status_code == 200:
+        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
+        if signed:
+            if signed.startswith("/"):
+                signed = f"{SUPABASE_URL}/storage/v1{signed}"
+            return {"download_url": signed}
+    raise HTTPException(status_code=502, detail="Could not generate download URL")
+
+
+# ── Season Data Endpoints ─────────────────────────────────────────────────────
+
+@app.get("/season/version")
+def season_version():
+    """
+    Public endpoint — returns current season week data version.
+    Bump SEASON_VERSION env var on Render when season_weeks.json is updated.
+    """
+    version = int(os.environ.get("SEASON_VERSION", "1"))
+    return {"version": version}
+
+@app.get("/season/data")
+def season_data():
+    """
+    Public endpoint — returns season week date ranges for the game selector.
+    Small JSON payload, returned directly (no signed URL needed).
+    To update: edit SEASON_WEEKS env var on Render (JSON string) or update
+    the default below, then bump SEASON_VERSION.
+    Format: {"seasons": {"2025": {"0": ["20250823","20250825"], ...}, "2026": {...}}}
+    """
+    env_data = os.environ.get("SEASON_WEEKS", "")
+    if env_data:
+        try:
+            return json.loads(env_data)
+        except Exception:
+            pass
+    # Default — hardcoded fallback matching espn_live.py _SEASON_WEEK_DATES
+    return {
+        "seasons": {
+            "2025": {
+                "0":  ["20250823", "20250825"],
+                "1":  ["20250826", "20250901"],
+                "2":  ["20250902", "20250908"],
+                "3":  ["20250909", "20250915"],
+                "4":  ["20250916", "20250922"],
+                "5":  ["20250923", "20250929"],
+                "6":  ["20250930", "20251006"],
+                "7":  ["20251007", "20251013"],
+                "8":  ["20251014", "20251020"],
+                "9":  ["20251021", "20251027"],
+                "10": ["20251028", "20251103"],
+                "11": ["20251104", "20251110"],
+                "12": ["20251111", "20251117"],
+                "13": ["20251118", "20251124"],
+                "14": ["20251125", "20251201"],
+                "15": ["20251202", "20251208"],
+            }
+        }
+    }
+
 # ── Storage Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/storage/load", dependencies=[Depends(verify_api_key)])
