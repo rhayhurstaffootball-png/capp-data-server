@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response, HTMLResponse
 from typing import Optional, Dict, List
 import os
 import json
@@ -748,3 +748,405 @@ async def poll_get_inputs(
     """Agent polls for pending input events, clears queue on read."""
     key = f"{client_id}:{machine_id}"
     return {"events": _poll_inputs.pop(key, [])}
+
+
+# ── Admin Panel ───────────────────────────────────────────────────────────────
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+def _require_admin(x_admin_token: str = Header(...)):
+    if not ADMIN_PASSWORD or x_admin_token != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def _supa_headers_json():
+    return {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+    }
+
+import secrets as _secrets
+import string as _string
+
+def _gen_password(length=16) -> str:
+    alpha = _string.ascii_letters + _string.digits + "!@#$^&*"
+    return "".join(_secrets.choice(alpha) for _ in range(length))
+
+def _gen_api_key() -> str:
+    return _secrets.token_hex(32)
+
+def _hash_pw(password: str, salt: str) -> str:
+    return hashlib.sha256((password + salt).encode()).hexdigest()
+
+
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+def admin_page():
+    return HTMLResponse(_ADMIN_HTML)
+
+
+@app.post("/admin/api/clients", dependencies=[Depends(_require_admin)])
+def admin_create_client(
+    username:  str = Body(...),
+    client_id: str = Body(...),
+    school:    str = Body(...),
+    password:  str = Body(""),
+    is_admin:  bool = Body(False),
+):
+    # Duplicate check
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"username": f"eq.{username}", "select": "username"},
+        headers=_supa_headers_json(),
+    )
+    if r.status_code == 200 and r.json():
+        raise HTTPException(status_code=409, detail=f"Username '{username}' already exists.")
+
+    pw       = password.strip() or _gen_password()
+    salt     = _secrets.token_hex(16)
+    pw_hash  = _hash_pw(pw, salt)
+    api_key  = _gen_api_key()
+
+    row = {
+        "client_id":      client_id.strip().lower(),
+        "username":       username.strip().lower(),
+        "password_hash":  pw_hash,
+        "salt":           salt,
+        "api_key":        api_key,
+        "active":         True,
+        "is_admin":       is_admin,
+        "seat_1_machine": None,
+        "seat_2_machine": None,
+    }
+    r2 = httpx.post(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        json=row,
+        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+    )
+    if r2.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=f"Supabase error: {r2.text}")
+
+    return {"ok": True, "username": username, "password": pw, "client_id": client_id, "school": school}
+
+
+@app.get("/admin/api/clients", dependencies=[Depends(_require_admin)])
+def admin_list_clients():
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"select": "username,client_id,active,is_admin,seat_1_machine,seat_2_machine",
+                "order": "username.asc"},
+        headers=_supa_headers_json(),
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.patch("/admin/api/clients/{username}/reset-seats", dependencies=[Depends(_require_admin)])
+def admin_reset_seats(username: str):
+    r = httpx.patch(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"username": f"eq.{username}"},
+        json={"seat_1_machine": None, "seat_2_machine": None},
+        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+    )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.patch("/admin/api/clients/{username}/deactivate", dependencies=[Depends(_require_admin)])
+def admin_deactivate(username: str, active: bool = Body(..., embed=True)):
+    r = httpx.patch(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"username": f"eq.{username}"},
+        json={"active": active},
+        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+    )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+_ADMIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CAPP Admin</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #070a0f; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; min-height: 100vh; }
+  #login { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; gap: 16px; }
+  #login h1 { font-size: 22px; font-weight: 700; letter-spacing: 2px; }
+  #login input { background: #1a2230; border: 1px solid #2c3b55; border-radius: 8px; color: white;
+    font-size: 14px; padding: 10px 14px; width: 280px; outline: none; }
+  #login input:focus { border-color: #3a7ebf; }
+  #login button { background: #3a7ebf; border: none; border-radius: 8px; color: white; cursor: pointer;
+    font-size: 14px; font-weight: 700; padding: 10px 0; width: 280px; }
+  #login button:hover { background: #4a8ecf; }
+  #login .err { color: #ef4444; font-size: 13px; }
+  #app { display: none; }
+  .header { background: #0d1117; border-bottom: 1px solid #1e2a3a; padding: 14px 28px;
+    display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 16px; font-weight: 700; letter-spacing: 2px; color: #3a7ebf; }
+  .header button { background: none; border: 1px solid #2c3b55; border-radius: 6px; color: #8b95a1;
+    cursor: pointer; font-size: 12px; padding: 5px 12px; }
+  .tabs { display: flex; gap: 2px; background: #0d1117; padding: 0 28px; border-bottom: 1px solid #1e2a3a; }
+  .tab { background: none; border: none; border-bottom: 2px solid transparent; color: #8b95a1;
+    cursor: pointer; font-size: 13px; font-weight: 600; padding: 12px 18px; }
+  .tab.active { border-bottom-color: #3a7ebf; color: white; }
+  .panel { display: none; padding: 28px; max-width: 860px; }
+  .panel.active { display: block; }
+  .card { background: #1a2230; border: 1px solid #2c3b55; border-radius: 12px; padding: 22px; margin-bottom: 18px; }
+  .card h2 { font-size: 15px; font-weight: 700; margin-bottom: 16px; color: #94b4d4; }
+  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  .form-group { display: flex; flex-direction: column; gap: 5px; }
+  .form-group label { color: #8b95a1; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
+  .form-group input { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white;
+    font-size: 13px; padding: 8px 12px; outline: none; }
+  .form-group input:focus { border-color: #3a7ebf; }
+  .form-group input::placeholder { color: #3a4a5a; }
+  .btn { border: none; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 700;
+    padding: 9px 22px; transition: background 0.15s; }
+  .btn-primary { background: #3a7ebf; color: white; }
+  .btn-primary:hover { background: #4a8ecf; }
+  .btn-danger { background: #7f1d1d; color: #fca5a5; }
+  .btn-danger:hover { background: #991b1b; }
+  .btn-warning { background: #78350f; color: #fcd34d; }
+  .btn-warning:hover { background: #92400e; }
+  .btn-success { background: #14532d; color: #86efac; }
+  .btn-success:hover { background: #166534; }
+  .result { background: #0d1117; border: 1px solid #2c3b55; border-radius: 8px; color: #86efac;
+    font-family: monospace; font-size: 13px; margin-top: 14px; padding: 14px; white-space: pre-wrap; display: none; }
+  .result.err { color: #fca5a5; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { background: #0d1117; color: #8b95a1; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+    padding: 10px 12px; text-align: left; text-transform: uppercase; }
+  td { border-top: 1px solid #1e2a3a; color: #e2e8f0; padding: 10px 12px; vertical-align: middle; }
+  tr:hover td { background: #1a2230; }
+  .badge { border-radius: 4px; font-size: 11px; font-weight: 700; padding: 2px 8px; }
+  .badge-green  { background: #14532d; color: #86efac; }
+  .badge-red    { background: #7f1d1d; color: #fca5a5; }
+  .badge-blue   { background: #1e3a5f; color: #93c5fd; }
+  .badge-gray   { background: #1e2a3a; color: #8b95a1; }
+  .action-btns  { display: flex; gap: 6px; }
+  .action-btns button { font-size: 11px; padding: 4px 10px; border-radius: 5px; border: none;
+    cursor: pointer; font-weight: 700; }
+  #refresh-btn { float: right; }
+  .loading { color: #8b95a1; font-size: 13px; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div id="login">
+  <h1>CAPP ADMIN</h1>
+  <input type="password" id="pw-input" placeholder="Admin password" autocomplete="current-password">
+  <button onclick="doLogin()">Sign In</button>
+  <div class="err" id="login-err"></div>
+</div>
+
+<!-- App -->
+<div id="app">
+  <div class="header">
+    <h1>CAPP ADMIN PANEL</h1>
+    <button onclick="logout()">Sign Out</button>
+  </div>
+  <div class="tabs">
+    <button class="tab active" onclick="showTab('clients-tab', this)">Clients</button>
+    <button class="tab" onclick="showTab('create-tab', this)">Create Account</button>
+  </div>
+
+  <!-- Clients list -->
+  <div class="panel active" id="clients-tab">
+    <div class="card">
+      <h2>All Accounts <button class="btn btn-primary" id="refresh-btn" onclick="loadClients()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button></h2>
+      <div id="clients-table"><div class="loading">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Create account -->
+  <div class="panel" id="create-tab">
+    <div class="card">
+      <h2>Create New Account</h2>
+      <div class="form-row">
+        <div class="form-group">
+          <label>School Name</label>
+          <input type="text" id="c-school" placeholder="Air Force Falcons">
+        </div>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="c-username" placeholder="airforce">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Client ID</label>
+          <input type="text" id="c-clientid" placeholder="airforce">
+        </div>
+        <div class="form-group">
+          <label>Password (blank = auto-generate)</label>
+          <input type="text" id="c-password" placeholder="Leave blank to generate">
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="createClient()">Create Account</button>
+      <div class="result" id="create-result"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let _token = "";
+
+function doLogin() {
+  const pw = document.getElementById("pw-input").value.trim();
+  if (!pw) return;
+  fetch("/admin/api/clients", { headers: { "x-admin-token": pw } })
+    .then(r => {
+      if (r.ok) {
+        _token = pw;
+        document.getElementById("login").style.display = "none";
+        document.getElementById("app").style.display = "block";
+        loadClients();
+      } else {
+        document.getElementById("login-err").textContent = "Incorrect password.";
+      }
+    })
+    .catch(() => document.getElementById("login-err").textContent = "Cannot reach server.");
+}
+
+document.getElementById("pw-input").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+
+function logout() {
+  _token = "";
+  document.getElementById("app").style.display = "none";
+  document.getElementById("login").style.display = "flex";
+  document.getElementById("pw-input").value = "";
+}
+
+function showTab(id, btn) {
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  document.getElementById(id).classList.add("active");
+  btn.classList.add("active");
+  if (id === "clients-tab") loadClients();
+}
+
+function api(method, path, body) {
+  return fetch("/admin/api" + path, {
+    method,
+    headers: { "x-admin-token": _token, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  }).then(r => r.json());
+}
+
+function loadClients() {
+  document.getElementById("clients-table").innerHTML = '<div class="loading">Loading...</div>';
+  api("GET", "/clients").then(data => {
+    if (!Array.isArray(data)) {
+      document.getElementById("clients-table").innerHTML = '<div class="loading">Error loading clients.</div>';
+      return;
+    }
+    if (data.length === 0) {
+      document.getElementById("clients-table").innerHTML = '<div class="loading">No accounts yet.</div>';
+      return;
+    }
+    let rows = data.map(c => {
+      const active  = c.active ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-red">Inactive</span>';
+      const admin   = c.is_admin ? '<span class="badge badge-blue">Admin</span>' : '';
+      const s1      = c.seat_1_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
+      const s2      = c.seat_2_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
+      const toggleLbl = c.active ? "Deactivate" : "Reactivate";
+      const toggleCls = c.active ? "btn-danger" : "btn-success";
+      return `<tr>
+        <td>${c.username}</td>
+        <td>${c.client_id}</td>
+        <td>${active} ${admin}</td>
+        <td>${s1}</td>
+        <td>${s2}</td>
+        <td>
+          <div class="action-btns">
+            <button class="btn btn-warning" onclick="resetSeats('${c.username}')">Reset Seats</button>
+            <button class="btn ${toggleCls}" onclick="toggleActive('${c.username}', ${!c.active})">${toggleLbl}</button>
+          </div>
+        </td>
+      </tr>`;
+    }).join("");
+    document.getElementById("clients-table").innerHTML = `
+      <table>
+        <thead><tr><th>Username</th><th>Client ID</th><th>Status</th><th>Seat 1</th><th>Seat 2</th><th>Actions</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  });
+}
+
+function resetSeats(username) {
+  if (!confirm("Clear both seat bindings for " + username + "?\\nThey will be able to activate on 2 new machines.")) return;
+  api("PATCH", "/clients/" + username + "/reset-seats")
+    .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
+}
+
+function toggleActive(username, newState) {
+  const msg = newState ? "Reactivate " + username + "?" : "Deactivate " + username + "? This will block all their logins.";
+  if (!confirm(msg)) return;
+  api("PATCH", "/clients/" + username + "/deactivate", { active: newState })
+    .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
+}
+
+function createClient() {
+  const school   = document.getElementById("c-school").value.trim();
+  const username = document.getElementById("c-username").value.trim().toLowerCase();
+  const clientId = document.getElementById("c-clientid").value.trim().toLowerCase();
+  const password = document.getElementById("c-password").value.trim();
+  const result   = document.getElementById("create-result");
+
+  if (!school || !username || !clientId) {
+    result.className = "result err";
+    result.style.display = "block";
+    result.textContent = "School name, username, and client ID are required.";
+    return;
+  }
+
+  result.className = "result";
+  result.style.display = "block";
+  result.textContent = "Creating account...";
+
+  api("POST", "/clients", { username, client_id: clientId, school, password, is_admin: false })
+    .then(d => {
+      if (d.ok) {
+        result.textContent = [
+          "ACCOUNT CREATED",
+          "",
+          "School:         " + d.school,
+          "Username:       " + d.username,
+          "Activation Key: " + d.password,
+          "Client ID:      " + d.client_id,
+          "",
+          "--- EMAIL TEMPLATE ---",
+          "",
+          "Your CAPP Video Coordinator Suite account is ready.",
+          "",
+          "Open CAPP and enter the following when prompted:",
+          "  Username:       " + d.username,
+          "  Activation Key: " + d.password,
+          "",
+          "Two seats are included. The first two machines you",
+          "activate will be bound to your account automatically.",
+          "",
+          "Questions? Contact roger@cappvcs.com",
+        ].join("\\n");
+        // Clear form
+        ["c-school","c-username","c-clientid","c-password"].forEach(id => document.getElementById(id).value = "");
+      } else {
+        result.className = "result err";
+        result.textContent = "Error: " + (d.detail || JSON.stringify(d));
+      }
+    })
+    .catch(e => {
+      result.className = "result err";
+      result.textContent = "Network error: " + e;
+    });
+}
+</script>
+</body>
+</html>"""
