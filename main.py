@@ -874,13 +874,45 @@ def admin_create_client(
 def admin_list_clients():
     r = httpx.get(
         f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"select": "username,client_id,active,is_admin,seat_1_machine,seat_2_machine",
+        params={"select": "username,client_id,active,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date",
                 "order": "username.asc"},
         headers=_supa_headers_json(),
     )
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
     return r.json()
+
+
+@app.patch("/admin/api/clients/{username}", dependencies=[Depends(_require_admin)])
+def admin_update_client(username: str, payload: dict = Body(...)):
+    """Update editable fields: notes, next_invoice_date."""
+    allowed = {k: v for k, v in payload.items() if k in ("notes", "next_invoice_date")}
+    if not allowed:
+        raise HTTPException(status_code=400, detail="No editable fields provided.")
+    r = httpx.patch(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"username": f"eq.{username}"},
+        json=allowed,
+        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+    )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.patch("/admin/api/clients/{username}/reset-seat", dependencies=[Depends(_require_admin)])
+def admin_reset_single_seat(username: str, seat: int = Body(..., embed=True)):
+    """Reset a single seat (1 or 2)."""
+    col = "seat_1_machine" if seat == 1 else "seat_2_machine"
+    r = httpx.patch(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"username": f"eq.{username}"},
+        json={col: None},
+        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+    )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
 
 
 @app.patch("/admin/api/clients/{username}/reset-seats", dependencies=[Depends(_require_admin)])
@@ -930,39 +962,35 @@ _ADMIN_HTML = """<!DOCTYPE html>
 <title>CAPP Admin</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #070a0f; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; min-height: 100vh; }
+  body { background: #070a0f; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; min-height: 100vh; overflow-x: hidden; }
   #login { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; gap: 16px; }
   #login h1 { font-size: 22px; font-weight: 700; letter-spacing: 2px; }
-  #login input { background: #1a2230; border: 1px solid #2c3b55; border-radius: 8px; color: white;
-    font-size: 14px; padding: 10px 14px; width: 280px; outline: none; }
+  #login input { background: #1a2230; border: 1px solid #2c3b55; border-radius: 8px; color: white; font-size: 14px; padding: 10px 14px; width: 280px; outline: none; }
   #login input:focus { border-color: #3a7ebf; }
-  #login button { background: #3a7ebf; border: none; border-radius: 8px; color: white; cursor: pointer;
-    font-size: 14px; font-weight: 700; padding: 10px 0; width: 280px; }
+  #login button { background: #3a7ebf; border: none; border-radius: 8px; color: white; cursor: pointer; font-size: 14px; font-weight: 700; padding: 10px 0; width: 280px; }
   #login button:hover { background: #4a8ecf; }
   #login .err { color: #ef4444; font-size: 13px; }
-  #app { display: none; }
-  .header { background: #0d1117; border-bottom: 1px solid #1e2a3a; padding: 14px 28px;
-    display: flex; align-items: center; justify-content: space-between; }
+  #app { display: none; height: 100vh; flex-direction: column; }
+  .header { background: #0d1117; border-bottom: 1px solid #1e2a3a; padding: 14px 28px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
   .header h1 { font-size: 16px; font-weight: 700; letter-spacing: 2px; color: #3a7ebf; }
-  .header button { background: none; border: 1px solid #2c3b55; border-radius: 6px; color: #8b95a1;
-    cursor: pointer; font-size: 12px; padding: 5px 12px; }
-  .tabs { display: flex; gap: 2px; background: #0d1117; padding: 0 28px; border-bottom: 1px solid #1e2a3a; }
-  .tab { background: none; border: none; border-bottom: 2px solid transparent; color: #8b95a1;
-    cursor: pointer; font-size: 13px; font-weight: 600; padding: 12px 18px; }
+  .header button { background: none; border: 1px solid #2c3b55; border-radius: 6px; color: #8b95a1; cursor: pointer; font-size: 12px; padding: 5px 12px; }
+  .tabs { display: flex; gap: 2px; background: #0d1117; padding: 0 28px; border-bottom: 1px solid #1e2a3a; flex-shrink: 0; }
+  .tab { background: none; border: none; border-bottom: 2px solid transparent; color: #8b95a1; cursor: pointer; font-size: 13px; font-weight: 600; padding: 12px 18px; }
   .tab.active { border-bottom-color: #3a7ebf; color: white; }
-  .panel { display: none; padding: 28px; max-width: 860px; }
+  .main-area { display: flex; flex: 1; overflow: hidden; position: relative; }
+  .panel { display: none; padding: 28px; overflow-y: auto; flex: 1; }
   .panel.active { display: block; }
   .card { background: #1a2230; border: 1px solid #2c3b55; border-radius: 12px; padding: 22px; margin-bottom: 18px; }
   .card h2 { font-size: 15px; font-weight: 700; margin-bottom: 16px; color: #94b4d4; }
   .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
   .form-group { display: flex; flex-direction: column; gap: 5px; }
   .form-group label { color: #8b95a1; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
-  .form-group input { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white;
-    font-size: 13px; padding: 8px 12px; outline: none; }
-  .form-group input:focus { border-color: #3a7ebf; }
-  .form-group input::placeholder { color: #3a4a5a; }
-  .btn { border: none; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 700;
-    padding: 9px 22px; transition: background 0.15s; }
+  .form-group input, .form-group textarea { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white; font-size: 13px; padding: 8px 12px; outline: none; font-family: inherit; }
+  .form-group input:focus, .form-group textarea:focus { border-color: #3a7ebf; }
+  .form-group input:read-only { opacity: 0.5; cursor: default; }
+  .form-group textarea { resize: vertical; min-height: 70px; }
+  .form-group input::placeholder, .form-group textarea::placeholder { color: #3a4a5a; }
+  .btn { border: none; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 700; padding: 9px 22px; transition: background 0.15s; }
   .btn-primary { background: #3a7ebf; color: white; }
   .btn-primary:hover { background: #4a8ecf; }
   .btn-danger { background: #7f1d1d; color: #fca5a5; }
@@ -971,28 +999,47 @@ _ADMIN_HTML = """<!DOCTYPE html>
   .btn-warning:hover { background: #92400e; }
   .btn-success { background: #14532d; color: #86efac; }
   .btn-success:hover { background: #166534; }
-  .result { background: #0d1117; border: 1px solid #2c3b55; border-radius: 8px; color: #86efac;
-    font-family: monospace; font-size: 13px; margin-top: 14px; padding: 14px; white-space: pre-wrap; display: none; }
+  .btn-sm { font-size: 11px; padding: 5px 12px; border-radius: 6px; }
+  .result { background: #0d1117; border: 1px solid #2c3b55; border-radius: 8px; color: #86efac; font-family: monospace; font-size: 13px; margin-top: 14px; padding: 14px; white-space: pre-wrap; display: none; }
   .result.err { color: #fca5a5; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th { background: #0d1117; color: #8b95a1; font-size: 11px; font-weight: 700; letter-spacing: 1px;
-    padding: 10px 12px; text-align: left; text-transform: uppercase; }
+  th { background: #0d1117; color: #8b95a1; font-size: 11px; font-weight: 700; letter-spacing: 1px; padding: 10px 12px; text-align: left; text-transform: uppercase; }
   td { border-top: 1px solid #1e2a3a; color: #e2e8f0; padding: 10px 12px; vertical-align: middle; }
-  tr:hover td { background: #1a2230; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: #1e2d42; }
   .badge { border-radius: 4px; font-size: 11px; font-weight: 700; padding: 2px 8px; }
-  .badge-green  { background: #14532d; color: #86efac; }
-  .badge-red    { background: #7f1d1d; color: #fca5a5; }
-  .badge-blue   { background: #1e3a5f; color: #93c5fd; }
-  .badge-gray   { background: #1e2a3a; color: #8b95a1; }
-  .action-btns  { display: flex; gap: 6px; }
-  .action-btns button { font-size: 11px; padding: 4px 10px; border-radius: 5px; border: none;
-    cursor: pointer; font-weight: 700; }
-  #refresh-btn { float: right; }
+  .badge-green { background: #14532d; color: #86efac; }
+  .badge-red   { background: #7f1d1d; color: #fca5a5; }
+  .badge-blue  { background: #1e3a5f; color: #93c5fd; }
+  .badge-gray  { background: #1e2a3a; color: #8b95a1; }
   .loading { color: #8b95a1; font-size: 13px; padding: 20px 0; text-align: center; }
-  select { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white;
-    font-size: 13px; padding: 8px 12px; outline: none; width: 100%; cursor: pointer; }
+  select { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white; font-size: 13px; padding: 8px 12px; outline: none; width: 100%; cursor: pointer; }
   select:focus { border-color: #3a7ebf; }
   select:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Slide-out panel */
+  #slideout { position: fixed; top: 0; right: -420px; width: 420px; height: 100vh; background: #0d1117;
+    border-left: 1px solid #2c3b55; z-index: 100; transition: right 0.28s ease; overflow-y: auto;
+    display: flex; flex-direction: column; }
+  #slideout.open { right: 0; }
+  .so-header { background: #111827; border-bottom: 1px solid #2c3b55; padding: 18px 22px;
+    display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  .so-header h2 { font-size: 15px; font-weight: 700; color: #94b4d4; }
+  .so-close { background: none; border: none; color: #8b95a1; cursor: pointer; font-size: 20px; line-height: 1; padding: 0 4px; }
+  .so-close:hover { color: white; }
+  .so-body { padding: 22px; flex: 1; }
+  .so-section { margin-bottom: 22px; }
+  .so-section h3 { color: #8b95a1; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 12px; }
+  .so-field { margin-bottom: 10px; }
+  .so-field label { color: #8b95a1; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px; }
+  .so-val { color: #e2e8f0; font-size: 13px; background: #1a2230; border-radius: 6px; padding: 7px 10px; font-family: monospace; word-break: break-all; }
+  .so-val.muted { color: #8b95a1; font-family: inherit; }
+  .seat-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .seat-row .so-val { flex: 1; font-size: 11px; }
+  .so-footer { padding: 18px 22px; border-top: 1px solid #2c3b55; display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 99; }
+  .overlay.on { display: block; }
+  .so-save-msg { color: #86efac; font-size: 12px; margin-top: 6px; display: none; }
 </style>
 </head>
 <body>
@@ -1015,63 +1062,125 @@ _ADMIN_HTML = """<!DOCTYPE html>
     <button class="tab active" onclick="showTab('clients-tab', this)">Clients</button>
     <button class="tab" onclick="showTab('create-tab', this)">Create Account</button>
   </div>
+  <div class="main-area">
 
-  <!-- Clients list -->
-  <div class="panel active" id="clients-tab">
-    <div class="card">
-      <h2>All Accounts <button class="btn btn-primary" id="refresh-btn" onclick="loadClients()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button></h2>
-      <div id="clients-table"><div class="loading">Loading...</div></div>
+    <!-- Clients list -->
+    <div class="panel active" id="clients-tab">
+      <div class="card">
+        <h2>All Accounts
+          <button class="btn btn-primary" onclick="loadClients()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">Click any row to view details.</p>
+        <div id="clients-table"><div class="loading">Loading...</div></div>
+      </div>
     </div>
+
+    <!-- Create account -->
+    <div class="panel" id="create-tab">
+      <div class="card">
+        <h2>Create New Account</h2>
+        <div class="form-row">
+          <div class="form-group">
+            <label>League</label>
+            <select id="c-division" onchange="onDivisionChange()"><option value="">— Select League —</option></select>
+          </div>
+          <div class="form-group">
+            <label>Conference</label>
+            <select id="c-conference" onchange="onConferenceChange()" disabled><option value="">— Select Conference —</option></select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Team</label>
+            <select id="c-team" onchange="onTeamChange()" disabled><option value="">— Select Team —</option></select>
+          </div>
+          <div class="form-group">
+            <label>Password (blank = auto-generate)</label>
+            <input type="text" id="c-password" placeholder="Leave blank to generate">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Username <span style="color:#8b95a1;font-weight:400">(auto-filled, editable)</span></label>
+            <input type="text" id="c-username" placeholder="auto-filled from team">
+          </div>
+          <div class="form-group">
+            <label>Client ID <span style="color:#8b95a1;font-weight:400">(auto-filled, editable)</span></label>
+            <input type="text" id="c-clientid" placeholder="auto-filled from team">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="createClient()">Create Account</button>
+        <div class="result" id="create-result"></div>
+      </div>
+    </div>
+
+  </div><!-- end main-area -->
+</div><!-- end app -->
+
+<!-- Slide-out overlay -->
+<div class="overlay" id="overlay" onclick="closeSlideout()"></div>
+
+<!-- Slide-out panel -->
+<div id="slideout">
+  <div class="so-header">
+    <h2 id="so-title">Account Details</h2>
+    <button class="so-close" onclick="closeSlideout()">&#x2715;</button>
   </div>
+  <div class="so-body">
 
-  <!-- Create account -->
-  <div class="panel" id="create-tab">
-    <div class="card">
-      <h2>Create New Account</h2>
-      <div class="form-row">
-        <div class="form-group">
-          <label>League</label>
-          <select id="c-division" onchange="onDivisionChange()">
-            <option value="">— Select League —</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Conference</label>
-          <select id="c-conference" onchange="onConferenceChange()" disabled>
-            <option value="">— Select Conference —</option>
-          </select>
-        </div>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Team</label>
-          <select id="c-team" onchange="onTeamChange()" disabled>
-            <option value="">— Select Team —</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Password (blank = auto-generate)</label>
-          <input type="text" id="c-password" placeholder="Leave blank to generate">
-        </div>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Username <span style="color:#8b95a1;font-weight:400">(auto-filled, editable)</span></label>
-          <input type="text" id="c-username" placeholder="auto-filled from team">
-        </div>
-        <div class="form-group">
-          <label>Client ID <span style="color:#8b95a1;font-weight:400">(auto-filled, editable)</span></label>
-          <input type="text" id="c-clientid" placeholder="auto-filled from team">
-        </div>
-      </div>
-      <button class="btn btn-primary" onclick="createClient()">Create Account</button>
-      <div class="result" id="create-result"></div>
+    <div class="so-section">
+      <h3>Account Info</h3>
+      <div class="so-field"><label>Username</label><div class="so-val" id="so-username">—</div></div>
+      <div class="so-field"><label>Client ID</label><div class="so-val" id="so-clientid">—</div></div>
+      <div class="so-field"><label>Status</label><div id="so-status">—</div></div>
     </div>
+
+    <div class="so-section">
+      <h3>Machine Seats</h3>
+      <div class="so-field">
+        <label>Seat 1</label>
+        <div class="seat-row">
+          <div class="so-val muted" id="so-seat1">—</div>
+          <button class="btn btn-warning btn-sm" onclick="resetSeat(1)">Reset</button>
+        </div>
+      </div>
+      <div class="so-field">
+        <label>Seat 2</label>
+        <div class="seat-row">
+          <div class="so-val muted" id="so-seat2">—</div>
+          <button class="btn btn-warning btn-sm" onclick="resetSeat(2)">Reset</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="so-section">
+      <h3>Billing</h3>
+      <div class="so-field">
+        <label>Next Invoice Date</label>
+        <div class="form-group"><input type="date" id="so-invoice-date"></div>
+      </div>
+    </div>
+
+    <div class="so-section">
+      <h3>Notes</h3>
+      <div class="form-group">
+        <textarea id="so-notes" placeholder="Contact name, phone, PO number, anything useful..."></textarea>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="saveDetails()" style="margin-top:8px;">Save Notes & Date</button>
+      <div class="so-save-msg" id="so-save-msg">Saved.</div>
+    </div>
+
+  </div>
+  <div class="so-footer">
+    <button class="btn btn-success btn-sm" id="so-toggle-btn" onclick="toggleActiveFromSlideout()">—</button>
+    <button class="btn btn-danger btn-sm" onclick="deleteFromSlideout()">Delete Account</button>
   </div>
 </div>
 
 <script>
 let _token = "";
+let _currentUser = null;
+let _allClients = [];
 
 function doLogin() {
   const pw = document.getElementById("pw-input").value.trim();
@@ -1081,7 +1190,8 @@ function doLogin() {
       if (r.ok) {
         _token = pw;
         document.getElementById("login").style.display = "none";
-        document.getElementById("app").style.display = "block";
+        const app = document.getElementById("app");
+        app.style.display = "flex";
         loadClients();
       } else {
         document.getElementById("login-err").textContent = "Incorrect password.";
@@ -1093,10 +1203,11 @@ function doLogin() {
 document.getElementById("pw-input").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
 
 function logout() {
-  _token = "";
+  _token = ""; _currentUser = null; _allClients = [];
   document.getElementById("app").style.display = "none";
   document.getElementById("login").style.display = "flex";
   document.getElementById("pw-input").value = "";
+  closeSlideout();
 }
 
 function showTab(id, btn) {
@@ -1106,15 +1217,18 @@ function showTab(id, btn) {
   btn.classList.add("active");
   if (id === "clients-tab") loadClients();
   if (id === "create-tab") loadTeams();
+  closeSlideout();
 }
 
 function api(method, path, body) {
   return fetch("/admin/api" + path, {
     method,
     headers: { "x-admin-token": _token, "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   }).then(r => r.json());
 }
+
+// ── Clients table ─────────────────────────────────────────────────────────────
 
 function loadClients() {
   document.getElementById("clients-table").innerHTML = '<div class="loading">Loading...</div>';
@@ -1123,63 +1237,129 @@ function loadClients() {
       document.getElementById("clients-table").innerHTML = '<div class="loading">Error loading clients.</div>';
       return;
     }
+    _allClients = data;
     if (data.length === 0) {
       document.getElementById("clients-table").innerHTML = '<div class="loading">No accounts yet.</div>';
       return;
     }
-    let rows = data.map(c => {
-      const active  = c.active ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-red">Inactive</span>';
-      const admin   = c.is_admin ? '<span class="badge badge-blue">Admin</span>' : '';
-      const s1      = c.seat_1_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
-      const s2      = c.seat_2_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
-      const toggleLbl = c.active ? "Deactivate" : "Reactivate";
-      const toggleCls = c.active ? "btn-danger" : "btn-success";
-      return `<tr>
+    const rows = data.map(c => {
+      const active = c.active ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-red">Inactive</span>';
+      const admin  = c.is_admin ? ' <span class="badge badge-blue">Admin</span>' : '';
+      const s1     = c.seat_1_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
+      const s2     = c.seat_2_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
+      const inv    = c.next_invoice_date ? c.next_invoice_date : '<span style="color:#8b95a1">—</span>';
+      return `<tr class="clickable" onclick="openSlideout('${c.username}')">
         <td>${c.username}</td>
         <td>${c.client_id}</td>
-        <td>${active} ${admin}</td>
-        <td>${s1}</td>
-        <td>${s2}</td>
-        <td>
-          <div class="action-btns">
-            <button class="btn btn-warning" onclick="resetSeats('${c.username}')">Reset Seats</button>
-            <button class="btn ${toggleCls}" onclick="toggleActive('${c.username}', ${!c.active})">${toggleLbl}</button>
-            <button class="btn btn-danger" onclick="deleteAccount('${c.username}')">Delete</button>
-          </div>
-        </td>
+        <td>${active}${admin}</td>
+        <td>${s1}</td><td>${s2}</td>
+        <td>${inv}</td>
       </tr>`;
     }).join("");
     document.getElementById("clients-table").innerHTML = `
       <table>
-        <thead><tr><th>Username</th><th>Client ID</th><th>Status</th><th>Seat 1</th><th>Seat 2</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Username</th><th>Client ID</th><th>Status</th><th>Seat 1</th><th>Seat 2</th><th>Next Invoice</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   });
 }
 
-function resetSeats(username) {
-  if (!confirm("Clear both seat bindings for " + username + "?\\nThey will be able to activate on 2 new machines.")) return;
-  api("PATCH", "/clients/" + username + "/reset-seats")
-    .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
+// ── Slide-out ─────────────────────────────────────────────────────────────────
+
+function openSlideout(username) {
+  const c = _allClients.find(x => x.username === username);
+  if (!c) return;
+  _currentUser = c;
+
+  document.getElementById("so-title").textContent = c.username;
+  document.getElementById("so-username").textContent = c.username;
+  document.getElementById("so-clientid").textContent = c.client_id;
+
+  const statusEl = document.getElementById("so-status");
+  statusEl.innerHTML = c.active
+    ? '<span class="badge badge-green">Active</span>'
+    : '<span class="badge badge-red">Inactive</span>';
+  if (c.is_admin) statusEl.innerHTML += ' <span class="badge badge-blue">Admin</span>';
+
+  document.getElementById("so-seat1").textContent = c.seat_1_machine
+    ? c.seat_1_machine.substring(0, 24) + "…" : "Open";
+  document.getElementById("so-seat2").textContent = c.seat_2_machine
+    ? c.seat_2_machine.substring(0, 24) + "…" : "Open";
+
+  document.getElementById("so-invoice-date").value = c.next_invoice_date || "";
+  document.getElementById("so-notes").value = c.notes || "";
+  document.getElementById("so-save-msg").style.display = "none";
+
+  const toggleBtn = document.getElementById("so-toggle-btn");
+  if (c.active) {
+    toggleBtn.textContent = "Deactivate";
+    toggleBtn.className = "btn btn-danger btn-sm";
+  } else {
+    toggleBtn.textContent = "Reactivate";
+    toggleBtn.className = "btn btn-success btn-sm";
+  }
+
+  document.getElementById("slideout").classList.add("open");
+  document.getElementById("overlay").classList.add("on");
 }
 
-function deleteAccount(username) {
+function closeSlideout() {
+  document.getElementById("slideout").classList.remove("open");
+  document.getElementById("overlay").classList.remove("on");
+  _currentUser = null;
+}
+
+function resetSeat(seat) {
+  if (!_currentUser) return;
+  if (!confirm("Reset Seat " + seat + " for " + _currentUser.username + "?\\nThey can activate on a new machine for that seat.")) return;
+  api("PATCH", "/clients/" + _currentUser.username + "/reset-seat", { seat })
+    .then(d => {
+      if (d.ok) { loadClients(); closeSlideout(); }
+      else alert("Error: " + JSON.stringify(d));
+    });
+}
+
+function saveDetails() {
+  if (!_currentUser) return;
+  const notes   = document.getElementById("so-notes").value;
+  const invDate = document.getElementById("so-invoice-date").value || null;
+  api("PATCH", "/clients/" + _currentUser.username, { notes, next_invoice_date: invDate })
+    .then(d => {
+      if (d.ok) {
+        const msg = document.getElementById("so-save-msg");
+        msg.style.display = "block";
+        setTimeout(() => msg.style.display = "none", 2000);
+        loadClients();
+      } else {
+        alert("Error: " + JSON.stringify(d));
+      }
+    });
+}
+
+function toggleActiveFromSlideout() {
+  if (!_currentUser) return;
+  const newState = !_currentUser.active;
+  const msg = newState
+    ? "Reactivate " + _currentUser.username + "?"
+    : "Deactivate " + _currentUser.username + "? This will block all their logins.";
+  if (!confirm(msg)) return;
+  api("PATCH", "/clients/" + _currentUser.username + "/deactivate", { active: newState })
+    .then(d => { if (d.ok) { loadClients(); closeSlideout(); } else alert("Error: " + JSON.stringify(d)); });
+}
+
+function deleteFromSlideout() {
+  if (!_currentUser) return;
   if (!confirm(
-    "DELETE account: " + username + "\\n\\n" +
+    "DELETE account: " + _currentUser.username + "\\n\\n" +
     "This permanently removes their account from the database.\\n" +
     "Their CAPP app will stop working immediately.\\n\\n" +
     "This cannot be undone. Are you sure?"
   )) return;
-  api("DELETE", "/clients/" + username)
-    .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
+  api("DELETE", "/clients/" + _currentUser.username)
+    .then(d => { if (d.ok) { loadClients(); closeSlideout(); } else alert("Error: " + JSON.stringify(d)); });
 }
 
-function toggleActive(username, newState) {
-  const msg = newState ? "Reactivate " + username + "?" : "Deactivate " + username + "? This will block all their logins.";
-  if (!confirm(msg)) return;
-  api("PATCH", "/clients/" + username + "/deactivate", { active: newState })
-    .then(d => { if (d.ok) loadClients(); else alert("Error: " + JSON.stringify(d)); });
-}
+// ── Create account ────────────────────────────────────────────────────────────
 
 let _teamsData = {};
 
@@ -1188,7 +1368,6 @@ function loadTeams() {
     _teamsData = data;
     const divSel = document.getElementById("c-division");
     divSel.innerHTML = '<option value="">— Select League —</option>';
-    // Order: NFL first, then FBS, then FCS
     const order = ["NFL", "FBS", "FCS"];
     const divs = order.filter(d => data[d]).concat(Object.keys(data).filter(d => !order.includes(d)));
     divs.forEach(div => {
@@ -1209,8 +1388,7 @@ function onDivisionChange() {
   team.disabled = true;
   if (!div) { conf.disabled = true; return; }
   conf.disabled = false;
-  const confs = Object.keys(_teamsData[div] || {}).sort();
-  confs.forEach(c => {
+  Object.keys(_teamsData[div] || {}).sort().forEach(c => {
     const opt = document.createElement("option");
     opt.value = c; opt.textContent = c;
     conf.appendChild(opt);
@@ -1224,8 +1402,7 @@ function onConferenceChange() {
   team.innerHTML = '<option value="">— Select Team —</option>';
   if (!conf) { team.disabled = true; return; }
   team.disabled = false;
-  const teams = (_teamsData[div] || {})[conf] || [];
-  teams.forEach(t => {
+  ((_teamsData[div] || {})[conf] || []).forEach(t => {
     const opt = document.createElement("option");
     opt.value = t; opt.textContent = toTitle(t);
     team.appendChild(opt);
@@ -1252,41 +1429,31 @@ function createClient() {
   const result   = document.getElementById("create-result");
 
   if (!school || !username || !clientId) {
-    result.className = "result err";
-    result.style.display = "block";
+    result.className = "result err"; result.style.display = "block";
     result.textContent = "Please select a team and confirm username / client ID.";
     return;
   }
-
-  result.className = "result";
-  result.style.display = "block";
+  result.className = "result"; result.style.display = "block";
   result.textContent = "Creating account...";
 
   api("POST", "/clients", { username, client_id: clientId, school, password, is_admin: false })
     .then(d => {
       if (d.ok) {
         result.textContent = [
-          "ACCOUNT CREATED",
-          "",
+          "ACCOUNT CREATED", "",
           "School:         " + d.school,
           "Username:       " + d.username,
           "Activation Key: " + d.password,
-          "Client ID:      " + d.client_id,
-          "",
-          "--- EMAIL TEMPLATE ---",
-          "",
-          "Your CAPP Video Coordinator Suite account is ready.",
-          "",
+          "Client ID:      " + d.client_id, "",
+          "--- EMAIL TEMPLATE ---", "",
+          "Your CAPP Video Coordinator Suite account is ready.", "",
           "Open CAPP and enter the following when prompted:",
           "  Username:       " + d.username,
-          "  Activation Key: " + d.password,
-          "",
+          "  Activation Key: " + d.password, "",
           "Two seats are included. The first two machines you",
-          "activate will be bound to your account automatically.",
-          "",
+          "activate will be bound to your account automatically.", "",
           "Questions? Contact roger@cappvcs.com",
         ].join("\\n");
-        // Clear form
         ["c-username","c-clientid","c-password"].forEach(id => document.getElementById(id).value = "");
         document.getElementById("c-division").value = "";
         onDivisionChange();
@@ -1295,10 +1462,7 @@ function createClient() {
         result.textContent = "Error: " + (d.detail || JSON.stringify(d));
       }
     })
-    .catch(e => {
-      result.className = "result err";
-      result.textContent = "Network error: " + e;
-    });
+    .catch(e => { result.className = "result err"; result.textContent = "Network error: " + e; });
 }
 </script>
 </body>
