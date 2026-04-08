@@ -128,7 +128,10 @@ def plays(
     league: str = Query("cfb", description="cfb or nfl"),
     force_refresh: bool = Query(False, description="Bypass cache and re-fetch from API"),
 ):
-    return get_game_plays(game_id, league=league, force_refresh=force_refresh)
+    try:
+        return get_game_plays(game_id, league=league, force_refresh=force_refresh)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 @app.get("/game/{game_id}/version", dependencies=[Depends(verify_api_key)])
 def game_version(game_id: str):

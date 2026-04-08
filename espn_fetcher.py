@@ -7,6 +7,15 @@ returns fully CAPP-ready play entries to clients.
 import requests
 import threading
 import time
+import unicodedata
+
+
+def _strip_accents(s: str) -> str:
+    """Normalize accented characters to ASCII equivalents (e.g. José → Jose)."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
 
 # ============================================================
 # ESPN API URLs
@@ -253,7 +262,7 @@ _lock = threading.Lock()
 def espn_name_to_capp_name(espn_display_name, league="cfb"):
     if not espn_display_name:
         return None
-    name = espn_display_name.strip()
+    name = _strip_accents(espn_display_name.strip())
     if league == "nfl":
         if name in NFL_TEAM_NAMES:
             return name
