@@ -770,6 +770,7 @@ def _supa_headers_json():
 
 import secrets as _secrets
 import string as _string
+import re as _re
 
 def _gen_password(length=16) -> str:
     alpha = _string.ascii_letters + _string.digits + "!@#$^&*"
@@ -780,6 +781,74 @@ def _gen_api_key() -> str:
 
 def _hash_pw(password: str, salt: str) -> str:
     return hashlib.sha256((password + salt).encode()).hexdigest()
+
+
+def _school_slug(name: str) -> str:
+    """'Air Force' -> 'air_force'"""
+    return _re.sub(r'[^a-z0-9]+', '_', name.lower().strip()).strip('_') or "school"
+
+
+@app.post("/register")
+def self_register(
+    school:   str = Body(..., embed=True),   # school/team name
+    email:    str = Body(..., embed=True),   # used as username
+    password: str = Body(..., embed=True),
+):
+    """
+    Self-service registration — no admin token required.
+    Creates an active account and returns client_id + api_key immediately.
+    The customer can then activate from inside the app.
+    """
+    username = email.strip().lower()
+    if not username or not password or not school.strip():
+        raise HTTPException(status_code=400, detail="school, email, and password are required.")
+
+    # Reject duplicate email/username
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"username": f"eq.{username}", "select": "username"},
+        headers=_supa_headers_json(),
+    )
+    if r.status_code == 200 and r.json():
+        raise HTTPException(status_code=409, detail="An account with that email already exists.")
+
+    # Generate a unique client_id from school name
+    base_slug = _school_slug(school.strip())
+    client_id = base_slug
+    for n in range(2, 20):
+        rc = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"client_id": f"eq.{client_id}", "select": "client_id"},
+            headers=_supa_headers_json(),
+        )
+        if rc.status_code == 200 and not rc.json():
+            break
+        client_id = f"{base_slug}_{n}"
+
+    salt    = _secrets.token_hex(16)
+    pw_hash = _hash_pw(password, salt)
+    api_key = _gen_api_key()
+
+    row = {
+        "client_id":      client_id,
+        "username":       username,
+        "password_hash":  pw_hash,
+        "salt":           salt,
+        "api_key":        api_key,
+        "active":         True,
+        "is_admin":       False,
+        "seat_1_machine": None,
+        "seat_2_machine": None,
+    }
+    r2 = httpx.post(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        json=row,
+        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+    )
+    if r2.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=f"Account creation failed: {r2.text}")
+
+    return {"client_id": client_id, "api_key": api_key}
 
 
 @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
