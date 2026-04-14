@@ -141,6 +141,55 @@ def game_version(game_id: str):
     return {"game_id": game_id, "fetched_at": get_game_version(game_id)}
 
 
+# ── Trial / License Status ────────────────────────────────────────────────────
+
+TRIAL_DAYS = 7
+
+@app.get("/trial/status")
+def trial_status(x_api_key: str = Header(None, alias="x-api-key")):
+    """
+    Returns trial/license status for an activated account.
+    Both seats of a school share the same clock (tied to account created_at).
+    """
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="API key required.")
+
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/capp_clients",
+        params={"api_key": f"eq.{x_api_key}",
+                "select": "client_id,active,licensed,created_at"},
+        headers=_supabase_headers(),
+    )
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=401, detail="Invalid API key.")
+
+    user = r.json()[0]
+    if not user.get("active"):
+        raise HTTPException(status_code=403, detail="Account is deactivated.")
+
+    # Fully licensed — no expiry
+    if user.get("licensed"):
+        return {"active": True, "licensed": True, "days_remaining": 9999,
+                "trial_days": TRIAL_DAYS}
+
+    # Trial — clock starts at account created_at
+    from datetime import datetime, timezone
+    try:
+        created_str = user.get("created_at", "")
+        created_at  = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+        elapsed     = (datetime.now(timezone.utc) - created_at).days
+        remaining   = max(0, TRIAL_DAYS - elapsed)
+    except Exception:
+        remaining = TRIAL_DAYS   # malformed date — be generous
+
+    return {
+        "active":        remaining > 0,
+        "licensed":      False,
+        "days_remaining": remaining,
+        "trial_days":    TRIAL_DAYS,
+    }
+
+
 # ── Auth Endpoints ─────────────────────────────────────────────────────────────
 
 @app.post("/nodes/login")
