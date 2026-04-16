@@ -9,7 +9,7 @@ import sqlite3
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
 
-from espn_fetcher import get_live_games, get_game_plays, get_game_version, start_poller
+from espn_fetcher import get_live_games, get_game_plays, get_game_version, start_poller, get_team_list, get_team_schedule
 from db_updater import run_update
 
 
@@ -139,6 +139,26 @@ def game_version(game_id: str):
     cached entry.  Clients poll this every 60 s to detect retroactive data
     corrections without re-downloading the full play list each time."""
     return {"game_id": game_id, "fetched_at": get_game_version(game_id)}
+
+@app.get("/teams", dependencies=[Depends(verify_api_key)])
+def teams(league: str = Query("cfb", description="cfb or nfl")):
+    """Raw ESPN team list — [{display_name, id}]. Client handles name resolution."""
+    try:
+        return {"teams": get_team_list(league)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+@app.get("/team/{team_id}/schedule", dependencies=[Depends(verify_api_key)])
+def team_schedule(
+    team_id: str,
+    league: str = Query("cfb", description="cfb or nfl"),
+    season: Optional[int] = Query(None, description="Season year e.g. 2026"),
+):
+    """Proxy ESPN team schedule. Returns [{game_id, home_team, away_team, status, week, …}]."""
+    try:
+        return {"games": get_team_schedule(team_id, season=season, league=league)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 # ── Trial / License Status ────────────────────────────────────────────────────

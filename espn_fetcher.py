@@ -1286,3 +1286,141 @@ def get_game_plays(game_id, league="cfb", force_refresh=False):
     with _lock:
         _plays_cache[game_id] = result        # cache fresh result for subsequent requests
     return result
+
+
+# ── Team list + schedule proxy ────────────────────────────────────────────────
+import time as _time
+
+_team_list_cache: dict = {}
+_team_list_ts: dict = {}
+_TEAM_LIST_TTL = 86400  # 24 h — team rosters barely change mid-season
+
+_schedule_cache: dict = {}
+_schedule_ts: dict = {}
+_SCHEDULE_TTL = 3600  # 1 h — enough freshness for pre-season schedule browsing
+
+
+def get_team_list(league: str = "cfb") -> list:
+    """
+    Return raw ESPN team list as [{display_name, id}].
+    Cached for 24 h. Client is responsible for name resolution.
+    """
+    if league in _team_list_cache and _time.time() - _team_list_ts.get(league, 0) < _TEAM_LIST_TTL:
+        return _team_list_cache[league]
+
+    if league == "nfl":
+        url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
+        params: dict = {"limit": 50}
+    else:
+        url = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/teams"
+        params = {"limit": 1000}
+
+    r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    raw_teams = data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+    result = [
+        {"display_name": t.get("team", {}).get("displayName", ""),
+         "id":           t.get("team", {}).get("id", "")}
+        for t in raw_teams
+        if t.get("team", {}).get("displayName") and t.get("team", {}).get("id")
+    ]
+
+    _team_list_cache[league] = result
+    _team_list_ts[league] = _time.time()
+    return result
+
+
+def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> list:
+    """
+    Proxy ESPN team schedule endpoint. Returns a list of game dicts with the
+    same structure as the games list (game_id, home_team, away_team, status, …)
+    plus week and season_type fields. Cached for 1 h per team/season/league.
+    """
+    cache_key = f"{league}_{team_id}_{season}"
+    if cache_key in _schedule_cache and _time.time() - _schedule_ts.get(cache_key, 0) < _SCHEDULE_TTL:
+        return _schedule_cache[cache_key]
+
+    if league == "nfl":
+        url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_id}/schedule"
+    else:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/football/college-football/teams/{team_id}/schedule"
+
+    params: dict = {}
+    if season:
+        params["season"] = season
+
+    r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    all_events = list(data.get("events", []))
+    postseason_ids: set = set()
+    if league == "nfl":
+        try:
+            post_params = dict(params)
+            post_params["seasontype"] = 3
+            post_r = _session.get(url, params=post_params, timeout=REQUEST_TIMEOUT)
+            if post_r.ok:
+                post_events = post_r.json().get("events", [])
+                postseason_ids = {e.get("id") for e in post_events}
+                all_events += post_events
+        except Exception:
+            pass
+
+    games = []
+    for event in all_events:
+        competition = event.get("competitions", [{}])[0]
+        status_obj  = competition.get("status", {})
+        state  = status_obj.get("type", {}).get("state", "pre")
+        detail = status_obj.get("type", {}).get("shortDetail", "")
+        clock  = status_obj.get("displayClock", "0:00")
+        period = status_obj.get("period", 0)
+
+        home = away = None
+        for competitor in competition.get("competitors", []):
+            score_raw = competitor.get("score", 0)
+            score = int(score_raw.get("value", 0) if isinstance(score_raw, dict) else score_raw or 0)
+            info = {
+                "team":    competitor.get("team", {}).get("displayName", ""),
+                "abbrev":  competitor.get("team", {}).get("abbreviation", ""),
+                "score":   score,
+                "team_id": competitor.get("team", {}).get("id", ""),
+            }
+            if competitor.get("homeAway") == "home":
+                home = info
+            else:
+                away = info
+
+        if not home or not away:
+            continue
+
+        conf_name = ""
+        if competition.get("conferenceCompetition", False):
+            grp = competition.get("groups") or {}
+            conf_name = grp.get("shortName") or grp.get("name", "")
+
+        games.append({
+            "game_id":      event.get("id", ""),
+            "home_team":    home["team"],
+            "home_abbrev":  home["abbrev"],
+            "home_score":   home["score"],
+            "home_team_id": home["team_id"],
+            "away_team":    away["team"],
+            "away_abbrev":  away["abbrev"],
+            "away_score":   away["score"],
+            "away_team_id": away["team_id"],
+            "status":        state,
+            "status_detail": detail,
+            "period":        period,
+            "clock":         clock,
+            "conference":    conf_name,
+            "date":          event.get("date", ""),
+            "week":          event.get("week", {}).get("number", ""),
+            "season_type":   3 if event.get("id") in postseason_ids else 2,
+        })
+
+    _schedule_cache[cache_key] = games
+    _schedule_ts[cache_key] = _time.time()
+    return games
