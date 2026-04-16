@@ -1293,11 +1293,11 @@ import time as _time
 
 _team_list_cache: dict = {}
 _team_list_ts: dict = {}
-_TEAM_LIST_TTL = 86400  # 24 h — team rosters barely change mid-season
+_TEAM_LIST_CACHE_SECONDS = 86400  # re-fetch team list from ESPN once per day
 
 _schedule_cache: dict = {}
 _schedule_ts: dict = {}
-_SCHEDULE_TTL = 3600  # 1 h — enough freshness for pre-season schedule browsing
+_SCHEDULE_CACHE_SECONDS = 86400  # re-fetch a team's schedule from ESPN once per day
 
 
 def get_team_list(league: str = "cfb") -> list:
@@ -1305,7 +1305,7 @@ def get_team_list(league: str = "cfb") -> list:
     Return raw ESPN team list as [{display_name, id}].
     Cached for 24 h. Client is responsible for name resolution.
     """
-    if league in _team_list_cache and _time.time() - _team_list_ts.get(league, 0) < _TEAM_LIST_TTL:
+    if league in _team_list_cache and _time.time() - _team_list_ts.get(league, 0) < _TEAM_LIST_CACHE_SECONDS:
         return _team_list_cache[league]
 
     if league == "nfl":
@@ -1339,7 +1339,7 @@ def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> 
     plus week and season_type fields. Cached for 1 h per team/season/league.
     """
     cache_key = f"{league}_{team_id}_{season}"
-    if cache_key in _schedule_cache and _time.time() - _schedule_ts.get(cache_key, 0) < _SCHEDULE_TTL:
+    if cache_key in _schedule_cache and _time.time() - _schedule_ts.get(cache_key, 0) < _SCHEDULE_CACHE_SECONDS:
         return _schedule_cache[cache_key]
 
     if league == "nfl":
