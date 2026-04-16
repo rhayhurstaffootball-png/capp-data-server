@@ -306,7 +306,7 @@ _PLAY_DURATION = {
     "field goal good": 5, "field goal missed": 5, "blocked field goal": 5,
     "blocked punt": 5, "sack": 7, "penalty": 6, "fumble recovery": 7,
     "interception": 7, "pass interception return": 7,
-    "kickoff": 5, "kickoff return": 5, "timeout": 0,
+    "kickoff": 5, "kickoff return": 5, "timeout": 0, "officials time out": 0,
 }
 _DEFAULT_DURATION = 6
 
@@ -619,7 +619,7 @@ def _qc_flag_entries(entries, home_name, away_name):
         c, p = entries[i], entries[i - 1]
         if (c.get("clock") == p.get("clock")
                 and c.get("quarter") == p.get("quarter")
-                and str(c.get("down", "")) not in ("KO", "EP", "2PT")):
+                and str(c.get("down", "")) not in ("KO", "EP", "2PT", "OTO")):
             streak += 1
             if streak == _QC_STUCK_THRESH:
                 flags.setdefault(i, []).append(f"Clock stuck ({streak}+ plays)")
@@ -753,15 +753,51 @@ def _parse_play(play, drive_team_id, home_team_id, away_team_id):
     type_text = play_type.get("text", "")
     type_id = int(play_type.get("id", 0))
     _skip = type_text.lower()
-    if _skip in ("end period", "end of half", "end of game", "coin toss",
-                 "two-minute warning", "officials time out"):
+
+    # Filter pure administrative entries with no football content
+    if _skip in ("end period", "end of half", "end of game", "coin toss", "two-minute warning"):
         return None
-    desc_text = play.get("text", "").lower()
-    if "official timeout" in desc_text or "officials time out" in desc_text:
-        return None
+
+    # Detect officials timeout vs team timeout.
+    # Team timeouts (type_text="Timeout" or type_id=21) must NOT be treated as OTO —
+    # ESPN sometimes labels them "Official Timeout #1 by Air Force at 2:45" in the
+    # description, which would otherwise be caught by the text-based OTO check.
+    _is_team_timeout = (_skip == "timeout" or type_id == 21)
+    _text_lower = play.get("text", "").lower()
+    _is_oto = (not _is_team_timeout and
+               (_skip == "officials time out" or
+                "official timeout" in _text_lower or
+                "officials time out" in _text_lower))
+
     clock_obj = play.get("clock", {})
     clock_display = clock_obj.get("displayValue", "0:00")
     period_num = int(play.get("period", {}).get("number", 1))
+    home_score = int(play.get("homeScore", 0))
+    away_score = int(play.get("awayScore", 0))
+    text = play.get("text", "")
+    sequence_number = int(play.get("sequenceNumber", "0"))
+
+    # Officials timeout: emit an OTO row instead of silently skipping
+    if _is_oto:
+        return {
+            "espn_play_id": play_id,
+            "sequence_number": sequence_number,
+            "period": period_num,
+            "clock": clock_display,
+            "play_type_text": "Officials Time Out",
+            "play_type_id": type_id,
+            "description": text or "Officials Timeout",
+            "home_score": home_score,
+            "away_score": away_score,
+            "start_down": None, "start_distance": None, "yards_to_endzone": None,
+            "start_yard_line": 0, "start_team_id": "", "stat_yardage": 0,
+            "scoring_play": False, "score_value": 0, "drive_team_id": "",
+            "end_down": None, "end_distance": None, "end_yards_to_endzone": None,
+            "point_after_attempt": None,
+            "wallclock": play.get("wallclock", ""),
+            "is_officials_timeout": True,
+        }
+
     start = play.get("start", {})
     end = play.get("end", {})
     start_down = start.get("down", None)
@@ -773,10 +809,6 @@ def _parse_play(play, drive_team_id, home_team_id, away_team_id):
     stat_yardage = play.get("statYardage", 0)
     scoring_play = play.get("scoringPlay", False)
     score_value = play.get("scoreValue", 0)
-    home_score = int(play.get("homeScore", 0))
-    away_score = int(play.get("awayScore", 0))
-    text = play.get("text", "")
-    sequence_number = int(play.get("sequenceNumber", "0"))
     point_after = play.get("pointAfterAttempt")
     pat_data = None
     if point_after:
@@ -826,6 +858,27 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
     clock = play.get("clock", "0:00")
     home_score = play.get("home_score", 0)
     away_score = play.get("away_score", 0)
+
+    # Officials timeout: emit a single OTO row — no possession/down/gain
+    if play.get("is_officials_timeout"):
+        return [{
+            "home_score":     home_score,
+            "away_score":     away_score,
+            "clock":          clock,
+            "quarter":        quarter,
+            "down":           "OTO",
+            "distance":       0,
+            "gain":           0,
+            "field_position": "",
+            "possession":     "",
+            "run_clock":      "No",
+            "home_time_out":  "No",
+            "away_time_out":  "No",
+            "play_text":      description or "Officials Timeout",
+            "wallclock":      play.get("wallclock", ""),
+            "qc_issue":       "",
+        }]
+
     type_text_lower = type_text.lower()
 
     is_kickoff = "kickoff" in type_text_lower and "return" not in type_text_lower
@@ -860,6 +913,14 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         down = "EP"; distance = 3; gain = 0; field_position = 3
     elif is_two_point:
         down = "2PT"; distance = 3; gain = 0; field_position = 3
+    elif is_punt:
+        down = "P"
+        distance = start_distance if start_distance else 10
+        gain = stat_yardage
+    elif is_field_goal:
+        down = "FG"
+        distance = start_distance if start_distance else 10
+        gain = stat_yardage
     elif is_timeout:
         down = str(start_down) if start_down else "1"
         distance = start_distance if start_distance else 10
