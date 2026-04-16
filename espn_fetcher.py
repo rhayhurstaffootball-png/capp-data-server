@@ -933,7 +933,7 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
     elif is_two_point:
         down = "2PT"; distance = 3; gain = 0; field_position = 3
     elif is_punt:
-        down = "P"
+        down = str(start_down) if start_down else "4"
         distance = start_distance if start_distance else 10
         gain = stat_yardage
     elif is_field_goal:
