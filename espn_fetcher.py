@@ -1376,17 +1376,16 @@ def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> 
 
     all_events = list(data.get("events", []))
     postseason_ids: set = set()
-    if league == "nfl":
-        try:
-            post_params = dict(params)
-            post_params["seasontype"] = 3
-            post_r = _session.get(url, params=post_params, timeout=REQUEST_TIMEOUT)
-            if post_r.ok:
-                post_events = post_r.json().get("events", [])
-                postseason_ids = {e.get("id") for e in post_events}
-                all_events += post_events
-        except Exception:
-            pass
+    try:
+        post_params = dict(params)
+        post_params["seasontype"] = 3
+        post_r = _session.get(url, params=post_params, timeout=REQUEST_TIMEOUT)
+        if post_r.ok:
+            post_events = post_r.json().get("events", [])
+            postseason_ids = {e.get("id") for e in post_events}
+            all_events += post_events
+    except Exception:
+        pass
 
     games = []
     for event in all_events:
