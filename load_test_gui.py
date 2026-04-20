@@ -83,6 +83,7 @@ class WorkerState:
     play_count:    int    = 0
     last_latency:  float  = 0.0
     errors:        int    = 0
+    last_error:    str    = ""
     last_active:   float  = 0.0
 
 
@@ -91,6 +92,7 @@ worker_states: list[WorkerState] = []
 total_requests  = 0
 total_errors    = 0
 all_latencies:  list[float] = []
+error_log:      list[str]   = []   # timestamped error messages for the log panel
 state_lock      = threading.Lock()
 test_running    = False
 test_start_time = 0.0
@@ -99,6 +101,15 @@ owned_api_key   = ""
 
 
 # ── Async worker ──────────────────────────────────────────────────────────────
+def _log_error(w: WorkerState, endpoint: str, detail: str):
+    """Append a timestamped error entry to the global error log (called under state_lock)."""
+    ts      = time.strftime("%H:%M:%S")
+    team    = f"{w.home_name} vs {w.away_name}" if w.home_name != "—" else w.game_id
+    msg     = f"[{ts}]  Worker {w.worker_id+1:>2}  {team:<30}  {endpoint:<22}  {detail}"
+    error_log.append(msg)
+    w.last_error = detail
+
+
 async def run_worker(w: WorkerState, base_url: str, api_key: str,
                      stop: asyncio.Event):
     global total_requests, total_errors, all_latencies
@@ -139,13 +150,16 @@ async def run_worker(w: WorkerState, base_url: str, api_key: str,
                             w.errors += 1
                             total_errors += 1
                             w.status = f"Error {r.status_code}"
-                except Exception:
+                            _log_error(w, "GET /game/version",
+                                       f"HTTP {r.status_code} — {r.text[:120]}")
+                except Exception as e:
                     elapsed = time.perf_counter() - t0
                     with state_lock:
                         total_requests += 1
                         total_errors   += 1
                         w.errors       += 1
                         w.status       = "Timeout"
+                        _log_error(w, "GET /game/version", f"{type(e).__name__}: {e}")
 
                 # Fetch plays if version changed
                 if w.status == "Fetching plays":
@@ -164,7 +178,6 @@ async def run_worker(w: WorkerState, base_url: str, api_key: str,
                                 data = r.json()
                                 w.plays_fetched += 1
                                 w.play_count     = len(data.get("entries", []))
-                                # Grab team names the first time
                                 if w.home_name == "—":
                                     w.home_name = data.get("home_name", "—")
                                     w.away_name = data.get("away_name", "—")
@@ -173,12 +186,15 @@ async def run_worker(w: WorkerState, base_url: str, api_key: str,
                                 w.errors += 1
                                 total_errors += 1
                                 w.status = f"Error {r.status_code}"
-                    except Exception:
+                                _log_error(w, "GET /game/plays",
+                                           f"HTTP {r.status_code} — {r.text[:120]}")
+                    except Exception as e:
                         with state_lock:
                             total_requests += 1
                             total_errors   += 1
                             w.errors       += 1
                             w.status       = "Timeout"
+                            _log_error(w, "GET /game/plays", f"{type(e).__name__}: {e}")
                 else:
                     with state_lock:
                         if w.status not in ("Error", "Timeout") and not w.status.startswith("Error"):
@@ -207,11 +223,14 @@ async def run_worker(w: WorkerState, base_url: str, api_key: str,
                         else:
                             w.errors += 1
                             total_errors += 1
-                except Exception:
+                            _log_error(w, "GET /games",
+                                       f"HTTP {r.status_code} — {r.text[:120]}")
+                except Exception as e:
                     with state_lock:
                         total_requests += 1
                         total_errors   += 1
                         w.errors       += 1
+                        _log_error(w, "GET /games", f"{type(e).__name__}: {e}")
                 games_due = time.monotonic() + GAMES_INTERVAL
 
             await asyncio.sleep(0.25)
@@ -437,17 +456,18 @@ class LoadTestApp(tk.Tk):
 
         cols = ("#", "Home Team", "Away Team", "Game ID", "League",
                 "Status", "Ver Checks", "Plays Fetched", "Play Count",
-                "Latency", "Errors")
+                "Latency", "Errors", "Last Error")
         self.tree = ttk.Treeview(table_frame, columns=cols,
                                  show="headings", style="CAPP.Treeview")
 
-        widths = [40, 160, 160, 100, 60, 160, 80, 90, 80, 80, 60]
+        widths = [40, 150, 150, 100, 55, 140, 75, 85, 75, 75, 55, 280]
         for col, w in zip(cols, widths):
             self.tree.heading(col, text=col)
             self.tree.column(col, width=w, anchor="center", stretch=False)
-        self.tree.column("Home Team", anchor="w")
-        self.tree.column("Away Team", anchor="w")
-        self.tree.column("Status",    anchor="w")
+        self.tree.column("Home Team",  anchor="w")
+        self.tree.column("Away Team",  anchor="w")
+        self.tree.column("Status",     anchor="w")
+        self.tree.column("Last Error", anchor="w")
 
         vsb = ttk.Scrollbar(table_frame, orient="vertical",
                              command=self.tree.yview)
@@ -463,12 +483,34 @@ class LoadTestApp(tk.Tk):
         self.tree.tag_configure("error",    background=RED_BG,     foreground=RED)
         self.tree.tag_configure("done",     background=BG2,        foreground=TEXT_DIM)
 
-        # ── Log strip ─────────────────────────────────────────────────────────
+        # ── Error log panel ───────────────────────────────────────────────────
+        err_outer = tk.Frame(self, bg=BG2)
+        err_outer.pack(fill="x", padx=12, pady=(0, 6))
+
+        tk.Label(err_outer, text="ERROR LOG", bg=BG2, fg=TEXT_DIM,
+                 font=("Segoe UI", 8, "bold"), padx=6, pady=3).pack(anchor="w")
+
+        err_inner = tk.Frame(err_outer, bg=BG2)
+        err_inner.pack(fill="x")
+
+        self.err_text = tk.Text(
+            err_inner, height=5, bg=BG2, fg=RED,
+            font=("Consolas", 9), relief="flat",
+            state="disabled", wrap="none",
+            highlightthickness=1, highlightbackground=BORDER)
+        err_scroll = ttk.Scrollbar(err_inner, orient="vertical",
+                                   command=self.err_text.yview)
+        self.err_text.configure(yscrollcommand=err_scroll.set)
+        err_scroll.pack(side="right", fill="y")
+        self.err_text.pack(fill="x")
+
+        # ── Status strip ──────────────────────────────────────────────────────
         log_frame = tk.Frame(self, bg=BG2, pady=4)
         log_frame.pack(fill="x", padx=12, pady=(0, 8))
         self.log_var = tk.StringVar(value="Ready.")
         tk.Label(log_frame, textvariable=self.log_var, bg=BG2, fg=TEXT_DIM,
                  font=("Consolas", 10), anchor="w", padx=8).pack(fill="x")
+        self._err_log_len = 0
 
     def _style(self):
         s = ttk.Style(self)
@@ -488,10 +530,14 @@ class LoadTestApp(tk.Tk):
     # ── Table helpers ─────────────────────────────────────────────────────────
     def _populate_table(self, n):
         self.tree.delete(*self.tree.get_children())
+        self._err_log_len = 0
+        self.err_text.config(state="normal")
+        self.err_text.delete("1.0", "end")
+        self.err_text.config(state="disabled")
         for i in range(n):
             self.tree.insert("", "end", iid=str(i),
                              values=(i + 1, "—", "—", "—", "—",
-                                     "Waiting", 0, 0, 0, "—", 0),
+                                     "Waiting", 0, 0, 0, "—", 0, ""),
                              tags=("waiting",))
 
     def _tag_for(self, status: str) -> str:
@@ -513,6 +559,7 @@ class LoadTestApp(tk.Tk):
             ws.version_checks, ws.plays_fetched,
             ws.play_count if ws.play_count else "—",
             lat, ws.errors,
+            ws.last_error,
         )
         tag = self._tag_for(ws.status)
         try:
@@ -586,8 +633,18 @@ class LoadTestApp(tk.Tk):
 
         with state_lock:
             states_copy = list(worker_states)
+            new_errors  = list(error_log[self._err_log_len:])
+            self._err_log_len = len(error_log)
+
         for ws in states_copy:
             self._update_row(ws)
+
+        if new_errors:
+            self.err_text.config(state="normal")
+            for line in new_errors:
+                self.err_text.insert("end", line + "\n")
+            self.err_text.see("end")
+            self.err_text.config(state="disabled")
 
         if self._running or test_running:
             self.after(500, self._poll_ui)
