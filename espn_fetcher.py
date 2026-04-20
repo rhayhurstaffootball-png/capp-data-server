@@ -758,6 +758,7 @@ def _infer_missing_pats(all_plays):
 
     Score jumped by 7 = EP good, 8 = 2PT good, 6 = EP missed.
     """
+    inferred = []
     prev_home = 0
     prev_away = 0
     for i, play in enumerate(all_plays):
@@ -779,12 +780,16 @@ def _infer_missing_pats(all_plays):
                 delta = max(home_delta, away_delta)
                 if delta == 7:
                     play["point_after_attempt"] = {"text": "Extra Point Good", "value": 1}
+                    inferred.append("Inferred missing EP result (+1)")
                 elif delta == 8:
                     play["point_after_attempt"] = {"text": "Two-Point Conversion", "value": 2}
+                    inferred.append("Inferred missing 2PT result (+2)")
                 elif delta == 6:
                     play["point_after_attempt"] = {"text": "Extra Point Attempt - No Good", "value": 0}
+                    inferred.append("Inferred missing EP miss (+0)")
         prev_home = curr_home
         prev_away = curr_away
+    return inferred
 
 
 def _parse_play(play, drive_team_id, home_team_id, away_team_id):
@@ -1217,7 +1222,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     all_plays.sort(key=lambda p: p.get("sequence_number", 0))
 
     # Infer missing PAT data from score jumps
-    _infer_missing_pats(all_plays)
+    inferred_pat_fixes = _infer_missing_pats(all_plays)
     # Annotate which team scored each TD (uses score deltas, not drive_team_id)
     _annotate_td_scoring_teams(all_plays)
 
@@ -1239,16 +1244,19 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     actual_home, actual_away = apply_scoreboard_lag(entries)
 
     # Post-lag auto-fix: correct errors that survived the pre-mapping pipeline
-    _auto_fix_entries(entries)
+    entry_fixes = _auto_fix_entries(entries)
 
     # Insert placeholder entries for scoring plays missing from the feed
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
-    _fill_scoring_gaps(entries, capp_home, capp_away)
+    inserted_gap_count = _fill_scoring_gaps(entries, capp_home, capp_away)
 
     # QC-flag remaining issues — operator sees these as red rows in CAPP
     qc_flags = _qc_flag_entries(entries, capp_home, capp_away)
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
+
+    auto_fixed_examples = list(inferred_pat_fixes) + list(entry_fixes.values())
+    qc_examples = [msg for _, msg in list(qc_flags.items())[:5]]
 
     return {
         "entries":    entries,
@@ -1260,6 +1268,17 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
         "away_abbrev": away_team_abbrev,
         "status":     game_status,
         "league":     league,
+        "qc_summary": {
+            "auto_fixed_count": len(inferred_pat_fixes) + len(entry_fixes),
+            "auto_fixed_examples": auto_fixed_examples[:5],
+            "auto_fixed_breakdown": {
+                "inferred_missing_pat_count": len(inferred_pat_fixes),
+                "post_lag_fix_count": len(entry_fixes),
+            },
+            "flagged_issue_count": len(qc_flags),
+            "flagged_issue_examples": qc_examples,
+            "manual_gap_count": inserted_gap_count,
+        },
         "fetched_at": time.time(),   # unix timestamp — clients poll this to detect changes
     }
 
@@ -1360,6 +1379,7 @@ def get_game_monitor_rows() -> list:
     rows = []
     for game_id, payload in plays_cache.items():
         entries = payload.get("entries", []) or []
+        qc_summary = payload.get("qc_summary", {}) or {}
         qc_entries = [entry for entry in entries if entry.get("qc_issue")]
         qc_examples = []
         for entry in qc_entries[:3]:
@@ -1388,6 +1408,9 @@ def get_game_monitor_rows() -> list:
             "age_seconds": round(max(0.0, time.time() - fetched_at), 1) if fetched_at else None,
             "plays_count": len(entries),
             "payload_bytes": payload_bytes,
+            "auto_fixed_count": int(qc_summary.get("auto_fixed_count", 0) or 0),
+            "auto_fixed_examples": list(qc_summary.get("auto_fixed_examples", []) or []),
+            "manual_gap_count": int(qc_summary.get("manual_gap_count", 0) or 0),
             "qc_issue_count": len(qc_entries),
             "qc_examples": qc_examples,
         })

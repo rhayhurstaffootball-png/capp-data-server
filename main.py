@@ -214,6 +214,8 @@ def _build_gameday_payload() -> dict:
             if merged["alert_level"] != "red":
                 merged["alert_level"] = "yellow"
             reasons.append(f"{merged['qc_issue_count']} QC issue(s)")
+        if merged.get("auto_fixed_count", 0) > 0:
+            reasons.append(f"{merged['auto_fixed_count']} auto-fixed")
         if merged.get("status") == "in" and merged.get("age_seconds") is not None and merged["age_seconds"] > 45:
             merged["alert_level"] = "red"
             reasons.append("live game cache stale")
@@ -252,6 +254,8 @@ def _build_gameday_payload() -> dict:
         "summary": {
             "tracked_games": len(merged_games),
             "live_games": sum(1 for row in merged_games if row.get("status") == "in"),
+            "games_with_auto_fixes": sum(1 for row in merged_games if row.get("auto_fixed_count", 0) > 0),
+            "auto_fix_total": sum(int(row.get("auto_fixed_count", 0) or 0) for row in merged_games),
             "games_with_qc_issues": sum(1 for row in merged_games if row.get("qc_issue_count", 0) > 0),
             "games_with_errors": sum(1 for row in merged_games if row.get("errors", 0) > 0),
             "games_slow_p95": sum(1 for row in merged_games if row.get("p95_latency_ms", 0) > 2000),
@@ -1743,7 +1747,8 @@ function loadGameDayStatus() {
         <div class="kpi"><div class="label">Req P95</div><div class="value">${recent.p95_ms || 0} ms</div><div class="sub">recent server latency</div></div>
         <div class="kpi"><div class="label">Tracked Games</div><div class="value">${data.summary.tracked_games || 0}</div><div class="sub">live=${data.summary.live_games || 0}</div></div>
         <div class="kpi"><div class="label">Poller</div><div class="value">${fetcher.poller_alive ? "Alive" : "Down"}</div><div class="sub">last poll ${fetcher.last_poll_duration_ms || 0} ms</div></div>
-        <div class="kpi"><div class="label">QC Issues</div><div class="value">${data.summary.games_with_qc_issues || 0}</div><div class="sub">games currently flagged</div></div>
+        <div class="kpi"><div class="label">Auto-Fixed</div><div class="value">${data.summary.auto_fix_total || 0}</div><div class="sub">${data.summary.games_with_auto_fixes || 0} games had fixes</div></div>
+        <div class="kpi"><div class="label">QC Issues</div><div class="value">${data.summary.games_with_qc_issues || 0}</div><div class="sub">games still flagged</div></div>
       </div>
       <div class="small">Generated: ${new Date((data.generated_at || 0) * 1000).toLocaleString()}</div>
     `;
@@ -1769,11 +1774,13 @@ function loadGameDayStatus() {
         <td>${g.away_name || "—"} at ${g.home_name || "—"}</td>
         <td>${g.status || "—"}</td>
         <td>${g.plays_count || 0}</td>
+        <td>${g.auto_fixed_count || 0}</td>
         <td>${g.qc_issue_count || 0}</td>
         <td>${g.requests_last_60s || 0}</td>
         <td>${g.p95_latency_ms || 0} ms</td>
         <td>${fmtBytes(g.payload_bytes || 0)}</td>
         <td>${fmtAge(g.age_seconds)}</td>
+        <td class="mono">${(g.auto_fixed_examples || []).slice(0, 2).join(", ") || "—"}</td>
         <td class="mono">${(g.alert_reasons || []).join(", ") || "—"}</td>
       </tr>
     `).join("");
@@ -1781,8 +1788,8 @@ function loadGameDayStatus() {
       <table>
         <thead>
           <tr>
-            <th>Level</th><th>Game</th><th>Status</th><th>Plays</th><th>QC</th>
-            <th>Req/60s</th><th>P95</th><th>Payload</th><th>Age</th><th>Notes</th>
+            <th>Level</th><th>Game</th><th>Status</th><th>Plays</th><th>Fixed</th><th>Flagged</th>
+            <th>Req/60s</th><th>P95</th><th>Payload</th><th>Age</th><th>Fixed Examples</th><th>Notes</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>

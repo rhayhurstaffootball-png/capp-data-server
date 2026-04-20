@@ -500,6 +500,31 @@ def historical_game_pool(num_workers: int) -> list[dict]:
     return [dict(item) for item in HISTORICAL_2025_GAMES[:num_workers]]
 
 
+def resolve_selected_games(num_workers: int, custom_game_id: str) -> tuple[list[dict], dict]:
+    custom_game_id = custom_game_id.strip()
+    if custom_game_id:
+        match = next((item for item in HISTORICAL_2025_GAMES if item["game_id"] == custom_game_id), None)
+        if match:
+            game = dict(match)
+        else:
+            game = {
+                "game_id": custom_game_id,
+                "league": "cfb",
+                "home_name": "Preview Game",
+                "away_name": "Preview Game",
+            }
+        return [game], {
+            "name": "Single historical preview game",
+            "season": HISTORICAL_SEASON,
+            "type": "historical_single_preview",
+        }
+    return historical_game_pool(num_workers), {
+        "name": "Fixed 2025 historical game set",
+        "season": HISTORICAL_SEASON,
+        "type": "historical_fixed_ids",
+    }
+
+
 async def fetch_cache_ready_games(base_url: str, api_key: str, games: list[dict], log_fn) -> tuple[list[dict], list[dict]]:
     headers = {"x-api-key": api_key}
     ready: list[dict] = []
@@ -616,7 +641,7 @@ async def cleanup_accounts(base_url: str, accounts: list[tuple[str, str]], log_f
         log_fn("Cleanup done.")
 
 
-async def async_main(base_url: str, num_workers: int, duration: int, api_key_override: str, log_fn, done_fn):
+async def async_main(base_url: str, num_workers: int, duration: int, api_key_override: str, custom_game_id: str, log_fn, done_fn):
     global test_running, test_start_time, created_accounts, last_report_paths
     global total_requests, total_errors, total_plays_fetched, total_bytes_received, all_latencies, bytes_by_endpoint
 
@@ -634,11 +659,6 @@ async def async_main(base_url: str, num_workers: int, duration: int, api_key_ove
     manual_stop_event.clear()
     last_report_paths = None
     used_shared_key = bool(api_key_override)
-    game_source = {
-        "name": "Fixed 2025 historical game set",
-        "season": HISTORICAL_SEASON,
-        "type": "historical_fixed_ids",
-    }
     warmup_summary = {
         "enabled": True,
         "warmed_games": 0,
@@ -680,7 +700,9 @@ async def async_main(base_url: str, num_workers: int, duration: int, api_key_ove
             done_fn()
             return
 
-    if num_workers > len(HISTORICAL_2025_GAMES):
+    assignments_data, game_source = resolve_selected_games(num_workers, custom_game_id)
+
+    if not custom_game_id and num_workers > len(HISTORICAL_2025_GAMES):
         error_msg = (
             f"ERROR: Requested {num_workers} workers but the built-in 2025 historical dataset "
             f"only has {len(HISTORICAL_2025_GAMES)} unique games."
@@ -693,11 +715,16 @@ async def async_main(base_url: str, num_workers: int, duration: int, api_key_ove
         done_fn()
         return
 
-    assignments_data = historical_game_pool(num_workers)
-    log_fn(
-        f"Using {len(assignments_data)} fixed {HISTORICAL_SEASON} game IDs for cache-only preflight "
-        f"(no /games discovery, no ESPN lookup)."
-    )
+    if custom_game_id:
+        log_fn(
+            f"Using single-game preview mode for {custom_game_id} "
+            "(warm through the server, then run one simulated client)."
+        )
+    else:
+        log_fn(
+            f"Using {len(assignments_data)} fixed {HISTORICAL_SEASON} game IDs for cache-only preflight "
+            f"(no /games discovery, no ESPN lookup)."
+        )
     ready_games, missing_games = await fetch_cache_ready_games(base_url, discovery_key, assignments_data, log_fn)
     cache_preflight = {
         "selected_games": len(assignments_data),
@@ -856,10 +883,10 @@ async def async_main(base_url: str, num_workers: int, duration: int, api_key_ove
     done_fn()
 
 
-def run_async_test(base_url, workers, duration, api_key, log_fn, done_fn):
+def run_async_test(base_url, workers, duration, api_key, custom_game_id, log_fn, done_fn):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(async_main(base_url, workers, duration, api_key, log_fn, done_fn))
+    loop.run_until_complete(async_main(base_url, workers, duration, api_key, custom_game_id, log_fn, done_fn))
     loop.close()
 
 
@@ -912,6 +939,7 @@ class LoadTestApp(tk.Tk):
         self.workers_entry = labeled(cfg, "Workers", str(DEFAULT_WORKERS), 6)
         self.duration_entry = labeled(cfg, "Duration (s)", str(DEFAULT_DURATION), 6)
         self.apikey_entry = labeled(cfg, "API Key (optional)", "", 22)
+        self.preview_game_entry = labeled(cfg, "Preview Game ID (optional)", "", 16)
 
         btn_frame = tk.Frame(top, bg=BG2)
         btn_frame.pack(side="right", padx=20)
@@ -1063,6 +1091,10 @@ class LoadTestApp(tk.Tk):
             return
 
         api_key = self.apikey_entry.get().strip()
+        custom_game_id = self.preview_game_entry.get().strip()
+
+        if custom_game_id:
+            workers = 1
 
         self._running = True
         self._duration = duration
@@ -1072,7 +1104,11 @@ class LoadTestApp(tk.Tk):
         self.progress_var.set(0)
         self._populate_table(workers)
 
-        self._thread = threading.Thread(target=run_async_test, args=(base_url, workers, duration, api_key, self._log, self._on_done), daemon=True)
+        self._thread = threading.Thread(
+            target=run_async_test,
+            args=(base_url, workers, duration, api_key, custom_game_id, self._log, self._on_done),
+            daemon=True,
+        )
         self._thread.start()
         self._poll_ui()
 
