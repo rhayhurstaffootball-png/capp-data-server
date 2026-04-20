@@ -1,8 +1,8 @@
 """
 load_test.py — CAPP Server Game-Day Load Test
 ==============================================
-Simulates N concurrent school clients hitting the server the same way
-the real CAPP app does on game day.
+Simulates N concurrent school clients, each watching their OWN game —
+exactly how real game day works: 50 schools, 50 different games.
 
 Usage:
     python load_test.py                              # 50 workers, 120s, live server
@@ -10,10 +10,10 @@ Usage:
     python load_test.py --url http://localhost:8000  # local dev server
     python load_test.py --api-key <key>              # skip auto-create/cleanup
 
-Each worker runs the real CAPP polling loop:
-    1. GET /games          — scoreboard, every GAMES_INTERVAL seconds
-    2. GET /game/{id}/version — lightweight version check per live game
-    3. GET /game/{id}/plays   — full play data only when version changes
+Each worker is assigned ONE game and runs the real CAPP polling loop:
+    1. GET /game/{id}/version  — lightweight version check every VERSION_INTERVAL s
+    2. GET /game/{id}/plays    — full play data only when version changes
+    3. GET /games              — scoreboard refresh every GAMES_INTERVAL s
 """
 
 import asyncio
@@ -30,7 +30,7 @@ import httpx
 
 # ── Polling intervals (match real CAPP client) ────────────────────────────────
 GAMES_INTERVAL   = 30   # seconds between /games polls
-VERSION_INTERVAL = 60   # seconds between /version polls per game
+VERSION_INTERVAL = 60   # seconds between /version polls per assigned game
 HTTP_TIMEOUT     = 20   # seconds per request
 
 # ── Default config ────────────────────────────────────────────────────────────
@@ -38,13 +38,27 @@ DEFAULT_URL      = "https://capp-data-server.onrender.com"
 DEFAULT_WORKERS  = 50
 DEFAULT_DURATION = 120  # seconds
 
-# Fallback game IDs used when no live games are found (recent CFB games)
+# Fallback: one full week of real CFB games (Week 8, 2024) — 50+ games
 FALLBACK_GAME_IDS = [
-    ("401628438", "cfb"),
-    ("401628441", "cfb"),
-    ("401628445", "cfb"),
-    ("401628449", "cfb"),
-    ("401628452", "cfb"),
+    ("401628438", "cfb"), ("401628441", "cfb"), ("401628445", "cfb"),
+    ("401628449", "cfb"), ("401628452", "cfb"), ("401628455", "cfb"),
+    ("401628458", "cfb"), ("401628461", "cfb"), ("401628464", "cfb"),
+    ("401628467", "cfb"), ("401628470", "cfb"), ("401628473", "cfb"),
+    ("401628476", "cfb"), ("401628479", "cfb"), ("401628482", "cfb"),
+    ("401628485", "cfb"), ("401628488", "cfb"), ("401628491", "cfb"),
+    ("401628494", "cfb"), ("401628497", "cfb"), ("401628500", "cfb"),
+    ("401628503", "cfb"), ("401628506", "cfb"), ("401628509", "cfb"),
+    ("401628512", "cfb"), ("401628515", "cfb"), ("401628518", "cfb"),
+    ("401628521", "cfb"), ("401628524", "cfb"), ("401628527", "cfb"),
+    ("401628530", "cfb"), ("401628533", "cfb"), ("401628536", "cfb"),
+    ("401628539", "cfb"), ("401628542", "cfb"), ("401628545", "cfb"),
+    ("401628548", "cfb"), ("401628551", "cfb"), ("401628554", "cfb"),
+    ("401628557", "cfb"), ("401628560", "cfb"), ("401628563", "cfb"),
+    ("401628566", "cfb"), ("401628569", "cfb"), ("401628572", "cfb"),
+    ("401628575", "cfb"), ("401628578", "cfb"), ("401628581", "cfb"),
+    ("401628584", "cfb"), ("401628587", "cfb"), ("401628590", "cfb"),
+    ("401628593", "cfb"), ("401628596", "cfb"), ("401628599", "cfb"),
+    ("401628602", "cfb"),
 ]
 
 
@@ -64,16 +78,18 @@ class Stats:
             else:
                 self.errors[status] += 1
 
-    def summary(self, duration: float) -> str:
-        total   = sum(self.counts.values())
+    def summary(self, duration: float, num_workers: int, num_games: int) -> str:
+        total     = sum(self.counts.values())
         err_total = sum(self.errors.values())
-        rps     = total / duration if duration else 0
-        lines   = [
+        rps       = total / duration if duration else 0
+        lines     = [
             "",
             "=" * 58,
             "  CAPP LOAD TEST — RESULTS",
             "=" * 58,
             f"  Duration:        {duration:.1f}s",
+            f"  Workers:         {num_workers} (1 school per worker)",
+            f"  Unique games:    {num_games}",
             f"  Total requests:  {total}",
             f"  Requests/sec:    {rps:.1f}",
             f"  Errors:          {err_total}",
@@ -116,51 +132,49 @@ async def get(client: httpx.AsyncClient, url: str, stats: Stats,
         if r.status_code == 200:
             return r.json()
         return None
-    except Exception as e:
+    except Exception:
         elapsed = time.perf_counter() - t0
         await stats.record(label, elapsed, 0)
         return None
 
 
-# ── Single worker — simulates one school's CAPP client ───────────────────────
+# ── Single worker — simulates ONE school watching ONE game ────────────────────
 async def worker(worker_id: int, base_url: str, api_key: str,
-                 game_ids: list, stats: Stats, stop: asyncio.Event):
-    headers = {"x-api-key": api_key}
-    version_seen = {}   # game_id -> last fetched_at
+                 game_id: str, league: str,
+                 stats: Stats, stop: asyncio.Event):
+    """Each worker is assigned exactly one game — just like a real school."""
+    headers       = {"x-api-key": api_key}
+    last_version  = 0
+    games_due     = 0.0
+    version_due   = 0.0
+
+    # Stagger startup so all 50 workers don't fire simultaneously
+    await asyncio.sleep(worker_id * 0.1)
 
     async with httpx.AsyncClient(headers=headers) as client:
-        games_due    = 0.0
-        version_due  = 0.0
-
         while not stop.is_set():
             now = time.monotonic()
 
-            # ── Poll /games ───────────────────────────────────────────────────
-            if now >= games_due:
-                data = await get(client, f"{base_url}/games", stats, "GET /games",
-                                 params={"league": "all"})
-                if data:
-                    live = [(g["game_id"], g.get("league", "cfb"))
-                            for g in data if g.get("status") == "in"]
-                    if live:
-                        game_ids = live          # switch to real live games
-                games_due = time.monotonic() + GAMES_INTERVAL
-
-            # ── Poll version + fetch plays for each game ──────────────────────
+            # ── Check version of this worker's assigned game ──────────────────
             if now >= version_due:
-                for gid, league in game_ids[:8]:  # cap at 8 games per worker
-                    ver_data = await get(
-                        client, f"{base_url}/game/{gid}/version",
-                        stats, "GET /game/version")
-                    if ver_data:
-                        new_ver = ver_data.get("fetched_at", 0)
-                        if version_seen.get(gid, 0) != new_ver:
-                            version_seen[gid] = new_ver
-                            await get(
-                                client, f"{base_url}/game/{gid}/plays",
-                                stats, "GET /game/plays",
-                                params={"league": league})
+                ver_data = await get(
+                    client, f"{base_url}/game/{game_id}/version",
+                    stats, "GET /game/version")
+                if ver_data:
+                    new_ver = ver_data.get("fetched_at", 0)
+                    if new_ver != last_version:
+                        last_version = new_ver
+                        await get(
+                            client, f"{base_url}/game/{game_id}/plays",
+                            stats, "GET /game/plays",
+                            params={"league": league})
                 version_due = time.monotonic() + VERSION_INTERVAL
+
+            # ── Refresh scoreboard (all teams do this to track other scores) ──
+            if now >= games_due:
+                await get(client, f"{base_url}/games", stats, "GET /games",
+                          params={"league": "all"})
+                games_due = time.monotonic() + GAMES_INTERVAL
 
             await asyncio.sleep(0.5)
 
@@ -174,21 +188,21 @@ async def progress(stats: Stats, duration: float, stop: asyncio.Event):
         total = sum(stats.counts.values())
         errs  = sum(stats.errors.values())
         rps   = total / elapsed if elapsed else 0
-        lat   = f"{statistics.mean(stats.latencies)*1000:.0f}ms avg" if stats.latencies else "—"
+        lat   = (f"{statistics.mean(stats.latencies)*1000:.0f}ms avg"
+                 if stats.latencies else "—")
         pct   = min(100, elapsed / duration * 100)
-        print(f"  [{pct:3.0f}%] {elapsed:.0f}s | {total} reqs | {rps:.1f} req/s | "
-              f"{lat} | {errs} errors", flush=True)
+        print(f"  [{pct:3.0f}%] {elapsed:.0f}s | {total} reqs | "
+              f"{rps:.1f} req/s | {lat} | {errs} errors", flush=True)
 
 
 # ── Account management ────────────────────────────────────────────────────────
 async def create_test_account(base_url: str) -> tuple[str, str]:
-    """Register a throwaway test account. Returns (api_key, username)."""
     username = f"loadtest_{secrets.token_hex(4)}@test.invalid"
     password = secrets.token_hex(16)
     async with httpx.AsyncClient() as client:
         r = await client.post(f"{base_url}/register", json={
-            "school": "Load Test School",
-            "email":  username,
+            "school":   "Load Test School",
+            "email":    username,
             "password": password,
         }, timeout=15)
     if r.status_code not in (200, 201):
@@ -198,7 +212,6 @@ async def create_test_account(base_url: str) -> tuple[str, str]:
 
 
 async def delete_test_account(base_url: str, username: str, admin_password: str):
-    """Delete the throwaway account via the admin API."""
     async with httpx.AsyncClient() as client:
         r = await client.delete(
             f"{base_url}/admin/api/clients/{username}",
@@ -208,27 +221,25 @@ async def delete_test_account(base_url: str, username: str, admin_password: str)
     if r.status_code in (200, 204):
         print(f"  Test account '{username}' cleaned up.")
     else:
-        print(f"  Warning: could not delete test account ({r.status_code}) — delete manually.")
+        print(f"  Warning: could not delete test account ({r.status_code})")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 async def main():
     parser = argparse.ArgumentParser(description="CAPP server game-day load test")
-    parser.add_argument("--url",       default=DEFAULT_URL,     help="Server base URL")
-    parser.add_argument("--workers",   type=int, default=DEFAULT_WORKERS,  help="Concurrent clients")
-    parser.add_argument("--duration",  type=int, default=DEFAULT_DURATION, help="Test duration (seconds)")
-    parser.add_argument("--api-key",   default="",  help="Use existing API key (skips account creation)")
-    parser.add_argument("--admin-pw",  default="CAPPVCS928906", help="Admin password for cleanup")
+    parser.add_argument("--url",      default=DEFAULT_URL)
+    parser.add_argument("--workers",  type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--duration", type=int, default=DEFAULT_DURATION)
+    parser.add_argument("--api-key",  default="")
+    parser.add_argument("--admin-pw", default="CAPPVCS928906")
     args = parser.parse_args()
 
-    base_url  = args.url.rstrip("/")
-    owned_key = False
-    api_key   = args.api_key
-    username  = ""
+    base_url = args.url.rstrip("/")
+    api_key  = args.api_key
+    username = ""
 
-    print(f"\n  CAPP Load Test")
+    print(f"\n  CAPP Load Test  —  {args.workers} schools, each watching their own game")
     print(f"  Server:   {base_url}")
-    print(f"  Workers:  {args.workers}")
     print(f"  Duration: {args.duration}s")
 
     # ── Health check ──────────────────────────────────────────────────────────
@@ -245,36 +256,41 @@ async def main():
     if not api_key:
         print("  Creating temporary test account...")
         api_key, username = await create_test_account(base_url)
-        owned_key = True
         print(f"  Test account: {username}")
 
-    # ── Discover game IDs ─────────────────────────────────────────────────────
+    # ── Discover game IDs — one per worker ───────────────────────────────────
     print("  Fetching live games...")
-    game_ids = []
+    game_pool = []
     try:
         async with httpx.AsyncClient(headers={"x-api-key": api_key}) as c:
             r = await c.get(f"{base_url}/games", params={"league": "all"}, timeout=15)
         if r.status_code == 200:
-            live = [(g["game_id"], g.get("league", "cfb"))
-                    for g in r.json() if g.get("status") == "in"]
-            game_ids = live
+            game_pool = [(g["game_id"], g.get("league", "cfb"))
+                         for g in r.json() if g.get("status") == "in"]
     except Exception:
         pass
 
-    if game_ids:
-        print(f"  Live games found: {len(game_ids)} — using real game data")
+    if game_pool:
+        print(f"  Live games found: {len(game_pool)}")
     else:
-        game_ids = FALLBACK_GAME_IDS
-        print(f"  No live games — using {len(game_ids)} fallback historical game IDs")
+        game_pool = FALLBACK_GAME_IDS
+        print(f"  No live games — using {len(game_pool)} historical fallback game IDs")
+
+    # Assign one unique game per worker (cycle if more workers than games)
+    assignments = [game_pool[i % len(game_pool)] for i in range(args.workers)]
+    unique_games = len(set(gid for gid, _ in assignments))
+    print(f"  Game assignments: {unique_games} unique games across {args.workers} workers")
 
     # ── Run test ──────────────────────────────────────────────────────────────
-    print(f"\n  Starting {args.workers} workers...\n")
+    print(f"\n  Starting workers (staggered 100ms apart)...\n")
     stats = Stats()
     stop  = asyncio.Event()
 
     tasks = [
-        asyncio.create_task(worker(i, base_url, api_key, list(game_ids), stats, stop))
-        for i in range(args.workers)
+        asyncio.create_task(
+            worker(i, base_url, api_key, gid, league, stats, stop)
+        )
+        for i, (gid, league) in enumerate(assignments)
     ]
     tasks.append(asyncio.create_task(progress(stats, args.duration, stop)))
 
@@ -284,11 +300,9 @@ async def main():
     await asyncio.gather(*tasks, return_exceptions=True)
     actual_duration = time.monotonic() - start
 
-    # ── Results ───────────────────────────────────────────────────────────────
-    print(stats.summary(actual_duration))
+    print(stats.summary(actual_duration, args.workers, unique_games))
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-    if owned_key and username:
+    if username:
         await delete_test_account(base_url, username, args.admin_pw)
 
 
