@@ -84,27 +84,45 @@ def _supabase_headers():
 def _storage_path(client_id: str, filename: str) -> str:
     return f"{client_id}/{filename}"
 
-# --- API Key Auth ---
-def verify_api_key(x_api_key: str = Header(..., description="CAPP API key")):
-    url = f"{SUPABASE_URL}/rest/v1/capp_clients"
-    params = {"api_key": f"eq.{x_api_key}", "select": "client_id,active"}
-    with httpx.Client() as client:
-        r = client.get(url, params=params, headers=_supabase_headers())
+# --- API Key Cache (avoids hitting Supabase on every request) ---
+import time as _time
+_key_cache: dict = {}          # api_key -> {"client_id": str, "active": bool, "ts": float}
+_KEY_CACHE_TTL = 300           # seconds — re-validate against Supabase every 5 minutes
+
+async def _lookup_api_key(api_key: str) -> dict:
+    """Return cached {client_id, active} for an API key, re-fetching after TTL."""
+    now = _time.time()
+    cached = _key_cache.get(api_key)
+    if cached and now - cached["ts"] < _KEY_CACHE_TTL:
+        return cached
+
+    url    = f"{SUPABASE_URL}/rest/v1/capp_clients"
+    params = {"api_key": f"eq.{api_key}", "select": "client_id,active"}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, params=params, headers=_supabase_headers(), timeout=8)
+
     if r.status_code != 200 or not r.json():
+        return {}
+
+    row = r.json()[0]
+    entry = {"client_id": row.get("client_id", ""), "active": row.get("active", False), "ts": now}
+    _key_cache[api_key] = entry
+    return entry
+
+# --- API Key Auth ---
+async def verify_api_key(x_api_key: str = Header(..., description="CAPP API key")):
+    row = await _lookup_api_key(x_api_key)
+    if not row:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    if not r.json()[0].get("active"):
+    if not row["active"]:
         raise HTTPException(status_code=401, detail="Account is not active")
 
-def get_client_id(x_api_key: str = Header(..., description="CAPP API key")) -> str:
+async def get_client_id(x_api_key: str = Header(..., description="CAPP API key")) -> str:
     """Like verify_api_key but returns the client_id for use in endpoints."""
-    url = f"{SUPABASE_URL}/rest/v1/capp_clients"
-    params = {"api_key": f"eq.{x_api_key}", "select": "client_id,active"}
-    with httpx.Client() as client:
-        r = client.get(url, params=params, headers=_supabase_headers())
-    if r.status_code != 200 or not r.json():
+    row = await _lookup_api_key(x_api_key)
+    if not row:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    row = r.json()[0]
-    if not row.get("active"):
+    if not row["active"]:
         raise HTTPException(status_code=401, detail="Account is not active")
     return row["client_id"]
 
@@ -169,7 +187,7 @@ def team_schedule(
 TRIAL_DAYS = 7
 
 @app.get("/trial/status")
-def trial_status(x_api_key: str = Header(None, alias="x-api-key")):
+async def trial_status(x_api_key: str = Header(None, alias="x-api-key")):
     """
     Returns trial/license status for an activated account.
     Both seats of a school share the same clock (tied to account created_at).
@@ -177,12 +195,13 @@ def trial_status(x_api_key: str = Header(None, alias="x-api-key")):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API key required.")
 
-    r = httpx.get(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"api_key": f"eq.{x_api_key}",
-                "select": "client_id,active,licensed,created_at"},
-        headers=_supabase_headers(),
-    )
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"api_key": f"eq.{x_api_key}",
+                    "select": "client_id,active,licensed,created_at"},
+            headers=_supabase_headers(),
+        )
     if r.status_code != 200 or not r.json():
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
@@ -216,7 +235,7 @@ def trial_status(x_api_key: str = Header(None, alias="x-api-key")):
 # ── Auth Endpoints ─────────────────────────────────────────────────────────────
 
 @app.post("/nodes/login")
-def nodes_login(
+async def nodes_login(
     username: str = Body(..., embed=True),
     password: str = Body(..., embed=True),
 ):
@@ -227,8 +246,8 @@ def nodes_login(
         "username": f"eq.{username}",
         "select": "client_id,password_hash,salt,api_key,active"
     }
-    with httpx.Client() as client:
-        r = client.get(url, params=params, headers=_supabase_headers())
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, params=params, headers=_supabase_headers())
     if r.status_code != 200 or not r.json():
         raise HTTPException(status_code=401, detail="Invalid username or password")
     user = r.json()[0]
@@ -241,7 +260,7 @@ def nodes_login(
 
 
 @app.post("/auth/login")
-def auth_login(
+async def auth_login(
     username: str = Body(..., embed=True),
     password: str = Body(..., embed=True),
     seat: str = Body(..., embed=True),       # "seat_1" or "seat_2"
@@ -253,8 +272,8 @@ def auth_login(
         "username": f"eq.{username}",
         "select": "client_id,password_hash,salt,api_key,active,is_admin,seat_1_machine,seat_2_machine"
     }
-    with httpx.Client() as client:
-        r = client.get(url, params=params, headers=_supabase_headers())
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, params=params, headers=_supabase_headers())
     if r.status_code != 200 or not r.json():
         raise HTTPException(status_code=401, detail="Invalid username or password")
     user = r.json()[0]
@@ -270,8 +289,8 @@ def auth_login(
         bound_machine = user.get(seat_col)
         if bound_machine is None:
             # First activation on this seat — bind this machine
-            with httpx.Client() as client:
-                client.patch(
+            async with httpx.AsyncClient() as client:
+                await client.patch(
                     f"{SUPABASE_URL}/rest/v1/capp_clients",
                     params={"username": f"eq.{username}"},
                     json={seat_col: machine_id},
@@ -289,7 +308,7 @@ def auth_login(
 # ── Storage Endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/storage/save", dependencies=[Depends(verify_api_key)])
-def storage_save(
+async def storage_save(
     client_id: str = Query(...),
     filename: str = Query(...),
     payload: dict = Body(...),
@@ -298,9 +317,8 @@ def storage_save(
     path = _storage_path(client_id, filename)
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     data = json.dumps(payload).encode()
-    with httpx.Client() as client:
-        # Try update first, then insert
-        r = client.put(url, content=data, headers={
+    async with httpx.AsyncClient() as client:
+        r = await client.put(url, content=data, headers={
             **_supabase_headers(),
             "Content-Type": "application/json",
             "x-upsert": "true",
@@ -323,27 +341,26 @@ def db_version():
         raise HTTPException(status_code=503, detail="DB metadata unavailable")
     return meta
 
+async def _signed_url(storage_path: str) -> str:
+    """Generate a 1-hour Supabase signed download URL for any object in the bucket."""
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{storage_path}"
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, json={"expiresIn": 3600},
+                              headers={**_supabase_headers(), "Content-Type": "application/json"})
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Could not generate download URL")
+    signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
+    if not signed:
+        raise HTTPException(status_code=502, detail="Could not generate download URL")
+    if signed.startswith("/"):
+        signed = f"{SUPABASE_URL}/storage/v1{signed}"
+    return signed
+
+
 @app.get("/db/download", dependencies=[Depends(verify_api_key)])
-def db_download():
-    """
-    Returns a signed Supabase URL for the client to download workflow.db directly.
-    Auth required — client must have a valid API key.
-    File transfer goes Supabase -> Client (not through Render).
-    """
-    # Generate a signed URL (1 hour expiry)
-    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/workflow.db"
-    headers = {**_supabase_headers(), "Content-Type": "application/json"}
-    import httpx as _httpx
-    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
-    if r.status_code == 200:
-        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
-        if signed:
-            # Supabase returns a relative path like /object/sign/...
-            # The full URL needs the /storage/v1 prefix
-            if signed.startswith("/"):
-                signed = f"{SUPABASE_URL}/storage/v1{signed}"
-            return {"download_url": signed}
-    raise HTTPException(status_code=502, detail="Could not generate download URL")
+async def db_download():
+    """Signed Supabase URL for workflow.db. File transfer goes Supabase → Client."""
+    return {"download_url": await _signed_url("shared/workflow.db")}
 
 @app.get("/contacts/version")
 def contacts_version():
@@ -355,41 +372,14 @@ def contacts_version():
     return {"version": version}
 
 @app.get("/contacts/download", dependencies=[Depends(verify_api_key)])
-def contacts_download():
-    """
-    Returns a signed Supabase URL for downloading contacts.xlsx.
-    Auth required — client must have a valid API key.
-    """
-    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/contacts.xlsx"
-    headers = {**_supabase_headers(), "Content-Type": "application/json"}
-    import httpx as _httpx
-    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
-    if r.status_code == 200:
-        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
-        if signed:
-            if signed.startswith("/"):
-                signed = f"{SUPABASE_URL}/storage/v1{signed}"
-            return {"download_url": signed}
-    raise HTTPException(status_code=502, detail="Could not generate download URL")
+async def contacts_download():
+    """Signed Supabase URL for contacts.xlsx. File transfer goes Supabase → Client."""
+    return {"download_url": await _signed_url("shared/contacts.xlsx")}
 
 @app.get("/agent/download")
-def agent_download():
-    """
-    Public endpoint — returns a signed Supabase URL for downloading CAPPNodes_Agent.exe.
-    No auth required so new clients can download before they have an API key.
-    File transfer goes Supabase -> Client (not through Render).
-    """
-    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/CAPPNodes_Agent.exe"
-    headers = {**_supabase_headers(), "Content-Type": "application/json"}
-    import httpx as _httpx
-    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
-    if r.status_code == 200:
-        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
-        if signed:
-            if signed.startswith("/"):
-                signed = f"{SUPABASE_URL}/storage/v1{signed}"
-            return {"download_url": signed}
-    raise HTTPException(status_code=502, detail="Could not generate download URL")
+async def agent_download():
+    """Public signed URL for CAPPNodes_Agent.exe — no auth required."""
+    return {"download_url": await _signed_url("shared/CAPPNodes_Agent.exe")}
 
 @app.post("/db/update", dependencies=[Depends(verify_api_key)])
 def db_force_update():
@@ -415,23 +405,9 @@ def app_version():
     return {"version": version}
 
 @app.get("/app/download", dependencies=[Depends(verify_api_key)])
-def app_download():
-    """
-    Returns a signed Supabase URL for downloading the latest CAPP installer.
-    Auth required. File transfer goes Supabase -> Client (not through Render).
-    Upload new installer to Supabase at: capp-workflow/shared/CAPP_Setup.exe
-    """
-    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/shared/CAPP_Setup.exe"
-    headers = {**_supabase_headers(), "Content-Type": "application/json"}
-    import httpx as _httpx
-    r = _httpx.post(url, json={"expiresIn": 3600}, headers=headers)
-    if r.status_code == 200:
-        signed = r.json().get("signedURL") or r.json().get("signedUrl", "")
-        if signed:
-            if signed.startswith("/"):
-                signed = f"{SUPABASE_URL}/storage/v1{signed}"
-            return {"download_url": signed}
-    raise HTTPException(status_code=502, detail="Could not generate download URL")
+async def app_download():
+    """Signed Supabase URL for CAPP_Setup.exe. File transfer goes Supabase → Client."""
+    return {"download_url": await _signed_url("shared/CAPP_Setup.exe")}
 
 
 # ── Season Data Endpoints ─────────────────────────────────────────────────────
@@ -487,15 +463,15 @@ def season_data():
 # ── Storage Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/storage/load", dependencies=[Depends(verify_api_key)])
-def storage_load(
+async def storage_load(
     client_id: str = Query(...),
     filename: str = Query(...),
 ):
     """Load a JSON file from Supabase storage for this client."""
     path = _storage_path(client_id, filename)
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
-    with httpx.Client() as client:
-        r = client.get(url, headers=_supabase_headers())
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=_supabase_headers())
     if r.status_code == 404:
         raise HTTPException(status_code=404, detail="File not found")
     if r.status_code != 200:
@@ -504,12 +480,12 @@ def storage_load(
 
 
 @app.get("/storage/list", dependencies=[Depends(verify_api_key)])
-def storage_list(client_id: str = Query(...)):
+async def storage_list(client_id: str = Query(...)):
     """List all stored files for this client."""
     url = f"{SUPABASE_URL}/storage/v1/object/list/{SUPABASE_BUCKET}"
-    with httpx.Client() as client:
-        r = client.post(url, json={"prefix": f"{client_id}/"},
-                        headers={**_supabase_headers(), "Content-Type": "application/json"})
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, json={"prefix": f"{client_id}/"},
+                              headers={**_supabase_headers(), "Content-Type": "application/json"})
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=f"Supabase list failed: {r.text}")
     return r.json()
@@ -519,23 +495,21 @@ def storage_list(client_id: str = Query(...)):
 
 NODES_FILE = "capp_nodes.json"
 
-def _load_nodes(client_id: str) -> list:
+async def _load_nodes(client_id: str) -> list:
     path = _storage_path(client_id, NODES_FILE)
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
-    with httpx.Client() as client:
-        r = client.get(url, headers=_supabase_headers())
-    if r.status_code == 404:
-        return []
-    if r.status_code != 200:
-        return []
-    return r.json().get("nodes", [])
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=_supabase_headers())
+    if r.status_code == 200:
+        return r.json().get("nodes", [])
+    return []
 
-def _save_nodes(client_id: str, nodes: list):
+async def _save_nodes(client_id: str, nodes: list):
     path = _storage_path(client_id, NODES_FILE)
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     data = json.dumps({"nodes": nodes}).encode()
-    with httpx.Client() as client:
-        client.put(url, content=data, headers={
+    async with httpx.AsyncClient() as client:
+        await client.put(url, content=data, headers={
             **_supabase_headers(),
             "Content-Type": "application/json",
             "x-upsert": "true",
@@ -543,7 +517,7 @@ def _save_nodes(client_id: str, nodes: list):
 
 
 @app.post("/nodes/register")
-def nodes_register(
+async def nodes_register(
     client_id: str = Depends(get_client_id),
     machine_name: str = Body(..., embed=True),
     rustdesk_id: str = Body(..., embed=True),
@@ -554,20 +528,18 @@ def nodes_register(
     from datetime import datetime, timezone
     import uuid
 
-    nodes = _load_nodes(client_id)
+    nodes = await _load_nodes(client_id)
     now = datetime.now(timezone.utc).isoformat()
 
-    # Update if rustdesk_id already exists, otherwise add
     existing = next((n for n in nodes if n.get("rustdesk_id") == rustdesk_id), None)
     if existing:
-        existing["machine_name"] = machine_name   # raw hostname, always updated by agent
+        existing["machine_name"] = machine_name
         existing["last_seen"] = now
         existing["status"] = "online"
         if password:
             existing["password"] = password
         if notes:
             existing["notes"] = notes
-        # display_name is user-set nickname — never touched by agent re-registration
     else:
         nodes.append({
             "id": str(uuid.uuid4()),
@@ -580,39 +552,39 @@ def nodes_register(
             "status": "online",
         })
 
-    _save_nodes(client_id, nodes)
+    await _save_nodes(client_id, nodes)
     return {"status": "registered", "machine_name": machine_name, "rustdesk_id": rustdesk_id}
 
 
 @app.get("/nodes")
-def nodes_list(client_id: str = Depends(get_client_id)):
+async def nodes_list(client_id: str = Depends(get_client_id)):
     """List all registered nodes for this client."""
-    return {"nodes": _load_nodes(client_id)}
+    return {"nodes": await _load_nodes(client_id)}
 
 
 @app.patch("/nodes/{node_id}")
-def nodes_rename(node_id: str, body: dict, client_id: str = Depends(get_client_id)):
+async def nodes_rename(node_id: str, body: dict, client_id: str = Depends(get_client_id)):
     """Set a user-facing nickname (display_name) for a node. Never overwritten by agent."""
     new_name = body.get("machine_name", "").strip()
     if not new_name:
         raise HTTPException(status_code=400, detail="machine_name is required")
-    nodes = _load_nodes(client_id)
+    nodes = await _load_nodes(client_id)
     for n in nodes:
         if n.get("id") == node_id:
-            n["display_name"] = new_name   # stored separately from machine_name (hostname)
-            _save_nodes(client_id, nodes)
+            n["display_name"] = new_name
+            await _save_nodes(client_id, nodes)
             return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Node not found")
 
 
 @app.delete("/nodes/{node_id}")
-def nodes_delete(node_id: str, client_id: str = Depends(get_client_id)):
+async def nodes_delete(node_id: str, client_id: str = Depends(get_client_id)):
     """Remove a node by its id."""
-    nodes = _load_nodes(client_id)
+    nodes = await _load_nodes(client_id)
     updated = [n for n in nodes if n.get("id") != node_id]
     if len(updated) == len(nodes):
         raise HTTPException(status_code=404, detail="Node not found")
-    _save_nodes(client_id, updated)
+    await _save_nodes(client_id, updated)
     return {"status": "deleted"}
 
 
@@ -627,19 +599,10 @@ SELF_URL = os.environ.get("SERVER_SELF_URL", "https://capp-data-server.onrender.
 
 
 async def _verify_api_key_async(x_api_key: str) -> Optional[str]:
-    """Async API key validation — returns client_id or None."""
+    """Async API key validation — returns client_id or None. Uses shared cache."""
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{SUPABASE_URL}/rest/v1/capp_clients",
-                params={"api_key": f"eq.{x_api_key}", "select": "client_id,active"},
-                headers=_supabase_headers(),
-                timeout=8,
-            )
-        if r.status_code != 200 or not r.json():
-            return None
-        row = r.json()[0]
-        return row["client_id"] if row.get("active") else None
+        row = await _lookup_api_key(x_api_key)
+        return row["client_id"] if row and row.get("active") else None
     except Exception:
         return None
 
@@ -861,41 +824,40 @@ def _school_slug(name: str) -> str:
 
 
 @app.post("/register")
-def self_register(
-    school:   str = Body(..., embed=True),   # school/team name
-    email:    str = Body(..., embed=True),   # used as username
+async def self_register(
+    school:   str = Body(..., embed=True),
+    email:    str = Body(..., embed=True),
     password: str = Body(..., embed=True),
 ):
     """
     Self-service registration — no admin token required.
     Creates an active account and returns client_id + api_key immediately.
-    The customer can then activate from inside the app.
     """
     username = email.strip().lower()
     if not username or not password or not school.strip():
         raise HTTPException(status_code=400, detail="school, email, and password are required.")
 
-    # Reject duplicate email/username
-    r = httpx.get(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"username": f"eq.{username}", "select": "username"},
-        headers=_supa_headers_json(),
-    )
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}", "select": "username"},
+            headers=_supa_headers_json(),
+        )
     if r.status_code == 200 and r.json():
         raise HTTPException(status_code=409, detail="An account with that email already exists.")
 
-    # Generate a unique client_id from school name
     base_slug = _school_slug(school.strip())
     client_id = base_slug
-    for n in range(2, 20):
-        rc = httpx.get(
-            f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"client_id": f"eq.{client_id}", "select": "client_id"},
-            headers=_supa_headers_json(),
-        )
-        if rc.status_code == 200 and not rc.json():
-            break
-        client_id = f"{base_slug}_{n}"
+    async with httpx.AsyncClient() as c:
+        for n in range(2, 20):
+            rc = await c.get(
+                f"{SUPABASE_URL}/rest/v1/capp_clients",
+                params={"client_id": f"eq.{client_id}", "select": "client_id"},
+                headers=_supa_headers_json(),
+            )
+            if rc.status_code == 200 and not rc.json():
+                break
+            client_id = f"{base_slug}_{n}"
 
     salt    = _secrets.token_hex(16)
     pw_hash = _hash_pw(password, salt)
@@ -912,11 +874,12 @@ def self_register(
         "seat_1_machine": None,
         "seat_2_machine": None,
     }
-    r2 = httpx.post(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        json=row,
-        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
-    )
+    async with httpx.AsyncClient() as client:
+        r2 = await client.post(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            json=row,
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
     if r2.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=f"Account creation failed: {r2.text}")
 
@@ -971,26 +934,26 @@ def admin_teams():
 
 
 @app.post("/admin/api/clients", dependencies=[Depends(_require_admin)])
-def admin_create_client(
+async def admin_create_client(
     username:  str = Body(...),
     client_id: str = Body(...),
     school:    str = Body(...),
     password:  str = Body(""),
     is_admin:  bool = Body(False),
 ):
-    # Duplicate check
-    r = httpx.get(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"username": f"eq.{username}", "select": "username"},
-        headers=_supa_headers_json(),
-    )
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}", "select": "username"},
+            headers=_supa_headers_json(),
+        )
     if r.status_code == 200 and r.json():
         raise HTTPException(status_code=409, detail=f"Username '{username}' already exists.")
 
-    pw       = password.strip() or _gen_password()
-    salt     = _secrets.token_hex(16)
-    pw_hash  = _hash_pw(pw, salt)
-    api_key  = _gen_api_key()
+    pw      = password.strip() or _gen_password()
+    salt    = _secrets.token_hex(16)
+    pw_hash = _hash_pw(pw, salt)
+    api_key = _gen_api_key()
 
     row = {
         "client_id":      client_id.strip().lower(),
@@ -1003,11 +966,12 @@ def admin_create_client(
         "seat_1_machine": None,
         "seat_2_machine": None,
     }
-    r2 = httpx.post(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        json=row,
-        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
-    )
+    async with httpx.AsyncClient() as c:
+        r2 = await c.post(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            json=row,
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
     if r2.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=f"Supabase error: {r2.text}")
 
@@ -1015,84 +979,90 @@ def admin_create_client(
 
 
 @app.get("/admin/api/clients", dependencies=[Depends(_require_admin)])
-def admin_list_clients():
-    r = httpx.get(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"select": "username,client_id,active,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date",
-                "order": "username.asc"},
-        headers=_supa_headers_json(),
-    )
+async def admin_list_clients():
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"select": "username,client_id,active,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date",
+                    "order": "username.asc"},
+            headers=_supa_headers_json(),
+        )
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
     return r.json()
 
 
 @app.patch("/admin/api/clients/{username}", dependencies=[Depends(_require_admin)])
-def admin_update_client(username: str, payload: dict = Body(...)):
+async def admin_update_client(username: str, payload: dict = Body(...)):
     """Update editable fields: notes, next_invoice_date."""
     allowed = {k: v for k, v in payload.items() if k in ("notes", "next_invoice_date")}
     if not allowed:
         raise HTTPException(status_code=400, detail="No editable fields provided.")
-    r = httpx.patch(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"username": f"eq.{username}"},
-        json=allowed,
-        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
-    )
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json=allowed,
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
 
 
 @app.patch("/admin/api/clients/{username}/reset-seat", dependencies=[Depends(_require_admin)])
-def admin_reset_single_seat(username: str, seat: int = Body(..., embed=True)):
+async def admin_reset_single_seat(username: str, seat: int = Body(..., embed=True)):
     """Reset a single seat (1 or 2)."""
     col = "seat_1_machine" if seat == 1 else "seat_2_machine"
-    r = httpx.patch(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"username": f"eq.{username}"},
-        json={col: None},
-        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
-    )
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={col: None},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
 
 
 @app.patch("/admin/api/clients/{username}/reset-seats", dependencies=[Depends(_require_admin)])
-def admin_reset_seats(username: str):
-    r = httpx.patch(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"username": f"eq.{username}"},
-        json={"seat_1_machine": None, "seat_2_machine": None},
-        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
-    )
+async def admin_reset_seats(username: str):
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={"seat_1_machine": None, "seat_2_machine": None},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
 
 
 @app.patch("/admin/api/clients/{username}/deactivate", dependencies=[Depends(_require_admin)])
-def admin_deactivate(username: str, active: bool = Body(..., embed=True)):
-    r = httpx.patch(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"username": f"eq.{username}"},
-        json={"active": active},
-        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
-    )
+async def admin_deactivate(username: str, active: bool = Body(..., embed=True)):
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={"active": active},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
 
 
 @app.delete("/admin/api/clients/{username}", dependencies=[Depends(_require_admin)])
-def admin_delete_client(username: str):
+async def admin_delete_client(username: str):
     """Permanently delete a client account from Supabase."""
-    r = httpx.delete(
-        f"{SUPABASE_URL}/rest/v1/capp_clients",
-        params={"username": f"eq.{username}"},
-        headers={**_supa_headers_json(), "Prefer": "return=minimal"},
-    )
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
