@@ -115,7 +115,7 @@ async def run_worker(w: WorkerState, base_url: str, api_key: str,
     global total_requests, total_errors, all_latencies
 
     headers      = {"x-api-key": api_key}
-    last_version = 0
+    last_version = -1   # -1 ensures first version check always triggers a plays fetch
     version_due  = 0.0
     games_due    = 0.0
 
