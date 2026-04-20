@@ -58,17 +58,17 @@ def upload_to_supabase(db_path):
         log.warning("No Supabase credentials — skipping upload")
         return False
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{SUPABASE_PATH}"
-    with open(db_path, "rb") as f:
-        data = f.read()
     headers = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "apikey": SUPABASE_KEY,
         "Content-Type": "application/octet-stream",
         "x-upsert": "true",
     }
-    r = requests.post(url, data=data, headers=headers, timeout=120)
+    size = os.path.getsize(db_path)
+    with open(db_path, "rb") as f:
+        r = requests.post(url, data=f, headers=headers, timeout=120)
     if r.status_code in (200, 201):
-        log.info(f"Uploaded to Supabase ({len(data)//1024} KB)")
+        log.info(f"Uploaded to Supabase ({size//1024} KB)")
         return True
     else:
         log.error(f"Supabase upload failed: {r.status_code} {r.text[:200]}")

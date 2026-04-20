@@ -44,13 +44,16 @@ def _bootstrap_db():
     url = f"{supabase_url}/storage/v1/object/capp-workflow/shared/workflow.db"
     headers = {"Authorization": f"Bearer {supabase_key}", "apikey": supabase_key}
     print("Bootstrapping workflow_server.db from Supabase...")
-    r = httpx.get(url, headers=headers, timeout=120, follow_redirects=True)
-    if r.status_code == 200:
-        with open(SERVER_DB_PATH, "wb") as f:
-            f.write(r.content)
-        print(f"DB bootstrapped ({len(r.content)//1024} KB)")
-    else:
-        print(f"WARNING: DB bootstrap failed ({r.status_code})")
+    with httpx.stream("GET", url, headers=headers, timeout=120, follow_redirects=True) as r:
+        if r.status_code == 200:
+            size = 0
+            with open(SERVER_DB_PATH, "wb") as f:
+                for chunk in r.iter_bytes(chunk_size=65536):
+                    f.write(chunk)
+                    size += len(chunk)
+            print(f"DB bootstrapped ({size//1024} KB)")
+        else:
+            print(f"WARNING: DB bootstrap failed ({r.status_code})")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

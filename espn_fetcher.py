@@ -116,6 +116,9 @@ ESPN_NAME_OVERRIDES = {
     "SE Louisiana Lions": "Southeastern Louisiana",
     "UAlbany Great Danes": "Albany",
     "East Texas A&M Lions": "Texas A&M-Commerce",
+    "Delaware Blue Hens": "Delaware",
+    "West Georgia Wolves": "West Georgia",
+    "New Haven Chargers": "New Haven",
     "San Jos\u00e9 State Spartans": "San Jose State",
     "San Jose State Spartans": "San Jose State",
 }
@@ -153,7 +156,7 @@ CAPP_TEAM_NAMES = {
     "Brown", "Bryant", "Bucknell", "Butler", "Cal Poly", "Campbell",
     "Central Arkansas", "Central Connecticut", "Charleston Southern", "Chattanooga",
     "Citadel", "Colgate", "Columbia", "Cornell", "Dartmouth", "Davidson",
-    "Dayton", "Delaware State", "Drake", "Duquesne", "East Tennessee State",
+    "Dayton", "Delaware", "Delaware State", "Drake", "Duquesne", "East Tennessee State",
     "Eastern Illinois", "Eastern Kentucky", "Eastern Washington", "Elon",
     "Florida A&M", "Fordham", "Furman", "Gardner-Webb", "Georgetown",
     "Grambling State", "Hampton", "Harvard", "Holy Cross", "Houston Baptist",
@@ -162,7 +165,7 @@ CAPP_TEAM_NAMES = {
     "Lamar", "Lehigh", "Lindenwood", "Maine", "Marist", "McNeese",
     "Mercer", "Mercyhurst", "Merrimack", "Mississippi Valley State",
     "Missouri State", "Monmouth", "Montana", "Montana State", "Morehead State",
-    "Morgan State", "Murray State", "New Hampshire", "Nicholls", "Norfolk State",
+    "Morgan State", "Murray State", "New Hampshire", "New Haven", "Nicholls", "Norfolk State",
     "North Alabama", "North Carolina A&T", "North Carolina Central", "North Dakota",
     "North Dakota State", "Northern Arizona", "Northern Colorado", "Northern Iowa",
     "Northwestern State", "Penn", "Portland State", "Prairie View A&M",
@@ -174,7 +177,7 @@ CAPP_TEAM_NAMES = {
     "Stetson", "Stonehill", "Stony Brook", "Tarleton State", "Tennessee State",
     "Tennessee Tech", "Texas A&M-Commerce", "Texas Southern", "Towson",
     "UC Davis", "UT Martin", "UTRGV", "Utah Tech", "VMI", "Valparaiso",
-    "Villanova", "Wagner", "Weber State", "Western Carolina", "Western Illinois",
+    "Villanova", "Wagner", "Weber State", "West Georgia", "Western Carolina", "Western Illinois",
     "William & Mary", "Wofford", "Yale", "Youngstown State",
 }
 
@@ -1279,6 +1282,12 @@ def _poll_loop():
         with _lock:
             _games_cache.clear()
             _games_cache.extend(new_games)
+            # Evict completed games older than 6 hours to prevent unbounded growth
+            _cutoff = time.time() - 6 * 3600
+            stale = [gid for gid, v in _plays_cache.items()
+                     if v.get("status") == "post" and v.get("fetched_at", 0) < _cutoff]
+            for gid in stale:
+                del _plays_cache[gid]
 
         time.sleep(POLL_INTERVAL)
 
