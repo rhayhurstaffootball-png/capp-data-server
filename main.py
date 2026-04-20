@@ -6,14 +6,57 @@ import json
 import hashlib
 import httpx
 import sqlite3
+import time
+from collections import deque, defaultdict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
 
-from espn_fetcher import get_live_games, get_game_plays, get_game_version, start_poller, get_team_list, get_team_schedule
+from espn_fetcher import (
+    get_live_games,
+    get_game_plays,
+    get_game_version,
+    start_poller,
+    get_team_list,
+    get_team_schedule,
+    get_fetcher_metrics,
+    get_game_monitor_rows,
+)
 from db_updater import run_update
 
 
 SERVER_DB_PATH = os.path.join(os.path.dirname(__file__), "workflow_server.db")
+APP_STARTED_AT = time.time()
+BOOTSTRAP_FINISHED_AT = 0.0
+SCHEDULER_STARTED_AT = 0.0
+REQUEST_TOTAL = 0
+REQUEST_ERRORS = 0
+REQUEST_PATH_COUNTS: dict = defaultdict(int)
+RECENT_LATENCY_MS = deque(maxlen=500)
+GAME_REQUEST_STATS: dict = defaultdict(
+    lambda: {
+        "plays_requests": 0,
+        "version_requests": 0,
+        "errors": 0,
+        "bytes_sent": 0,
+        "last_request_at": 0.0,
+        "last_success_at": 0.0,
+        "last_error": "",
+        "last_status_code": 0,
+        "latency_ms": deque(maxlen=100),
+        "request_times": deque(maxlen=300),
+        "slow_over_2000": 0,
+        "slow_over_5000": 0,
+        "slow_over_10000": 0,
+    }
+)
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(len(ordered) * pct))
+    return ordered[index]
 
 def get_db_meta():
     """Read current version info from workflow_server.db."""
@@ -28,6 +71,227 @@ def get_db_meta():
     except Exception:
         pass
     return None
+
+
+def _process_memory_bytes() -> int:
+    try:
+        import resource  # Linux / macOS
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if os.name == "posix" and rss < 1024 * 1024 * 1024:
+            return int(rss * 1024)
+        return int(rss)
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        if ok:
+            return int(counters.WorkingSetSize)
+    except Exception:
+        pass
+
+    return 0
+
+
+def _latency_summary() -> dict:
+    values = list(RECENT_LATENCY_MS)
+    if not values:
+        return {"count": 0, "avg_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+    values.sort()
+    p95_index = min(len(values) - 1, int(len(values) * 0.95))
+    return {
+        "count": len(values),
+        "avg_ms": round(sum(values) / len(values), 1),
+        "p95_ms": round(values[p95_index], 1),
+        "max_ms": round(values[-1], 1),
+    }
+
+
+def _record_game_request(game_id: str, endpoint: str, latency_ms: float, status_code: int, payload_bytes: int = 0, error: str = ""):
+    if not game_id:
+        return
+    now = time.time()
+    stats = GAME_REQUEST_STATS[str(game_id)]
+    stats["last_request_at"] = now
+    stats["last_status_code"] = int(status_code or 0)
+    stats["request_times"].append(now)
+    if endpoint == "plays":
+        stats["plays_requests"] += 1
+    elif endpoint == "version":
+        stats["version_requests"] += 1
+    if latency_ms > 0:
+        stats["latency_ms"].append(float(latency_ms))
+        if latency_ms > 2000:
+            stats["slow_over_2000"] += 1
+        if latency_ms > 5000:
+            stats["slow_over_5000"] += 1
+        if latency_ms > 10000:
+            stats["slow_over_10000"] += 1
+    if payload_bytes > 0:
+        stats["bytes_sent"] += int(payload_bytes)
+    if 200 <= int(status_code or 0) < 400:
+        stats["last_success_at"] = now
+    else:
+        stats["errors"] += 1
+        stats["last_error"] = error or f"HTTP {status_code}"
+
+
+def _window_count(timestamps: deque, seconds: int) -> int:
+    if not timestamps:
+        return 0
+    cutoff = time.time() - seconds
+    return sum(1 for ts in timestamps if ts >= cutoff)
+
+
+def _game_request_snapshot() -> dict:
+    snapshot = {}
+    for game_id, stats in GAME_REQUEST_STATS.items():
+        latencies = list(stats["latency_ms"])
+        snapshot[game_id] = {
+            "plays_requests": stats["plays_requests"],
+            "version_requests": stats["version_requests"],
+            "errors": stats["errors"],
+            "bytes_sent": stats["bytes_sent"],
+            "last_request_at": stats["last_request_at"] or None,
+            "last_success_at": stats["last_success_at"] or None,
+            "last_error": stats["last_error"],
+            "last_status_code": stats["last_status_code"],
+            "requests_last_60s": _window_count(stats["request_times"], 60),
+            "requests_last_300s": _window_count(stats["request_times"], 300),
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else 0.0,
+            "p95_latency_ms": round(_percentile(latencies, 0.95), 1) if latencies else 0.0,
+            "max_latency_ms": round(max(latencies), 1) if latencies else 0.0,
+            "slow_over_2000": stats["slow_over_2000"],
+            "slow_over_5000": stats["slow_over_5000"],
+            "slow_over_10000": stats["slow_over_10000"],
+        }
+    return snapshot
+
+
+def _build_gameday_payload() -> dict:
+    health = _build_health_payload()
+    game_rows = get_game_monitor_rows()
+    request_rows = _game_request_snapshot()
+
+    merged_games = []
+    for row in game_rows:
+        request_stats = request_rows.get(row["game_id"], {})
+        merged = {**row, **request_stats}
+        merged["alert_level"] = "green"
+        reasons = []
+        if merged.get("p95_latency_ms", 0) > 5000:
+            merged["alert_level"] = "red"
+            reasons.append("p95 latency > 5s")
+        elif merged.get("p95_latency_ms", 0) > 2000:
+            if merged["alert_level"] != "red":
+                merged["alert_level"] = "yellow"
+            reasons.append("p95 latency > 2s")
+        if merged.get("errors", 0) > 0:
+            merged["alert_level"] = "red"
+            reasons.append("request errors")
+        if merged.get("qc_issue_count", 0) > 0:
+            if merged["alert_level"] != "red":
+                merged["alert_level"] = "yellow"
+            reasons.append(f"{merged['qc_issue_count']} QC issue(s)")
+        if merged.get("status") == "in" and merged.get("age_seconds") is not None and merged["age_seconds"] > 45:
+            merged["alert_level"] = "red"
+            reasons.append("live game cache stale")
+        merged["alert_reasons"] = reasons
+        merged_games.append(merged)
+
+    alerts = []
+    recent_latency = health.get("requests", {}).get("recent_latency", {})
+    fetcher = health.get("fetcher", {})
+    if not fetcher.get("poller_alive"):
+        alerts.append({"level": "red", "kind": "poller", "message": "Poller is not alive."})
+    if fetcher.get("last_poll_error"):
+        alerts.append({"level": "red", "kind": "poller", "message": f"Last poll error: {fetcher['last_poll_error']}"})
+    if recent_latency.get("p95_ms", 0) > 5000:
+        alerts.append({"level": "red", "kind": "latency", "message": f"Server p95 latency is {recent_latency['p95_ms']} ms."})
+    elif recent_latency.get("p95_ms", 0) > 2000:
+        alerts.append({"level": "yellow", "kind": "latency", "message": f"Server p95 latency is {recent_latency['p95_ms']} ms."})
+    if health.get("memory", {}).get("rss_bytes", 0) > 1_500_000_000:
+        alerts.append({"level": "red", "kind": "memory", "message": "Process memory is above 1.5 GB."})
+    elif health.get("memory", {}).get("rss_bytes", 0) > 1_000_000_000:
+        alerts.append({"level": "yellow", "kind": "memory", "message": "Process memory is above 1.0 GB."})
+
+    for row in merged_games:
+        if row["alert_level"] != "green":
+            alerts.append({
+                "level": row["alert_level"],
+                "kind": "game",
+                "game_id": row["game_id"],
+                "message": f"{row.get('away_name','')} at {row.get('home_name','')}: {', '.join(row['alert_reasons'])}",
+            })
+
+    alerts.sort(key=lambda item: (item["level"] != "red", item["kind"], item["message"]))
+    return {
+        "generated_at": time.time(),
+        "platform": health,
+        "summary": {
+            "tracked_games": len(merged_games),
+            "live_games": sum(1 for row in merged_games if row.get("status") == "in"),
+            "games_with_qc_issues": sum(1 for row in merged_games if row.get("qc_issue_count", 0) > 0),
+            "games_with_errors": sum(1 for row in merged_games if row.get("errors", 0) > 0),
+            "games_slow_p95": sum(1 for row in merged_games if row.get("p95_latency_ms", 0) > 2000),
+            "alerts_red": sum(1 for item in alerts if item["level"] == "red"),
+            "alerts_yellow": sum(1 for item in alerts if item["level"] == "yellow"),
+        },
+        "alerts": alerts[:50],
+        "games": merged_games,
+    }
+
+
+def _build_health_payload() -> dict:
+    fetcher = get_fetcher_metrics()
+    db_meta = get_db_meta()
+    uptime = max(0.0, time.time() - APP_STARTED_AT)
+    ready = bool(BOOTSTRAP_FINISHED_AT and fetcher.get("poller_alive") and fetcher.get("initial_poll_complete"))
+    return {
+        "status": "ok" if ready else "warming",
+        "ready": ready,
+        "version": "2",
+        "started_at": APP_STARTED_AT,
+        "uptime_seconds": round(uptime, 1),
+        "bootstrap_finished_at": BOOTSTRAP_FINISHED_AT,
+        "scheduler_started_at": SCHEDULER_STARTED_AT,
+        "db": {
+            "present": os.path.exists(SERVER_DB_PATH),
+            "path": SERVER_DB_PATH,
+            "meta": db_meta,
+        },
+        "memory": {
+            "rss_bytes": _process_memory_bytes(),
+        },
+        "requests": {
+            "total": REQUEST_TOTAL,
+            "errors": REQUEST_ERRORS,
+            "by_path": dict(REQUEST_PATH_COUNTS),
+            "recent_latency": _latency_summary(),
+        },
+        "fetcher": fetcher,
+    }
 
 def _bootstrap_db():
     """
@@ -59,16 +323,39 @@ def _bootstrap_db():
 async def lifespan(app: FastAPI):
     # Download DB from Supabase if not present (Render ephemeral disk)
     _bootstrap_db()
+    global BOOTSTRAP_FINISHED_AT, SCHEDULER_STARTED_AT
+    BOOTSTRAP_FINISHED_AT = time.time()
     # Start scheduler
     scheduler = AsyncIOScheduler()
     # Run at 6:00 AM and 6:00 PM UTC daily
     scheduler.add_job(lambda: run_update(), "cron", hour="6,18", minute=0,
                       id="db_update", replace_existing=True)
     scheduler.start()
+    SCHEDULER_STARTED_AT = time.time()
     yield
     scheduler.shutdown()
 
 app = FastAPI(title="CAPP Data Server", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    global REQUEST_TOTAL, REQUEST_ERRORS
+
+    started = time.perf_counter()
+    REQUEST_TOTAL += 1
+    REQUEST_PATH_COUNTS[request.url.path] += 1
+    try:
+        response = await call_next(request)
+    except Exception:
+        REQUEST_ERRORS += 1
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    RECENT_LATENCY_MS.append(elapsed_ms)
+    if response.status_code >= 400:
+        REQUEST_ERRORS += 1
+    return response
 
 # --- Supabase config ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -132,7 +419,12 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2"}
+    return _build_health_payload()
+
+
+@app.get("/metrics/status")
+def metrics_status():
+    return _build_health_payload()
 
 @app.get("/games", dependencies=[Depends(verify_api_key)])
 def games(
@@ -149,9 +441,19 @@ def plays(
     league: str = Query("cfb", description="cfb or nfl"),
     force_refresh: bool = Query(False, description="Bypass cache and re-fetch from API"),
 ):
+    started = time.perf_counter()
     try:
-        return get_game_plays(game_id, league=league, force_refresh=force_refresh)
+        payload = get_game_plays(game_id, league=league, force_refresh=force_refresh)
+        latency_ms = (time.perf_counter() - started) * 1000
+        try:
+            payload_bytes = len(json.dumps(payload).encode("utf-8"))
+        except Exception:
+            payload_bytes = 0
+        _record_game_request(game_id, "plays", latency_ms, 200, payload_bytes=payload_bytes)
+        return payload
     except Exception as e:
+        latency_ms = (time.perf_counter() - started) * 1000
+        _record_game_request(game_id, "plays", latency_ms, 500, error=f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 @app.get("/game/{game_id}/version", dependencies=[Depends(verify_api_key)])
@@ -159,7 +461,11 @@ def game_version(game_id: str):
     """Lightweight endpoint — returns only the fetched_at timestamp for the
     cached entry.  Clients poll this every 60 s to detect retroactive data
     corrections without re-downloading the full play list each time."""
-    return {"game_id": game_id, "fetched_at": get_game_version(game_id)}
+    started = time.perf_counter()
+    payload = {"game_id": game_id, "fetched_at": get_game_version(game_id)}
+    latency_ms = (time.perf_counter() - started) * 1000
+    _record_game_request(game_id, "version", latency_ms, 200, payload_bytes=len(json.dumps(payload).encode("utf-8")))
+    return payload
 
 @app.get("/teams", dependencies=[Depends(verify_api_key)])
 def teams(league: str = Query("cfb", description="cfb or nfl")):
@@ -992,6 +1298,12 @@ async def admin_list_clients():
     return r.json()
 
 
+@app.get("/admin/api/gameday/status", dependencies=[Depends(_require_admin)])
+def admin_gameday_status():
+    """Game-day operator status: platform health, alerts, and per-game telemetry."""
+    return _build_gameday_payload()
+
+
 @app.patch("/admin/api/clients/{username}", dependencies=[Depends(_require_admin)])
 async def admin_update_client(username: str, payload: dict = Body(...)):
     """Update editable fields: notes, next_invoice_date."""
@@ -1154,6 +1466,18 @@ _ADMIN_HTML = """<!DOCTYPE html>
   .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 99; }
   .overlay.on { display: block; }
   .so-save-msg { color: #86efac; font-size: 12px; margin-top: 6px; display: none; }
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .kpi { background: #0d1117; border: 1px solid #2c3b55; border-radius: 10px; padding: 14px; }
+  .kpi .label { color: #8b95a1; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
+  .kpi .value { color: #e2e8f0; font-size: 24px; font-weight: 700; margin-top: 8px; }
+  .kpi .sub { color: #8b95a1; font-size: 12px; margin-top: 4px; }
+  .alert-list { display: flex; flex-direction: column; gap: 10px; }
+  .alert-item { border-radius: 10px; padding: 12px 14px; border: 1px solid #2c3b55; }
+  .alert-red { background: #2a1111; border-color: #7f1d1d; color: #fecaca; }
+  .alert-yellow { background: #2a210f; border-color: #92400e; color: #fde68a; }
+  .alert-green { background: #102318; border-color: #166534; color: #bbf7d0; }
+  .mono { font-family: Consolas, monospace; }
+  .small { font-size: 12px; color: #8b95a1; }
 </style>
 </head>
 <body>
@@ -1175,6 +1499,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
   <div class="tabs">
     <button class="tab active" onclick="showTab('clients-tab', this)">Clients</button>
     <button class="tab" onclick="showTab('create-tab', this)">Create Account</button>
+    <button class="tab" onclick="showTab('gameday-tab', this)">Game Day</button>
   </div>
   <div class="main-area">
 
@@ -1225,6 +1550,18 @@ _ADMIN_HTML = """<!DOCTYPE html>
         </div>
         <button class="btn btn-primary" onclick="createClient()">Create Account</button>
         <div class="result" id="create-result"></div>
+      </div>
+    </div>
+
+    <div class="panel" id="gameday-tab">
+      <div class="card">
+        <h2>Game-Day Monitoring
+          <button class="btn btn-primary" onclick="loadGameDayStatus()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p class="small" style="margin-bottom:14px;">Platform health, alerting, and per-game delivery/QC telemetry for live operations.</p>
+        <div id="gameday-summary"><div class="loading">Loading...</div></div>
+        <div id="gameday-alerts" style="margin-top:18px;"></div>
+        <div id="gameday-games" style="margin-top:18px;"></div>
       </div>
     </div>
 
@@ -1295,6 +1632,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
 let _token = "";
 let _currentUser = null;
 let _allClients = [];
+let _gameDayTimer = null;
 
 function doLogin() {
   const pw = document.getElementById("pw-input").value.trim();
@@ -1318,6 +1656,7 @@ document.getElementById("pw-input").addEventListener("keydown", e => { if (e.key
 
 function logout() {
   _token = ""; _currentUser = null; _allClients = [];
+  stopGameDayRefresh();
   document.getElementById("app").style.display = "none";
   document.getElementById("login").style.display = "flex";
   document.getElementById("pw-input").value = "";
@@ -1329,8 +1668,10 @@ function showTab(id, btn) {
   document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
   document.getElementById(id).classList.add("active");
   btn.classList.add("active");
+   stopGameDayRefresh();
   if (id === "clients-tab") loadClients();
   if (id === "create-tab") loadTeams();
+  if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   closeSlideout();
 }
 
@@ -1340,6 +1681,118 @@ function api(method, path, body) {
     headers: { "x-admin-token": _token, "Content-Type": "application/json" },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   }).then(r => r.json());
+}
+
+function fmtBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return value.toFixed(1) + " " + units[idx];
+}
+
+function fmtAge(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 60) return seconds.toFixed(0) + "s";
+  if (seconds < 3600) return (seconds / 60).toFixed(1) + "m";
+  return (seconds / 3600).toFixed(1) + "h";
+}
+
+function badgeForLevel(level, text) {
+  const cls = level === "red" ? "badge-red" : level === "yellow" ? "badge-blue" : "badge-green";
+  return '<span class="badge ' + cls + '">' + text + '</span>';
+}
+
+function startGameDayRefresh() {
+  stopGameDayRefresh();
+  _gameDayTimer = setInterval(() => {
+    const panel = document.getElementById("gameday-tab");
+    if (panel && panel.classList.contains("active")) loadGameDayStatus();
+  }, 15000);
+}
+
+function stopGameDayRefresh() {
+  if (_gameDayTimer) {
+    clearInterval(_gameDayTimer);
+    _gameDayTimer = null;
+  }
+}
+
+function loadGameDayStatus() {
+  document.getElementById("gameday-summary").innerHTML = '<div class="loading">Loading summary...</div>';
+  document.getElementById("gameday-alerts").innerHTML = '<div class="loading">Loading alerts...</div>';
+  document.getElementById("gameday-games").innerHTML = '<div class="loading">Loading game telemetry...</div>';
+  api("GET", "/gameday/status").then(data => {
+    if (!data || !data.summary) {
+      document.getElementById("gameday-summary").innerHTML = '<div class="loading">Error loading game-day status.</div>';
+      return;
+    }
+    const platform = data.platform || {};
+    const requests = (platform.requests || {});
+    const recent = (requests.recent_latency || {});
+    const fetcher = (platform.fetcher || {});
+    const memory = ((platform.memory || {}).rss_bytes || 0);
+    document.getElementById("gameday-summary").innerHTML = `
+      <div class="kpi-grid">
+        <div class="kpi"><div class="label">Server Status</div><div class="value">${platform.status || "unknown"}</div><div class="sub">ready=${platform.ready}</div></div>
+        <div class="kpi"><div class="label">Memory RSS</div><div class="value">${fmtBytes(memory)}</div><div class="sub">process memory</div></div>
+        <div class="kpi"><div class="label">Req P95</div><div class="value">${recent.p95_ms || 0} ms</div><div class="sub">recent server latency</div></div>
+        <div class="kpi"><div class="label">Tracked Games</div><div class="value">${data.summary.tracked_games || 0}</div><div class="sub">live=${data.summary.live_games || 0}</div></div>
+        <div class="kpi"><div class="label">Poller</div><div class="value">${fetcher.poller_alive ? "Alive" : "Down"}</div><div class="sub">last poll ${fetcher.last_poll_duration_ms || 0} ms</div></div>
+        <div class="kpi"><div class="label">QC Issues</div><div class="value">${data.summary.games_with_qc_issues || 0}</div><div class="sub">games currently flagged</div></div>
+      </div>
+      <div class="small">Generated: ${new Date((data.generated_at || 0) * 1000).toLocaleString()}</div>
+    `;
+
+    const alerts = Array.isArray(data.alerts) ? data.alerts : [];
+    if (!alerts.length) {
+      document.getElementById("gameday-alerts").innerHTML = '<div class="alert-item alert-green">No active alerts right now.</div>';
+    } else {
+      document.getElementById("gameday-alerts").innerHTML =
+        '<div class="alert-list">' +
+        alerts.map(a => `<div class="alert-item alert-${a.level}"><strong>${(a.kind || "alert").toUpperCase()}</strong><div style="margin-top:4px;">${a.message}</div></div>`).join("") +
+        '</div>';
+    }
+
+    const games = Array.isArray(data.games) ? data.games : [];
+    if (!games.length) {
+      document.getElementById("gameday-games").innerHTML = '<div class="loading">No tracked games in cache yet.</div>';
+      return;
+    }
+    const rows = games.map(g => `
+      <tr>
+        <td>${badgeForLevel(g.alert_level, (g.alert_level || "green").toUpperCase())}</td>
+        <td>${g.away_name || "—"} at ${g.home_name || "—"}</td>
+        <td>${g.status || "—"}</td>
+        <td>${g.plays_count || 0}</td>
+        <td>${g.qc_issue_count || 0}</td>
+        <td>${g.requests_last_60s || 0}</td>
+        <td>${g.p95_latency_ms || 0} ms</td>
+        <td>${fmtBytes(g.payload_bytes || 0)}</td>
+        <td>${fmtAge(g.age_seconds)}</td>
+        <td class="mono">${(g.alert_reasons || []).join(", ") || "—"}</td>
+      </tr>
+    `).join("");
+    document.getElementById("gameday-games").innerHTML = `
+      <table>
+        <thead>
+          <tr>
+            <th>Level</th><th>Game</th><th>Status</th><th>Plays</th><th>QC</th>
+            <th>Req/60s</th><th>P95</th><th>Payload</th><th>Age</th><th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }).catch(() => {
+    document.getElementById("gameday-summary").innerHTML = '<div class="loading">Cannot reach game-day status endpoint.</div>';
+    document.getElementById("gameday-alerts").innerHTML = "";
+    document.getElementById("gameday-games").innerHTML = "";
+  });
 }
 
 // ── Clients table ─────────────────────────────────────────────────────────────

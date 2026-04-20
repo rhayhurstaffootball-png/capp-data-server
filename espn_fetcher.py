@@ -289,6 +289,13 @@ _POSTSEASON_DATES = {
 _games_cache = []   # list of game info dicts
 _plays_cache = {}   # game_id -> mapped result dict
 _lock = threading.Lock()
+_poller_thread = None
+_poller_started_at = 0.0
+_last_poll_started_at = 0.0
+_last_poll_completed_at = 0.0
+_last_poll_duration_ms = 0.0
+_last_poll_error = ""
+_initial_poll_done = threading.Event()
 
 # ============================================================
 # Team Name Utilities
@@ -1262,7 +1269,9 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
 
 def _poll_loop():
     while True:
+        poll_started = time.time()
         new_games = []
+        poll_errors = []
         for league in ["cfb", "nfl"]:
             try:
                 events = _fetch_scoreboard(league, {})
@@ -1276,8 +1285,10 @@ def _poll_loop():
                                 _plays_cache[g["game_id"]] = mapped
                         except Exception as e:
                             print(f"Live plays error ({g['game_id']}): {e}")
+                            poll_errors.append(f"Live plays error ({g['game_id']}): {e}")
             except Exception as e:
                 print(f"Poll error ({league}): {e}")
+                poll_errors.append(f"Poll error ({league}): {e}")
 
         with _lock:
             _games_cache.clear()
@@ -1288,12 +1299,101 @@ def _poll_loop():
                      if v.get("status") == "post" and v.get("fetched_at", 0) < _cutoff]
             for gid in stale:
                 del _plays_cache[gid]
+            global _last_poll_started_at, _last_poll_completed_at, _last_poll_duration_ms, _last_poll_error
+            _last_poll_started_at = poll_started
+            _last_poll_completed_at = time.time()
+            _last_poll_duration_ms = max(0.0, (_last_poll_completed_at - poll_started) * 1000)
+            _last_poll_error = " | ".join(poll_errors[:3])
+        _initial_poll_done.set()
 
         time.sleep(POLL_INTERVAL)
 
 def start_poller():
-    t = threading.Thread(target=_poll_loop, daemon=True)
-    t.start()
+    global _poller_thread, _poller_started_at
+    with _lock:
+        if _poller_thread and _poller_thread.is_alive():
+            return False
+        _poller_started_at = time.time()
+        _poller_thread = threading.Thread(target=_poll_loop, daemon=True, name="capp-espn-poller")
+        _poller_thread.start()
+    return True
+
+
+def get_fetcher_metrics() -> dict:
+    with _lock:
+        games_cache = list(_games_cache)
+        plays_cache = dict(_plays_cache)
+        poller_alive = bool(_poller_thread and _poller_thread.is_alive())
+        last_started = _last_poll_started_at
+        last_completed = _last_poll_completed_at
+        last_duration_ms = _last_poll_duration_ms
+        last_error = _last_poll_error
+        poller_started_at = _poller_started_at
+
+    live_games = [g for g in games_cache if g.get("status") == "in"]
+    final_cached = sum(1 for value in plays_cache.values() if value.get("status") == "post")
+    live_cached = sum(1 for value in plays_cache.values() if value.get("status") == "in")
+
+    return {
+        "poller_started": poller_started_at > 0,
+        "poller_alive": poller_alive,
+        "poller_started_at": poller_started_at,
+        "initial_poll_complete": _initial_poll_done.is_set(),
+        "last_poll_started_at": last_started,
+        "last_poll_completed_at": last_completed,
+        "last_poll_duration_ms": round(last_duration_ms, 1),
+        "last_poll_error": last_error,
+        "games_cache_count": len(games_cache),
+        "live_games_count": len(live_games),
+        "plays_cache_count": len(plays_cache),
+        "plays_cache_live_count": live_cached,
+        "plays_cache_post_count": final_cached,
+    }
+
+
+def get_game_monitor_rows() -> list:
+    with _lock:
+        games_cache = list(_games_cache)
+        plays_cache = dict(_plays_cache)
+
+    game_lookup = {str(game.get("game_id", "")): game for game in games_cache if game.get("game_id")}
+    rows = []
+    for game_id, payload in plays_cache.items():
+        entries = payload.get("entries", []) or []
+        qc_entries = [entry for entry in entries if entry.get("qc_issue")]
+        qc_examples = []
+        for entry in qc_entries[:3]:
+            issue = str(entry.get("qc_issue", "")).strip()
+            if issue:
+                qc_examples.append(issue)
+
+        base = game_lookup.get(str(game_id), {})
+        try:
+            payload_bytes = len(json.dumps(payload).encode("utf-8"))
+        except Exception:
+            payload_bytes = 0
+
+        fetched_at = float(payload.get("fetched_at", 0) or 0)
+        status = payload.get("status") or base.get("status") or "unknown"
+        rows.append({
+            "game_id": str(game_id),
+            "league": payload.get("league") or base.get("league") or "cfb",
+            "status": status,
+            "home_name": payload.get("home_name") or base.get("home_team") or "",
+            "away_name": payload.get("away_name") or base.get("away_team") or "",
+            "period": payload.get("period") or base.get("period") or 0,
+            "clock": payload.get("clock") or base.get("clock") or "",
+            "status_detail": payload.get("status_detail") or base.get("status_detail") or "",
+            "fetched_at": fetched_at,
+            "age_seconds": round(max(0.0, time.time() - fetched_at), 1) if fetched_at else None,
+            "plays_count": len(entries),
+            "payload_bytes": payload_bytes,
+            "qc_issue_count": len(qc_entries),
+            "qc_examples": qc_examples,
+        })
+
+    rows.sort(key=lambda row: (row["status"] != "in", -(row["fetched_at"] or 0), row["game_id"]))
+    return rows
 
 # ============================================================
 # Public API
