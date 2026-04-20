@@ -1566,6 +1566,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <div id="gameday-summary"><div class="loading">Loading...</div></div>
         <div id="gameday-alerts" style="margin-top:18px;"></div>
         <div id="gameday-games" style="margin-top:18px;"></div>
+        <div id="gameday-detail" style="margin-top:18px;"></div>
       </div>
     </div>
 
@@ -1637,6 +1638,7 @@ let _token = "";
 let _currentUser = null;
 let _allClients = [];
 let _gameDayTimer = null;
+let _gameDayGames = [];
 
 function doLogin() {
   const pw = document.getElementById("pw-input").value.trim();
@@ -1730,6 +1732,7 @@ function loadGameDayStatus() {
   document.getElementById("gameday-summary").innerHTML = '<div class="loading">Loading summary...</div>';
   document.getElementById("gameday-alerts").innerHTML = '<div class="loading">Loading alerts...</div>';
   document.getElementById("gameday-games").innerHTML = '<div class="loading">Loading game telemetry...</div>';
+  document.getElementById("gameday-detail").innerHTML = '<div class="loading">Select a game row to inspect fixes and remaining QC issues.</div>';
   api("GET", "/gameday/status").then(data => {
     if (!data || !data.summary) {
       document.getElementById("gameday-summary").innerHTML = '<div class="loading">Error loading game-day status.</div>';
@@ -1764,12 +1767,14 @@ function loadGameDayStatus() {
     }
 
     const games = Array.isArray(data.games) ? data.games : [];
+    _gameDayGames = games;
     if (!games.length) {
       document.getElementById("gameday-games").innerHTML = '<div class="loading">No tracked games in cache yet.</div>';
+      document.getElementById("gameday-detail").innerHTML = '<div class="loading">No game detail available yet.</div>';
       return;
     }
     const rows = games.map(g => `
-      <tr>
+      <tr class="clickable" onclick="showGameDayDetail('${g.game_id}')">
         <td>${badgeForLevel(g.alert_level, (g.alert_level || "green").toUpperCase())}</td>
         <td>${g.away_name || "—"} at ${g.home_name || "—"}</td>
         <td>${g.status || "—"}</td>
@@ -1795,11 +1800,50 @@ function loadGameDayStatus() {
         <tbody>${rows}</tbody>
       </table>
     `;
+    document.getElementById("gameday-detail").innerHTML = '<div class="loading">Click a game row to inspect QC details.</div>';
   }).catch(() => {
     document.getElementById("gameday-summary").innerHTML = '<div class="loading">Cannot reach game-day status endpoint.</div>';
     document.getElementById("gameday-alerts").innerHTML = "";
     document.getElementById("gameday-games").innerHTML = "";
+    document.getElementById("gameday-detail").innerHTML = "";
   });
+}
+
+function showGameDayDetail(gameId) {
+  const game = (_gameDayGames || []).find(g => String(g.game_id) === String(gameId));
+  if (!game) return;
+  const fixedExamples = (game.auto_fixed_examples || []).length
+    ? (game.auto_fixed_examples || []).map(x => `<li>${x}</li>`).join("")
+    : "<li>No auto-fixes recorded for this game.</li>";
+  const flaggedExamples = (game.qc_examples || []).length
+    ? (game.qc_examples || []).map(x => `<li>${x}</li>`).join("")
+    : "<li>No remaining QC flags for this game.</li>";
+  const notes = (game.alert_reasons || []).length
+    ? (game.alert_reasons || []).join(", ")
+    : "No active alerts for this game.";
+  document.getElementById("gameday-detail").innerHTML = `
+    <div class="card">
+      <h2>${game.away_name || "—"} at ${game.home_name || "—"} <span class="small mono">(${game.game_id})</span></h2>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="label">Alert Level</div><div class="value">${(game.alert_level || "green").toUpperCase()}</div><div class="sub">${notes}</div></div>
+        <div class="kpi"><div class="label">Auto-Fixed</div><div class="value">${game.auto_fixed_count || 0}</div><div class="sub">manual gaps: ${game.manual_gap_count || 0}</div></div>
+        <div class="kpi"><div class="label">Still Flagged</div><div class="value">${game.qc_issue_count || 0}</div><div class="sub">remaining QC issues</div></div>
+        <div class="kpi"><div class="label">Latency</div><div class="value">${game.p95_latency_ms || 0} ms</div><div class="sub">avg ${game.avg_latency_ms || 0} ms</div></div>
+        <div class="kpi"><div class="label">Traffic</div><div class="value">${game.requests_last_60s || 0}</div><div class="sub">req/60s, ${game.requests_last_300s || 0} req/5m</div></div>
+        <div class="kpi"><div class="label">Payload</div><div class="value">${fmtBytes(game.payload_bytes || 0)}</div><div class="sub">plays=${game.plays_count || 0}, age=${fmtAge(game.age_seconds)}</div></div>
+      </div>
+      <div class="form-row">
+        <div class="card" style="margin-bottom:0;">
+          <h2>Auto-Fixed Examples</h2>
+          <ul>${fixedExamples}</ul>
+        </div>
+        <div class="card" style="margin-bottom:0;">
+          <h2>Still Flagged</h2>
+          <ul>${flaggedExamples}</ul>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 // ── Clients table ─────────────────────────────────────────────────────────────
