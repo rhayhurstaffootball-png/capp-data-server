@@ -323,6 +323,18 @@ def _bootstrap_db():
         else:
             print(f"WARNING: DB bootstrap failed ({r.status_code})")
 
+def _evict_game_request_stats():
+    """Remove GAME_REQUEST_STATS entries not accessed in the last 48 hours."""
+    cutoff = time.time() - 48 * 3600
+    stale = [gid for gid, stats in GAME_REQUEST_STATS.items()
+             if stats.get("last_request_at", 0) < cutoff]
+    for gid in stale:
+        del GAME_REQUEST_STATS[gid]
+    if stale:
+        import gc
+        gc.collect()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Download DB from Supabase if not present (Render ephemeral disk)
@@ -334,6 +346,9 @@ async def lifespan(app: FastAPI):
     # Run at 6:00 AM and 6:00 PM UTC daily
     scheduler.add_job(lambda: run_update(), "cron", hour="6,18", minute=0,
                       id="db_update", replace_existing=True)
+    # Evict stale game request stats every hour
+    scheduler.add_job(_evict_game_request_stats, "interval", hours=1,
+                      id="evict_game_stats", replace_existing=True)
     scheduler.start()
     SCHEDULER_STARTED_AT = time.time()
     yield
@@ -903,9 +918,24 @@ async def nodes_delete(node_id: str, client_id: str = Depends(get_client_id)):
 # Session key = "{client_id}:{machine_id}" — scoped per account for security.
 
 _vnc_sessions: Dict[str, Dict[str, object]] = {}
+_vnc_locks:    Dict[str, Dict[str, asyncio.Lock]] = {}
 _active_relay:  Dict[str, str]              = {}   # session_key → relay URL agent is on
 
 SELF_URL = os.environ.get("SERVER_SELF_URL", "https://capp-data-server.onrender.com")
+
+
+async def _vnc_keepalive_task(websocket, lock):
+    while True:
+        await asyncio.sleep(10)
+        async with lock:
+            try:
+                await websocket.send_text('{"type":"keepalive"}')
+            except Exception:
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+                break
 
 
 async def _verify_api_key_async(x_api_key: str) -> Optional[str]:
@@ -949,11 +979,17 @@ async def vnc_relay(
 
     if session_key not in _vnc_sessions:
         _vnc_sessions[session_key] = {"host": None, "viewer": None}
+        _vnc_locks[session_key]    = {"host": asyncio.Lock(), "viewer": asyncio.Lock()}
     _vnc_sessions[session_key][role] = websocket
+    _vnc_locks[session_key][role]    = asyncio.Lock()   # fresh lock for this connection
+
+    my_lock = _vnc_locks[session_key][role]
 
     # Track which relay the agent is on so the viewer can find it
     if role == "host":
         _active_relay[session_key] = SELF_URL
+
+    ka = asyncio.create_task(_vnc_keepalive_task(websocket, my_lock))
 
     try:
         while True:
@@ -962,15 +998,18 @@ async def vnc_relay(
             if msg_type == "websocket.disconnect":
                 break
 
-            other_ws = _vnc_sessions.get(session_key, {}).get(other_role)
-            if other_ws is not None:
-                try:
-                    if data.get("text") is not None:
-                        await other_ws.send_text(data["text"])
-                    elif data.get("bytes") is not None:
-                        await other_ws.send_bytes(data["bytes"])
-                except Exception:
-                    pass
+            other_ws   = _vnc_sessions.get(session_key, {}).get(other_role)
+            other_lock = _vnc_locks.get(session_key, {}).get(other_role)
+
+            if other_ws is not None and other_lock is not None:
+                async with other_lock:
+                    try:
+                        if data.get("bytes") is not None:
+                            await other_ws.send_bytes(data["bytes"])
+                        elif data.get("text") is not None:
+                            await other_ws.send_text(data["text"])
+                    except Exception:
+                        pass
 
             # If viewer sends input and host is NOT on WebSocket (HTTP polling
             # fallback), store in _poll_inputs so the agent can pick it up
@@ -987,10 +1026,13 @@ async def vnc_relay(
     except Exception:
         pass
     finally:
+        ka.cancel()
         if session_key in _vnc_sessions:
-            _vnc_sessions[session_key][role] = None
-            if all(v is None for v in _vnc_sessions[session_key].values()):
-                del _vnc_sessions[session_key]
+            if _vnc_sessions[session_key][role] is websocket:
+                _vnc_sessions[session_key][role] = None
+                if all(v is None for v in _vnc_sessions[session_key].values()):
+                    del _vnc_sessions[session_key]
+                    del _vnc_locks[session_key]
         if role == "host":
             _active_relay.pop(session_key, None)
 
