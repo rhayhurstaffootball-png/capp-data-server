@@ -4,6 +4,7 @@ from typing import Optional, Dict, List
 import os
 import json
 import hashlib
+import asyncio
 import httpx
 import sqlite3
 import time
@@ -1048,12 +1049,12 @@ async def set_active_relay(body: dict = Body(...), x_api_key: str = Header(None)
     if machine_id and relay_url:
         # Store in memory (fast) AND persist to node data (survives Render restarts)
         _active_relay[f"{client_id}:{machine_id}"] = relay_url
-        nodes = _load_nodes(client_id)
+        nodes = await _load_nodes(client_id)
         for n in nodes:
             if n.get("rustdesk_id") == machine_id:
                 n["active_relay"] = relay_url
                 break
-        _save_nodes(client_id, nodes)
+        await _save_nodes(client_id, nodes)
     return {"ok": True}
 
 
@@ -1066,7 +1067,7 @@ async def get_agent_relay(machine_id: str, x_api_key: str = Header(None)):
     # In-memory first (fast), then persistent node data (survives Render restarts)
     relay = _active_relay.get(f"{client_id}:{machine_id}")
     if not relay:
-        nodes = _load_nodes(client_id)
+        nodes = await _load_nodes(client_id)
         node = next((n for n in nodes if n.get("rustdesk_id") == machine_id), None)
         relay = node.get("active_relay", SELF_URL) if node else SELF_URL
     return {"relay_url": relay}
