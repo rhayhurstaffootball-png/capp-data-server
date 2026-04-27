@@ -1427,6 +1427,154 @@ async def admin_delete_client(username: str):
     return {"ok": True}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPP Friends
+# ─────────────────────────────────────────────────────────────────────────────
+from datetime import datetime as _dt, timezone as _tz
+
+
+@app.get("/friends/directory", dependencies=[Depends(verify_api_key)])
+async def friends_directory():
+    """Return all school profiles. Every authenticated client can read all profiles."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/school_profiles",
+            params={"select": "*", "order": "team.asc.nullslast"},
+            headers=_supa_headers_json(),
+            timeout=10,
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Directory unavailable")
+    return r.json()
+
+
+@app.put("/friends/profile")
+async def friends_save_profile(
+    profile: dict = Body(...),
+    client_id: str = Depends(get_client_id),
+):
+    """Upsert own school profile. client_id is always derived from the API key — never trusted from body."""
+    profile.pop("client_id", None)
+    profile["client_id"]   = client_id
+    profile["updated_at"]  = _dt.now(_tz.utc).isoformat()
+    async with httpx.AsyncClient() as c:
+        r = await c.post(
+            f"{SUPABASE_URL}/rest/v1/school_profiles",
+            json=profile,
+            headers={**_supa_headers_json(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+            timeout=10,
+        )
+    if r.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=502, detail=f"Save failed: {r.text[:200]}")
+    return {"ok": True}
+
+
+@app.get("/friends/conversations")
+async def friends_conversations(client_id: str = Depends(get_client_id)):
+    """Inbox: latest message per conversation partner + unread count."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/messages",
+            params={
+                "or":    f"(sender_id.eq.{client_id},recipient_id.eq.{client_id})",
+                "order": "sent_at.desc",
+                "limit": "500",
+            },
+            headers=_supa_headers_json(),
+            timeout=10,
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Conversations unavailable")
+    msgs   = r.json()
+    seen: dict = {}
+    for msg in msgs:
+        other = msg["recipient_id"] if msg["sender_id"] == client_id else msg["sender_id"]
+        if other not in seen:
+            seen[other] = {
+                "client_id": other,
+                "last_msg":  msg["body"],
+                "last_ts":   msg["sent_at"],
+                "unread":    0,
+            }
+        if msg["recipient_id"] == client_id and not msg.get("read_at"):
+            seen[other]["unread"] += 1
+    return list(seen.values())
+
+
+@app.get("/friends/messages")
+async def friends_get_messages(
+    with_id: str = Query(...),
+    client_id: str = Depends(get_client_id),
+):
+    """Full message thread between this client and another."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/messages",
+            params={
+                "or": (
+                    f"(and(sender_id.eq.{client_id},recipient_id.eq.{with_id}),"
+                    f"and(sender_id.eq.{with_id},recipient_id.eq.{client_id}))"
+                ),
+                "order": "sent_at.asc",
+                "limit": "500",
+            },
+            headers=_supa_headers_json(),
+            timeout=10,
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Messages unavailable")
+    return r.json()
+
+
+@app.post("/friends/messages")
+async def friends_send_message(
+    body: dict = Body(...),
+    client_id: str = Depends(get_client_id),
+):
+    """Send a message to another client."""
+    to   = str(body.get("to", "")).strip()
+    text = str(body.get("body", "")).strip()
+    if not to or not text:
+        raise HTTPException(status_code=400, detail="to and body required")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(
+            f"{SUPABASE_URL}/rest/v1/messages",
+            json={"sender_id": client_id, "recipient_id": to, "body": text},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+            timeout=10,
+        )
+    if r.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=502, detail=f"Send failed: {r.text[:200]}")
+    return {"ok": True}
+
+
+@app.post("/friends/messages/read")
+async def friends_mark_read(
+    body: dict = Body(...),
+    client_id: str = Depends(get_client_id),
+):
+    """Mark all unread messages from a sender as read."""
+    from_id = str(body.get("with_id", "")).strip()
+    if not from_id:
+        raise HTTPException(status_code=400, detail="with_id required")
+    now_iso = _dt.now(_tz.utc).isoformat()
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/messages",
+            params={
+                "sender_id":    f"eq.{from_id}",
+                "recipient_id": f"eq.{client_id}",
+                "read_at":      "is.null",
+            },
+            json={"read_at": now_iso},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+            timeout=10,
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=502, detail="Mark read failed")
+    return {"ok": True}
+
+
 _ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
