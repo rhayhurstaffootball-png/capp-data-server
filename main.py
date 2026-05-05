@@ -732,8 +732,8 @@ def app_version():
 
 @app.get("/app/download", dependencies=[Depends(verify_api_key)])
 async def app_download():
-    """Signed Supabase URL for CAPP_Setup.exe. File transfer goes Supabase → Client."""
-    return {"download_url": await _signed_url("shared/CAPP_Setup.exe")}
+    """Installer served from DO relay — no Supabase file size limits."""
+    return {"download_url": "https://relay.cappvcs.com/installer/download"}
 
 
 # ── Season Data Endpoints ─────────────────────────────────────────────────────
