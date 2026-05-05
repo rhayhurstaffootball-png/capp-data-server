@@ -442,6 +442,114 @@ def health():
     return _build_health_payload()
 
 
+_BETA_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CAPP Beta</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0d0d0d;
+      color: #f0f0f0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .logo {
+      font-size: 3rem;
+      font-weight: 800;
+      letter-spacing: 0.15em;
+      color: #ffffff;
+      margin-bottom: 0.25rem;
+    }
+    .logo span { color: #e8a020; }
+    .tagline {
+      font-size: 0.95rem;
+      color: #888;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 3rem;
+    }
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 2.5rem 3rem;
+      text-align: center;
+      max-width: 480px;
+      width: 90%;
+    }
+    .badge {
+      display: inline-block;
+      background: #e8a020;
+      color: #000;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 0.25rem 0.75rem;
+      border-radius: 20px;
+      margin-bottom: 1.25rem;
+    }
+    .card h2 {
+      font-size: 1.4rem;
+      font-weight: 600;
+      margin-bottom: 0.75rem;
+    }
+    .card p {
+      font-size: 0.9rem;
+      color: #999;
+      line-height: 1.6;
+      margin-bottom: 2rem;
+    }
+    .download-btn {
+      display: inline-block;
+      background: #e8a020;
+      color: #000;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-decoration: none;
+      padding: 0.85rem 2.5rem;
+      border-radius: 8px;
+      transition: background 0.2s;
+    }
+    .download-btn:hover { background: #f0b030; }
+    .meta {
+      font-size: 0.75rem;
+      color: #555;
+      margin-top: 1.5rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="logo">C<span>A</span>PP</div>
+  <div class="tagline">Video Coordinator Suite</div>
+  <div class="card">
+    <div class="badge">Beta Access</div>
+    <h2>Download CAPP v2.0.0</h2>
+    <p>You've been invited to try the CAPP Beta.<br>
+       Download the installer below and run it to get started.<br>
+       Updates will be delivered automatically inside the app.</p>
+    <a class="download-btn" href="https://relay.cappvcs.com/installer/download">
+      Download Installer
+    </a>
+    <div class="meta">Windows 10/11 &nbsp;&middot;&nbsp; ~276 MB</div>
+  </div>
+</body>
+</html>"""
+
+
+@app.get("/beta", response_class=HTMLResponse, include_in_schema=False)
+def beta_page():
+    return HTMLResponse(_BETA_HTML)
+
+
 @app.get("/metrics/status")
 def metrics_status():
     return _build_health_payload()
