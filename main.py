@@ -844,6 +844,16 @@ async def app_download():
     return {"download_url": "https://relay.cappvcs.com/installer/download"}
 
 
+@app.get("/agent/version")
+def agent_version():
+    """
+    Public endpoint — returns current CAPPNodes Agent version.
+    Bump AGENT_VERSION env var on Render when a new CAPPNodes_Agent.exe is uploaded.
+    """
+    version = os.environ.get("AGENT_VERSION", "2.0.0")
+    return {"version": version}
+
+
 # ── Season Data Endpoints ─────────────────────────────────────────────────────
 
 @app.get("/season/version")
