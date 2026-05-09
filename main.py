@@ -1599,7 +1599,7 @@ async def admin_list_clients():
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"select": "username,client_id,active,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date",
+            params={"select": "username,client_id,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date",
                     "order": "username.asc"},
             headers=_supa_headers_json(),
         )
@@ -1669,6 +1669,20 @@ async def admin_deactivate(username: str, active: bool = Body(..., embed=True)):
             f"{SUPABASE_URL}/rest/v1/capp_clients",
             params={"username": f"eq.{username}"},
             json={"active": active},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.patch("/admin/api/clients/{username}/license", dependencies=[Depends(_require_admin)])
+async def admin_set_licensed(username: str, licensed: bool = Body(..., embed=True)):
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={"licensed": licensed},
             headers={**_supa_headers_json(), "Prefer": "return=minimal"},
         )
     if r.status_code not in (200, 204):
@@ -2083,6 +2097,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
   </div>
   <div class="so-footer">
     <button class="btn btn-success btn-sm" id="so-toggle-btn" onclick="toggleActiveFromSlideout()">—</button>
+    <button class="btn btn-primary btn-sm" id="so-license-btn" onclick="toggleLicensedFromSlideout()">—</button>
     <button class="btn btn-danger btn-sm" onclick="deleteFromSlideout()">Delete Account</button>
   </div>
 </div>
@@ -2371,6 +2386,15 @@ function openSlideout(username) {
     toggleBtn.className = "btn btn-success btn-sm";
   }
 
+  const licBtn = document.getElementById("so-license-btn");
+  if (c.licensed) {
+    licBtn.textContent = "Revoke License";
+    licBtn.className = "btn btn-warning btn-sm";
+  } else {
+    licBtn.textContent = "Grant License";
+    licBtn.className = "btn btn-primary btn-sm";
+  }
+
   document.getElementById("slideout").classList.add("open");
   document.getElementById("overlay").classList.add("on");
 }
@@ -2416,6 +2440,17 @@ function toggleActiveFromSlideout() {
     : "Deactivate " + _currentUser.username + "? This will block all their logins.";
   if (!confirm(msg)) return;
   api("PATCH", "/clients/" + _currentUser.username + "/deactivate", { active: newState })
+    .then(d => { if (d.ok) { loadClients(); closeSlideout(); } else alert("Error: " + JSON.stringify(d)); });
+}
+
+function toggleLicensedFromSlideout() {
+  if (!_currentUser) return;
+  const newState = !_currentUser.licensed;
+  const msg = newState
+    ? "Grant full license to " + _currentUser.username + "? This removes all trial restrictions."
+    : "Revoke license from " + _currentUser.username + "? They will revert to trial mode.";
+  if (!confirm(msg)) return;
+  api("PATCH", "/clients/" + _currentUser.username + "/license", { licensed: newState })
     .then(d => { if (d.ok) { loadClients(); closeSlideout(); } else alert("Error: " + JSON.stringify(d)); });
 }
 
