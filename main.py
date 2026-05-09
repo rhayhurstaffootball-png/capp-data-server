@@ -1294,39 +1294,128 @@ def _school_slug(name: str) -> str:
     return _re.sub(r'[^a-z0-9]+', '_', name.lower().strip()).strip('_') or "school"
 
 
+def _school_username_base(name: str) -> str:
+    """'Florida State' -> 'FloridaState'  |  'Air Force' -> 'AirForce'"""
+    words = _re.sub(r"[^a-zA-Z0-9 ]", "", name.strip()).split()
+    return "".join(w.capitalize() for w in words) or "School"
+
+
+def _send_registration_email(to_email: str, to_name: str, username: str, school: str) -> None:
+    """Send the assigned-username confirmation email via SMTP (env-configured)."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host = os.environ.get("SMTP_HOST", "")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    from_addr = os.environ.get("FROM_EMAIL", smtp_user)
+
+    if not smtp_host or not smtp_user or not smtp_pass:
+        return  # email not configured — skip silently
+
+    body_html = f"""
+    <div style="font-family:'Segoe UI',Arial,sans-serif;background:#070a0f;color:#e8edf5;padding:40px 0;">
+      <div style="max-width:480px;margin:0 auto;background:#111825;border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:36px;">
+        <div style="text-align:center;margin-bottom:24px;">
+          <img src="https://cappvcs.com/capplogo.png" alt="CAPP" style="height:40px;" />
+        </div>
+        <h2 style="color:#e8edf5;font-size:1.25rem;font-weight:700;margin:0 0 8px;">Welcome to CAPP, {to_name.split()[0]}!</h2>
+        <p style="color:#8b96a8;font-size:0.9rem;margin:0 0 24px;">
+          Your account for <strong style="color:#e8edf5;">{school}</strong> has been created.
+          Here are your login credentials:
+        </p>
+        <div style="background:rgba(58,126,191,0.08);border:1px solid rgba(58,126,191,0.25);border-radius:8px;padding:16px 20px;margin-bottom:24px;">
+          <div style="font-size:0.75rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#8b96a8;margin-bottom:4px;">Username</div>
+          <div style="font-size:1.1rem;font-weight:700;color:#3a7ebf;letter-spacing:0.03em;">{username}</div>
+        </div>
+        <p style="color:#8b96a8;font-size:0.85rem;margin:0 0 8px;">
+          Open the CAPP app, click <strong style="color:#e8edf5;">Sign In</strong>, and enter the username above along with the password you chose during registration.
+        </p>
+        <p style="color:#8b96a8;font-size:0.85rem;margin:0;">
+          Questions? Reply to this email or contact <a href="mailto:roger@cappvcs.com" style="color:#3a7ebf;">roger@cappvcs.com</a>.
+        </p>
+      </div>
+    </div>
+    """
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Your CAPP username: {username}"
+    msg["From"]    = f"CAPP Video Coordinator Suite <{from_addr}>"
+    msg["To"]      = to_email
+    msg.attach(MIMEText(body_html, "html"))
+
+    with smtplib.SMTP(smtp_host, smtp_port) as s:
+        s.starttls()
+        s.login(smtp_user, smtp_pass)
+        s.sendmail(from_addr, [to_email], msg.as_string())
+
+
 @app.post("/register")
 async def self_register(
-    school:   str = Body(..., embed=True),
-    email:    str = Body(..., embed=True),
-    password: str = Body(..., embed=True),
+    school:     str = Body(..., embed=True),
+    email:      str = Body(..., embed=True),
+    password:   str = Body(..., embed=True),
+    name:       str = Body("", embed=True),
+    conference: str = Body("", embed=True),
 ):
     """
-    Self-service registration — no admin token required.
-    Creates an active account and returns client_id + api_key immediately.
+    Self-service registration from cappvcs.com/register.
+    Generates a SchoolName1/SchoolName2 username, sends it by email, and
+    returns the username so the website can display it.  The app signs in
+    separately via /auth/login.
     """
-    username = email.strip().lower()
-    if not username or not password or not school.strip():
-        raise HTTPException(status_code=400, detail="school, email, and password are required.")
+    email  = email.strip().lower()
+    school = school.strip()
+    name   = name.strip()
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"username": f"eq.{username}", "select": "username"},
-            headers=_supa_headers_json(),
-        )
-    if r.status_code == 200 and r.json():
-        raise HTTPException(status_code=409, detail="An account with that email already exists.")
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
+    if not school:
+        raise HTTPException(status_code=400, detail="School / team name is required.")
+    if not password:
+        raise HTTPException(status_code=400, detail="Password is required.")
 
-    base_slug = _school_slug(school.strip())
-    client_id = base_slug
+    # (Email uniqueness is not enforced server-side; seat limits per school
+    #  prevent duplicate registrations for the same school.)
+
+    # Determine username: SchoolName1 or SchoolName2 (max 2 seats per school)
+    base_username = _school_username_base(school)
+    base_slug     = _school_slug(school)
+
     async with httpx.AsyncClient() as c:
-        for n in range(2, 20):
+        # Find the first available seat number
+        assigned_username = None
+        for seat in (1, 2):
+            candidate = f"{base_username}{seat}"
             rc = await c.get(
+                f"{SUPABASE_URL}/rest/v1/capp_clients",
+                params={"username": f"eq.{candidate}", "select": "username"},
+                headers=_supa_headers_json(),
+            )
+            if rc.status_code == 200 and not rc.json():
+                assigned_username = candidate
+                break
+
+        if assigned_username is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Both seats for {school} are already registered. "
+                    "Contact roger@cappvcs.com if you need access."
+                ),
+            )
+
+        # Resolve a unique client_id slug
+        client_id = base_slug
+        for n in range(2, 20):
+            rc2 = await c.get(
                 f"{SUPABASE_URL}/rest/v1/capp_clients",
                 params={"client_id": f"eq.{client_id}", "select": "client_id"},
                 headers=_supa_headers_json(),
             )
-            if rc.status_code == 200 and not rc.json():
+            if rc2.status_code == 200 and not rc2.json():
                 break
             client_id = f"{base_slug}_{n}"
 
@@ -1336,7 +1425,7 @@ async def self_register(
 
     row = {
         "client_id":      client_id,
-        "username":       username,
+        "username":       assigned_username,
         "password_hash":  pw_hash,
         "salt":           salt,
         "api_key":        api_key,
@@ -1354,7 +1443,16 @@ async def self_register(
     if r2.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=f"Account creation failed: {r2.text}")
 
-    return {"client_id": client_id, "api_key": api_key}
+    # Send confirmation email (non-blocking — don't fail registration if email fails)
+    try:
+        _send_registration_email(email, name or school, assigned_username, school)
+    except Exception:
+        pass
+
+    return {
+        "username": assigned_username,
+        "message":  "Account created. Check your email for your login username.",
+    }
 
 
 @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
