@@ -357,6 +357,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CAPP Data Server", lifespan=lifespan)
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://cappvcs.com", "https://www.cappvcs.com"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 
 @app.middleware("http")
 async def _metrics_middleware(request: Request, call_next):
