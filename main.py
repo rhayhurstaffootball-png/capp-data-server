@@ -1599,7 +1599,7 @@ async def admin_list_clients():
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"select": "username,client_id,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date",
+            params={"select": "username,client_id,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date,created_at",
                     "order": "username.asc"},
             headers=_supa_headers_json(),
         )
@@ -1909,7 +1909,9 @@ _ADMIN_HTML = """<!DOCTYPE html>
   .badge-green { background: #14532d; color: #86efac; }
   .badge-red   { background: #7f1d1d; color: #fca5a5; }
   .badge-blue  { background: #1e3a5f; color: #93c5fd; }
-  .badge-gray  { background: #1e2a3a; color: #8b95a1; }
+  .badge-gray   { background: #1e2a3a; color: #8b95a1; }
+  .badge-yellow { background: #2d2200; color: #facc15; }
+  .badge-red2   { background: #3b0a0a; color: #f87171; }
   .loading { color: #8b95a1; font-size: 13px; padding: 20px 0; text-align: center; }
   select { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white; font-size: 13px; padding: 8px 12px; outline: none; width: 100%; cursor: pointer; }
   select:focus { border-color: #3a7ebf; }
@@ -2329,23 +2331,38 @@ function loadClients() {
       document.getElementById("clients-table").innerHTML = '<div class="loading">No accounts yet.</div>';
       return;
     }
+    const TRIAL_DAYS = 7;
     const rows = data.map(c => {
       const active = c.active ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-red">Inactive</span>';
       const admin  = c.is_admin ? ' <span class="badge badge-blue">Admin</span>' : '';
       const s1     = c.seat_1_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
       const s2     = c.seat_2_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
       const inv    = c.next_invoice_date ? c.next_invoice_date : '<span style="color:#8b95a1">—</span>';
+      let licBadge;
+      if (c.licensed) {
+        licBadge = '<span class="badge badge-green">Licensed</span>';
+      } else {
+        const created = c.created_at ? new Date(c.created_at) : null;
+        const daysElapsed = created ? Math.floor((Date.now() - created) / 86400000) : 0;
+        if (daysElapsed >= TRIAL_DAYS) {
+          licBadge = '<span class="badge badge-red2">Trial Expired</span>';
+        } else {
+          const remaining = TRIAL_DAYS - daysElapsed;
+          licBadge = `<span class="badge badge-yellow">Trial (${remaining}d left)</span>`;
+        }
+      }
       return `<tr class="clickable" onclick="openSlideout('${c.username}')">
         <td>${c.username}</td>
         <td>${c.client_id}</td>
         <td>${active}${admin}</td>
+        <td>${licBadge}</td>
         <td>${s1}</td><td>${s2}</td>
         <td>${inv}</td>
       </tr>`;
     }).join("");
     document.getElementById("clients-table").innerHTML = `
       <table>
-        <thead><tr><th>Username</th><th>Client ID</th><th>Status</th><th>Seat 1</th><th>Seat 2</th><th>Next Invoice</th></tr></thead>
+        <thead><tr><th>Username</th><th>Client ID</th><th>Status</th><th>License</th><th>Seat 1</th><th>Seat 2</th><th>Next Invoice</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   });
