@@ -1460,6 +1460,44 @@ def admin_page():
     return HTMLResponse(_ADMIN_HTML)
 
 
+@app.get("/public/schools")
+def public_schools():
+    """Public endpoint — teams grouped by division → conference for registration dropdowns."""
+    try:
+        conn = sqlite3.connect(SERVER_DB_PATH)
+        cur  = conn.cursor()
+        cur.execute("SELECT MAX(season) FROM team_conferences")
+        latest = cur.fetchone()[0] or 2026
+        cur.execute("""
+            SELECT team, conference, UPPER(classification) as division
+            FROM team_conferences
+            WHERE season = ?
+              AND conference IS NOT NULL
+              AND team NOT LIKE 'ZZZZZZ%%'
+            ORDER BY classification, conference, team
+        """, (latest,))
+        rows = cur.fetchall()
+        cur.execute("""
+            SELECT team, conference, division
+            FROM teams
+            WHERE division = 'NFL'
+              AND conference IS NOT NULL
+            ORDER BY conference, team
+        """)
+        nfl_rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    grouped: dict = {}
+    for team, conference, division in rows:
+        div_label = "FBS" if division == "FBS" else "FCS"
+        grouped.setdefault(div_label, {}).setdefault(conference, []).append(team)
+    for team, conference, _ in nfl_rows:
+        grouped.setdefault("NFL", {}).setdefault(conference, []).append(team)
+    return grouped
+
+
 @app.get("/admin/api/teams", dependencies=[Depends(_require_admin)])
 def admin_teams():
     """Return all teams grouped by division → conference for the admin panel.
