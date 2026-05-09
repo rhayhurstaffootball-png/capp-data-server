@@ -1454,8 +1454,9 @@ async def self_register(
     # Send confirmation email (non-blocking — don't fail registration if email fails)
     try:
         _send_registration_email(email, name or school, assigned_username, school)
-    except Exception:
-        pass
+        print(f"[REGISTER] Email sent to {email} for {assigned_username}", flush=True)
+    except Exception as _email_err:
+        print(f"[REGISTER] Email FAILED for {assigned_username} -> {email}: {_email_err}", flush=True)
 
     return {
         "username": assigned_username,
