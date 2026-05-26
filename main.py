@@ -641,7 +641,7 @@ async def trial_status(x_api_key: str = Header(None, alias="x-api-key")):
         r = await client.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
             params={"api_key": f"eq.{x_api_key}",
-                    "select": "client_id,active,licensed,created_at"},
+                    "select": "client_id,active,licensed,created_at,trial_extension_days"},
             headers=_supabase_headers(),
         )
     if r.status_code != 200 or not r.json():
@@ -656,13 +656,14 @@ async def trial_status(x_api_key: str = Header(None, alias="x-api-key")):
         return {"active": True, "licensed": True, "days_remaining": 9999,
                 "trial_days": TRIAL_DAYS}
 
-    # Trial — clock starts at account created_at
+    # Trial — clock starts at account created_at; admin can extend via trial_extension_days
     from datetime import datetime, timezone
     try:
         created_str = user.get("created_at", "")
         created_at  = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
         elapsed     = (datetime.now(timezone.utc) - created_at).days
-        remaining   = max(0, TRIAL_DAYS - elapsed)
+        extension   = int(user.get("trial_extension_days") or 0)
+        remaining   = max(0, TRIAL_DAYS + extension - elapsed)
     except Exception:
         remaining = TRIAL_DAYS   # malformed date — be generous
 
@@ -1599,7 +1600,7 @@ async def admin_list_clients():
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"select": "username,client_id,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date,created_at",
+            params={"select": "username,client_id,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date,created_at,trial_extension_days",
                     "order": "username.asc"},
             headers=_supa_headers_json(),
         )
@@ -1688,6 +1689,65 @@ async def admin_set_licensed(username: str, licensed: bool = Body(..., embed=Tru
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
+
+
+@app.patch("/admin/api/clients/{username}/extend-trial", dependencies=[Depends(_require_admin)])
+async def admin_extend_trial(username: str, days: int = Body(..., embed=True)):
+    """Add N days to a trial account's extension. Cumulative — safe to call multiple times."""
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 365.")
+    # Fetch current extension value
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}", "select": "trial_extension_days"},
+            headers=_supa_headers_json(),
+        )
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=404, detail="Account not found.")
+    current = int(r.json()[0].get("trial_extension_days") or 0)
+    async with httpx.AsyncClient() as c:
+        r2 = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={"trial_extension_days": current + days},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r2.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r2.text)
+    return {"ok": True, "trial_extension_days": current + days}
+
+
+@app.patch("/admin/api/clients/{username}/reset-trial", dependencies=[Depends(_require_admin)])
+async def admin_reset_trial(username: str):
+    """Reset trial to a fresh 7 days from now by computing the needed extension offset."""
+    from datetime import datetime, timezone
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}", "select": "created_at"},
+            headers=_supa_headers_json(),
+        )
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=404, detail="Account not found.")
+    created_str = r.json()[0].get("created_at", "")
+    try:
+        created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+        elapsed    = (datetime.now(timezone.utc) - created_at).days
+    except Exception:
+        elapsed = 0
+    # Set extension so that: TRIAL_DAYS + extension - elapsed = TRIAL_DAYS  →  extension = elapsed
+    new_extension = elapsed
+    async with httpx.AsyncClient() as c:
+        r2 = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={"trial_extension_days": new_extension},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r2.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r2.text)
+    return {"ok": True, "trial_extension_days": new_extension}
 
 
 @app.delete("/admin/api/clients/{username}", dependencies=[Depends(_require_admin)])
@@ -2080,6 +2140,17 @@ _ADMIN_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="so-section">
+      <h3>Trial</h3>
+      <div class="so-field"><label>Status</label><div class="so-val" id="so-trial-status">—</div></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;" id="so-trial-btns">
+        <button class="btn btn-primary btn-sm" onclick="extendTrial(7)">+7 Days</button>
+        <button class="btn btn-primary btn-sm" onclick="extendTrial(14)">+14 Days</button>
+        <button class="btn btn-primary btn-sm" onclick="extendTrial(30)">+30 Days</button>
+        <button class="btn btn-warning btn-sm" onclick="resetTrial()">Reset Trial</button>
+      </div>
+    </div>
+
+    <div class="so-section">
       <h3>Billing</h3>
       <div class="so-field">
         <label>Next Invoice Date</label>
@@ -2344,10 +2415,11 @@ function loadClients() {
       } else {
         const created = c.created_at ? new Date(c.created_at) : null;
         const daysElapsed = created ? Math.floor((Date.now() - created) / 86400000) : 0;
-        if (daysElapsed >= TRIAL_DAYS) {
+        const ext = c.trial_extension_days || 0;
+        const remaining = TRIAL_DAYS + ext - daysElapsed;
+        if (remaining <= 0) {
           licBadge = '<span class="badge badge-red2">Trial Expired</span>';
         } else {
-          const remaining = TRIAL_DAYS - daysElapsed;
           licBadge = `<span class="badge badge-yellow">Trial (${remaining}d left)</span>`;
         }
       }
@@ -2393,6 +2465,28 @@ function openSlideout(username) {
   document.getElementById("so-invoice-date").value = c.next_invoice_date || "";
   document.getElementById("so-notes").value = c.notes || "";
   document.getElementById("so-save-msg").style.display = "none";
+
+  // Trial status
+  const trialEl = document.getElementById("so-trial-status");
+  const trialBtns = document.getElementById("so-trial-btns");
+  if (c.licensed) {
+    trialEl.textContent = "Licensed — full access";
+    trialEl.style.color = "#86efac";
+    trialBtns.style.display = "none";
+  } else {
+    trialBtns.style.display = "flex";
+    const created = c.created_at ? new Date(c.created_at) : null;
+    const elapsed = created ? Math.floor((Date.now() - created) / 86400000) : 0;
+    const ext = c.trial_extension_days || 0;
+    const remaining = Math.max(0, 7 + ext - elapsed);
+    if (remaining > 0) {
+      trialEl.textContent = remaining + "d remaining" + (ext > 0 ? "  (+" + ext + "d added)" : "");
+      trialEl.style.color = "#fde68a";
+    } else {
+      trialEl.textContent = "Expired  (" + elapsed + "d elapsed, +" + ext + "d extension)";
+      trialEl.style.color = "#fca5a5";
+    }
+  }
 
   const toggleBtn = document.getElementById("so-toggle-btn");
   if (c.active) {
@@ -2481,6 +2575,26 @@ function deleteFromSlideout() {
   )) return;
   api("DELETE", "/clients/" + _currentUser.username)
     .then(d => { if (d.ok) { loadClients(); closeSlideout(); } else alert("Error: " + JSON.stringify(d)); });
+}
+
+function extendTrial(days) {
+  if (!_currentUser) return;
+  if (!confirm("Extend trial for " + _currentUser.username + " by " + days + " day(s)?")) return;
+  api("PATCH", "/clients/" + _currentUser.username + "/extend-trial", { days })
+    .then(d => {
+      if (d.ok) { loadClients(); closeSlideout(); }
+      else alert("Error: " + JSON.stringify(d));
+    });
+}
+
+function resetTrial() {
+  if (!_currentUser) return;
+  if (!confirm("Reset trial for " + _currentUser.username + "?\\nThis gives them a fresh 7-day trial starting now.")) return;
+  api("PATCH", "/clients/" + _currentUser.username + "/reset-trial", {})
+    .then(d => {
+      if (d.ok) { loadClients(); closeSlideout(); }
+      else alert("Error: " + JSON.stringify(d));
+    });
 }
 
 // ── Create account ────────────────────────────────────────────────────────────
