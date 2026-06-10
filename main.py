@@ -1765,6 +1765,89 @@ async def admin_delete_client(username: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CRM — demo prospects (separate from licensed capp_clients)
+# Simple pipeline tracker: schools Roger has demoed who may not be customers yet.
+# ─────────────────────────────────────────────────────────────────────────────
+_PROSPECT_STATUSES = ("Demo Done", "Quote/Contract Sent", "Trial", "Paid", "Lost")
+_PROSPECT_FIELDS   = ("school", "contact", "email", "phone", "status", "quote_sent_date", "notes")
+
+
+@app.get("/admin/api/prospects", dependencies=[Depends(_require_admin)])
+async def admin_list_prospects():
+    """All CRM prospects, most-recently-updated first."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_prospects",
+            params={"select": "*", "order": "updated_at.desc.nullslast"},
+            headers=_supa_headers_json(),
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.post("/admin/api/prospects", dependencies=[Depends(_require_admin)])
+async def admin_create_prospect(payload: dict = Body(...)):
+    """Create a prospect. Only `school` is required."""
+    row = {k: v for k, v in payload.items() if k in _PROSPECT_FIELDS}
+    if not (row.get("school") or "").strip():
+        raise HTTPException(status_code=400, detail="School is required.")
+    row.setdefault("status", "Demo Done")
+    if row["status"] not in _PROSPECT_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid status.")
+    row["quote_sent_date"] = row.get("quote_sent_date") or None
+    now = _dt.now(_tz.utc).isoformat()
+    row["created_at"] = now
+    row["updated_at"] = now
+    async with httpx.AsyncClient() as c:
+        r = await c.post(
+            f"{SUPABASE_URL}/rest/v1/capp_prospects",
+            json=row,
+            headers={**_supa_headers_json(), "Prefer": "return=representation"},
+        )
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()[0] if r.json() else {"ok": True}
+
+
+@app.patch("/admin/api/prospects/{prospect_id}", dependencies=[Depends(_require_admin)])
+async def admin_update_prospect(prospect_id: str, payload: dict = Body(...)):
+    """Update editable prospect fields. Always bumps updated_at."""
+    row = {k: v for k, v in payload.items() if k in _PROSPECT_FIELDS}
+    if not row:
+        raise HTTPException(status_code=400, detail="No editable fields provided.")
+    if "status" in row and row["status"] not in _PROSPECT_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid status.")
+    if "quote_sent_date" in row:
+        row["quote_sent_date"] = row["quote_sent_date"] or None
+    row["updated_at"] = _dt.now(_tz.utc).isoformat()
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_prospects",
+            params={"id": f"eq.{prospect_id}"},
+            json=row,
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.delete("/admin/api/prospects/{prospect_id}", dependencies=[Depends(_require_admin)])
+async def admin_delete_prospect(prospect_id: str):
+    """Permanently delete a prospect."""
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(
+            f"{SUPABASE_URL}/rest/v1/capp_prospects",
+            params={"id": f"eq.{prospect_id}"},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CAPP Friends
 # ─────────────────────────────────────────────────────────────────────────────
 from datetime import datetime as _dt, timezone as _tz
@@ -1978,10 +2061,10 @@ _ADMIN_HTML = """<!DOCTYPE html>
   select:disabled { opacity: 0.4; cursor: not-allowed; }
 
   /* Slide-out panel */
-  #slideout { position: fixed; top: 0; right: -420px; width: 420px; height: 100vh; background: #0d1117;
+  #slideout, #crm-slideout { position: fixed; top: 0; right: -420px; width: 420px; height: 100vh; background: #0d1117;
     border-left: 1px solid #2c3b55; z-index: 100; transition: right 0.28s ease; overflow-y: auto;
     display: flex; flex-direction: column; }
-  #slideout.open { right: 0; }
+  #slideout.open, #crm-slideout.open { right: 0; }
   .so-header { background: #111827; border-bottom: 1px solid #2c3b55; padding: 18px 22px;
     display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
   .so-header h2 { font-size: 15px; font-weight: 700; color: #94b4d4; }
@@ -2033,6 +2116,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
   <div class="tabs">
     <button class="tab active" onclick="showTab('clients-tab', this)">Clients</button>
     <button class="tab" onclick="showTab('create-tab', this)">Create Account</button>
+    <button class="tab" onclick="showTab('crm-tab', this)">CRM</button>
     <button class="tab" onclick="showTab('gameday-tab', this)">Game Day</button>
   </div>
   <div class="main-area">
@@ -2084,6 +2168,63 @@ _ADMIN_HTML = """<!DOCTYPE html>
         </div>
         <button class="btn btn-primary" onclick="createClient()">Create Account</button>
         <div class="result" id="create-result"></div>
+      </div>
+    </div>
+
+    <!-- CRM / demo prospects -->
+    <div class="panel" id="crm-tab">
+      <div class="card">
+        <h2>Add Prospect</h2>
+        <p class="small" style="margin-bottom:14px;">Track schools you've demoed. Separate from licensed Clients above.</p>
+        <div class="form-row">
+          <div class="form-group">
+            <label>School *</label>
+            <input type="text" id="p-school" placeholder="e.g. Wagner">
+          </div>
+          <div class="form-group">
+            <label>Contact Name</label>
+            <input type="text" id="p-contact" placeholder="Coach / AD name">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Email</label>
+            <input type="text" id="p-email" placeholder="name@school.edu">
+          </div>
+          <div class="form-group">
+            <label>Phone</label>
+            <input type="text" id="p-phone" placeholder="optional">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Status</label>
+            <select id="p-status">
+              <option>Demo Done</option>
+              <option>Quote/Contract Sent</option>
+              <option>Trial</option>
+              <option>Paid</option>
+              <option>Lost</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Quote / Contract Sent Date</label>
+            <input type="date" id="p-quote-date">
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom:12px;">
+          <label>Notes</label>
+          <textarea id="p-notes" placeholder="Call notes, next steps, anything useful..."></textarea>
+        </div>
+        <button class="btn btn-primary" onclick="createProspect()">Add Prospect</button>
+        <div class="result" id="p-create-result"></div>
+      </div>
+      <div class="card">
+        <h2>Pipeline
+          <button class="btn btn-primary" onclick="loadProspects()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">Click any row to edit status, dates, and notes.</p>
+        <div id="prospects-table"><div class="loading">Loading...</div></div>
       </div>
     </div>
 
@@ -2175,12 +2316,55 @@ _ADMIN_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- CRM prospect slide-out -->
+<div id="crm-slideout">
+  <div class="so-header">
+    <h2 id="crm-so-title">Prospect</h2>
+    <button class="so-close" onclick="closeSlideout()">&#x2715;</button>
+  </div>
+  <div class="so-body">
+    <div class="so-section">
+      <h3>Details</h3>
+      <div class="form-group" style="margin-bottom:10px;"><label>School</label><input type="text" id="crm-school"></div>
+      <div class="form-group" style="margin-bottom:10px;"><label>Contact Name</label><input type="text" id="crm-contact"></div>
+      <div class="form-group" style="margin-bottom:10px;"><label>Email</label><input type="text" id="crm-email"></div>
+      <div class="form-group" style="margin-bottom:10px;"><label>Phone</label><input type="text" id="crm-phone"></div>
+    </div>
+    <div class="so-section">
+      <h3>Pipeline</h3>
+      <div class="form-group" style="margin-bottom:10px;">
+        <label>Status</label>
+        <select id="crm-status">
+          <option>Demo Done</option>
+          <option>Quote/Contract Sent</option>
+          <option>Trial</option>
+          <option>Paid</option>
+          <option>Lost</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin-bottom:10px;"><label>Quote / Contract Sent Date</label><input type="date" id="crm-quote-date"></div>
+    </div>
+    <div class="so-section">
+      <h3>Notes</h3>
+      <div class="form-group"><textarea id="crm-notes" placeholder="Call notes, next steps..."></textarea></div>
+      <button class="btn btn-primary btn-sm" onclick="saveProspect()" style="margin-top:8px;">Save</button>
+      <div class="so-save-msg" id="crm-save-msg">Saved.</div>
+    </div>
+    <div class="so-section small" id="crm-meta"></div>
+  </div>
+  <div class="so-footer">
+    <button class="btn btn-danger btn-sm" onclick="deleteProspect()">Delete Prospect</button>
+  </div>
+</div>
+
 <script>
 let _token = "";
 let _currentUser = null;
 let _allClients = [];
 let _gameDayTimer = null;
 let _gameDayGames = [];
+let _prospects = [];
+let _currentProspect = null;
 
 function doLogin() {
   const pw = document.getElementById("pw-input").value.trim();
@@ -2219,6 +2403,7 @@ function showTab(id, btn) {
    stopGameDayRefresh();
   if (id === "clients-tab") loadClients();
   if (id === "create-tab") loadTeams();
+  if (id === "crm-tab") loadProspects();
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   closeSlideout();
 }
@@ -2512,8 +2697,141 @@ function openSlideout(username) {
 
 function closeSlideout() {
   document.getElementById("slideout").classList.remove("open");
+  document.getElementById("crm-slideout").classList.remove("open");
   document.getElementById("overlay").classList.remove("on");
   _currentUser = null;
+  _currentProspect = null;
+}
+
+// ── CRM / prospects ───────────────────────────────────────────────────────────
+
+function prospectStatusBadge(status) {
+  const map = {
+    "Demo Done":           "badge-blue",
+    "Quote/Contract Sent": "badge-yellow",
+    "Trial":               "badge-gray",
+    "Paid":                "badge-green",
+    "Lost":                "badge-red2",
+  };
+  const cls = map[status] || "badge-gray";
+  return '<span class="badge ' + cls + '">' + (status || "—") + '</span>';
+}
+
+function crmEsc(s) {
+  return (s == null ? "" : String(s)).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function loadProspects() {
+  document.getElementById("prospects-table").innerHTML = '<div class="loading">Loading...</div>';
+  api("GET", "/prospects").then(data => {
+    if (!Array.isArray(data)) {
+      document.getElementById("prospects-table").innerHTML = '<div class="loading">Error loading prospects.</div>';
+      return;
+    }
+    _prospects = data;
+    if (data.length === 0) {
+      document.getElementById("prospects-table").innerHTML = '<div class="loading">No prospects yet. Add one above.</div>';
+      return;
+    }
+    const rows = data.map(p => {
+      const updated = p.updated_at ? new Date(p.updated_at).toLocaleDateString() : "—";
+      const quote   = p.quote_sent_date ? p.quote_sent_date : '<span style="color:#8b95a1">—</span>';
+      return `<tr class="clickable" onclick="openProspect('${p.id}')">
+        <td>${crmEsc(p.school)}</td>
+        <td>${crmEsc(p.contact) || '<span style="color:#8b95a1">—</span>'}</td>
+        <td>${prospectStatusBadge(p.status)}</td>
+        <td>${quote}</td>
+        <td>${updated}</td>
+      </tr>`;
+    }).join("");
+    document.getElementById("prospects-table").innerHTML = `
+      <table>
+        <thead><tr><th>School</th><th>Contact</th><th>Status</th><th>Quote Sent</th><th>Updated</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  });
+}
+
+function createProspect() {
+  const school = document.getElementById("p-school").value.trim();
+  const res = document.getElementById("p-create-result");
+  if (!school) {
+    res.className = "result err"; res.style.display = "block";
+    res.textContent = "School is required.";
+    return;
+  }
+  const body = {
+    school,
+    contact: document.getElementById("p-contact").value.trim(),
+    email:   document.getElementById("p-email").value.trim(),
+    phone:   document.getElementById("p-phone").value.trim(),
+    status:  document.getElementById("p-status").value,
+    quote_sent_date: document.getElementById("p-quote-date").value || null,
+    notes:   document.getElementById("p-notes").value.trim(),
+  };
+  api("POST", "/prospects", body).then(r => {
+    if (r && r.detail) {
+      res.className = "result err"; res.style.display = "block";
+      res.textContent = "Error: " + r.detail;
+      return;
+    }
+    res.className = "result"; res.style.display = "block";
+    res.textContent = "Added " + school + ".";
+    ["p-school","p-contact","p-email","p-phone","p-quote-date","p-notes"].forEach(id => document.getElementById(id).value = "");
+    document.getElementById("p-status").value = "Demo Done";
+    loadProspects();
+  });
+}
+
+function openProspect(id) {
+  const p = _prospects.find(x => String(x.id) === String(id));
+  if (!p) return;
+  _currentProspect = p;
+  document.getElementById("crm-so-title").textContent = p.school || "Prospect";
+  document.getElementById("crm-school").value     = p.school || "";
+  document.getElementById("crm-contact").value    = p.contact || "";
+  document.getElementById("crm-email").value      = p.email || "";
+  document.getElementById("crm-phone").value      = p.phone || "";
+  document.getElementById("crm-status").value     = p.status || "Demo Done";
+  document.getElementById("crm-quote-date").value = p.quote_sent_date || "";
+  document.getElementById("crm-notes").value      = p.notes || "";
+  document.getElementById("crm-save-msg").style.display = "none";
+  const created = p.created_at ? new Date(p.created_at).toLocaleDateString() : "—";
+  document.getElementById("crm-meta").textContent = "Added " + created;
+  document.getElementById("crm-slideout").classList.add("open");
+  document.getElementById("overlay").classList.add("on");
+}
+
+function saveProspect() {
+  if (!_currentProspect) return;
+  const body = {
+    school:  document.getElementById("crm-school").value.trim(),
+    contact: document.getElementById("crm-contact").value.trim(),
+    email:   document.getElementById("crm-email").value.trim(),
+    phone:   document.getElementById("crm-phone").value.trim(),
+    status:  document.getElementById("crm-status").value,
+    quote_sent_date: document.getElementById("crm-quote-date").value || null,
+    notes:   document.getElementById("crm-notes").value.trim(),
+  };
+  api("PATCH", "/prospects/" + _currentProspect.id, body).then(r => {
+    const msg = document.getElementById("crm-save-msg");
+    if (r && r.detail) {
+      msg.style.color = "#fca5a5"; msg.textContent = "Error: " + r.detail; msg.style.display = "block";
+      return;
+    }
+    msg.style.color = "#86efac"; msg.textContent = "Saved."; msg.style.display = "block";
+    loadProspects();
+  });
+}
+
+function deleteProspect() {
+  if (!_currentProspect) return;
+  if (!confirm("Delete " + (_currentProspect.school || "this prospect") + " permanently?")) return;
+  api("DELETE", "/prospects/" + _currentProspect.id).then(r => {
+    if (r && r.detail) { alert("Error: " + r.detail); return; }
+    closeSlideout();
+    loadProspects();
+  });
 }
 
 function resetSeat(seat) {
