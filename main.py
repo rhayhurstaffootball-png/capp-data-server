@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body, WebSoc
 from fastapi.responses import JSONResponse, RedirectResponse, Response, HTMLResponse
 from typing import Optional, Dict, List
 import os
+import re
 import json
 import hashlib
 import asyncio
@@ -50,6 +51,16 @@ GAME_REQUEST_STATS: dict = defaultdict(
         "slow_over_10000": 0,
     }
 )
+
+
+_PATH_ID_RE = re.compile(r"/\d+|/[0-9a-fA-F-]{16,}")
+
+
+def _norm_path(path: str) -> str:
+    """Collapse dynamic path segments (game IDs, team IDs, machine IDs) to a
+    placeholder so REQUEST_PATH_COUNTS stays bounded to a handful of route
+    templates instead of growing one key per unique ID forever."""
+    return _PATH_ID_RE.sub("/{id}", path)
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -336,6 +347,20 @@ def _evict_game_request_stats():
         gc.collect()
 
 
+def _evict_stale_poll_buffers():
+    """Drop HTTP-poll frame/input buffers for sessions with no live WS session.
+    Covers pure-HTTP-poll nodes whose WS-relay teardown cleanup never runs, so a
+    stale (1440p) JPEG can't sit in RAM indefinitely after a node goes away."""
+    stale = [k for k in list(_poll_frames.keys()) if k not in _vnc_sessions]
+    for k in stale:
+        _poll_frames.pop(k, None)
+    for k in [k for k in list(_poll_inputs.keys()) if k not in _vnc_sessions]:
+        _poll_inputs.pop(k, None)
+    if stale:
+        import gc
+        gc.collect()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Download DB from Supabase if not present (Render ephemeral disk)
@@ -350,6 +375,8 @@ async def lifespan(app: FastAPI):
     # Evict stale game request stats every hour
     scheduler.add_job(_evict_game_request_stats, "interval", hours=1,
                       id="evict_game_stats", replace_existing=True)
+    scheduler.add_job(_evict_stale_poll_buffers, "interval", hours=1,
+                      id="evict_poll_buffers", replace_existing=True)
     scheduler.start()
     SCHEDULER_STARTED_AT = time.time()
     yield
@@ -372,7 +399,7 @@ async def _metrics_middleware(request: Request, call_next):
 
     started = time.perf_counter()
     REQUEST_TOTAL += 1
-    REQUEST_PATH_COUNTS[request.url.path] += 1
+    REQUEST_PATH_COUNTS[_norm_path(request.url.path)] += 1
     try:
         response = await call_next(request)
     except Exception:
@@ -1161,6 +1188,10 @@ async def vnc_relay(
                 if all(v is None for v in _vnc_sessions[session_key].values()):
                     del _vnc_sessions[session_key]
                     del _vnc_locks[session_key]
+                    # Release the HTTP-poll fallback buffers for this session —
+                    # _poll_frames holds a full (1440p) JPEG and was never freed.
+                    _poll_frames.pop(session_key, None)
+                    _poll_inputs.pop(session_key, None)
         if role == "host":
             _active_relay.pop(session_key, None)
 

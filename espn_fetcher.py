@@ -1312,12 +1312,25 @@ def _poll_loop():
         with _lock:
             _games_cache.clear()
             _games_cache.extend(new_games)
-            # Evict completed games older than 6 hours to prevent unbounded growth
-            _cutoff = time.time() - 6 * 3600
-            stale = [gid for gid, v in _plays_cache.items()
-                     if v.get("status") == "post" and v.get("fetched_at", 0) < _cutoff]
+            now = time.time()
+            # Evict completed games older than 6 hours
+            _post_cutoff = now - 6 * 3600
+            # Evict any non-live game (pre/unknown status) older than 24 hours
+            _any_cutoff = now - 24 * 3600
+            stale = [
+                gid for gid, v in _plays_cache.items()
+                if (v.get("status") == "post" and v.get("fetched_at", 0) < _post_cutoff)
+                or (v.get("status") != "in" and v.get("fetched_at", 0) < _any_cutoff)
+            ]
             for gid in stale:
                 del _plays_cache[gid]
+            # Evict schedule cache entries older than their TTL — they get replaced on
+            # next request, but entries never re-requested would otherwise stay forever
+            _sched_cutoff = now - _SCHEDULE_CACHE_SECONDS
+            stale_sched = [k for k, ts in _schedule_ts.items() if ts < _sched_cutoff]
+            for k in stale_sched:
+                _schedule_cache.pop(k, None)
+                _schedule_ts.pop(k, None)
             global _last_poll_started_at, _last_poll_completed_at, _last_poll_duration_ms, _last_poll_error
             _last_poll_started_at = poll_started
             _last_poll_completed_at = time.time()
