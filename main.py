@@ -2010,7 +2010,8 @@ async def playbook_setup(email: str = Body(..., embed=True),
         )
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
-    return {"status": "ok", "first_name": u.get("first_name", ""),
+    return {"status": "ok", "token": _pb_make_token(email),
+            "first_name": u.get("first_name", ""),
             "last_name": u.get("last_name", ""), "position": u.get("position", "")}
 
 
@@ -2027,8 +2028,167 @@ async def playbook_login(email: str = Body(..., embed=True),
         return {"status": "needs_setup", "first_name": u.get("first_name", "")}
     if _hash_pw(password, u.get("pw_salt", "")) != u["pw_hash"]:
         raise HTTPException(status_code=401, detail="Wrong password.")
-    return {"status": "ok", "first_name": u.get("first_name", ""),
+    return {"status": "ok", "token": _pb_make_token(email),
+            "first_name": u.get("first_name", ""),
             "last_name": u.get("last_name", ""), "position": u.get("position", "")}
+
+
+# ── R2 (Cloudflare) + player session tokens for the Playbook Portal ───────────
+import hmac as _hmac, base64 as _b64, time as _time, datetime as _dtmod, urllib.parse as _uq
+
+R2_BUCKET = os.environ.get("R2_BUCKET", "capp-playbook")
+_PB_TOKEN_SECRET = (ADMIN_PASSWORD or "changeme") + "|playbook-session"
+_PB_TOKEN_TTL = 60 * 60 * 24 * 30   # 30 days
+
+
+def _pb_make_token(email: str) -> str:
+    exp = int(_time.time()) + _PB_TOKEN_TTL
+    msg = f"{email}|{exp}"
+    sig = _hmac.new(_PB_TOKEN_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return _b64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+
+
+def _pb_read_token(token: str):
+    try:
+        raw = _b64.urlsafe_b64decode(token.encode()).decode()
+        email, exp, sig = raw.rsplit("|", 2)
+        if int(exp) < _time.time():
+            return None
+        good = _hmac.new(_PB_TOKEN_SECRET.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+        return email if _hmac.compare_digest(good, sig) else None
+    except Exception:
+        return None
+
+
+async def _require_player(x_pb_token: str = Header("")):
+    email = _pb_read_token(x_pb_token)
+    if not email:
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+    if not await _pb_get(email):        # deleted players are revoked automatically
+        raise HTTPException(status_code=401, detail="Account not found.")
+    return email
+
+
+def _r2_presign(method: str, key: str, expires: int = 600) -> str:
+    """SigV4 presigned URL for a direct browser<->R2 transfer (no bytes flow
+    through this server). method = GET | PUT | DELETE."""
+    access  = os.environ["R2_ACCESS_KEY_ID"]
+    secret  = os.environ["R2_SECRET_KEY"]
+    account = os.environ["R2_ACCOUNT_ID"]
+    host = f"{account}.r2.cloudflarestorage.com"
+    region, service = "auto", "s3"
+    now = _dtmod.datetime.utcnow()
+    amzdate, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+    scope = f"{datestamp}/{region}/{service}/aws4_request"
+    canon_uri = "/" + R2_BUCKET + "/" + _uq.quote(key, safe="/~")
+    q = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access}/{scope}",
+        "X-Amz-Date": amzdate,
+        "X-Amz-Expires": str(expires),
+        "X-Amz-SignedHeaders": "host",
+    }
+    canon_qs = "&".join(f"{_uq.quote(k, safe='~')}={_uq.quote(v, safe='~')}"
+                        for k, v in sorted(q.items()))
+    canon_req = "\n".join([method, canon_uri, canon_qs, f"host:{host}\n", "host", "UNSIGNED-PAYLOAD"])
+    sts = "\n".join(["AWS4-HMAC-SHA256", amzdate, scope,
+                     hashlib.sha256(canon_req.encode()).hexdigest()])
+    def _s(k, m): return _hmac.new(k, m.encode(), hashlib.sha256).digest()
+    kdate = _s(("AWS4" + secret).encode(), datestamp)
+    ksig  = _s(_s(_s(kdate, region), service), "aws4_request")
+    sig = _hmac.new(ksig, sts.encode(), hashlib.sha256).hexdigest()
+    return f"https://{host}{canon_uri}?{canon_qs}&X-Amz-Signature={sig}"
+
+
+# ── Playbook content — admin manages folders/PDFs; players read via signed URLs ─
+_PB_DOCS = "playbook_docs"
+
+
+@app.post("/admin/api/playbook/docs/sign-upload", dependencies=[Depends(_require_admin)])
+async def admin_pb_sign_upload(payload: dict = Body(...)):
+    """Presigned PUT so the admin browser uploads the PDF straight to R2."""
+    import uuid as _uuid
+    key = f"pdfs/{_uuid.uuid4().hex}.pdf"
+    return {"key": key, "put_url": _r2_presign("PUT", key, expires=900)}
+
+
+@app.post("/admin/api/playbook/docs", dependencies=[Depends(_require_admin)])
+async def admin_pb_create_doc(payload: dict = Body(...)):
+    """Record a doc after its bytes were uploaded to R2."""
+    row = {
+        "folder_path": (payload.get("folder") or "").strip().strip("/"),
+        "title":       (payload.get("title") or "").strip(),
+        "r2_key":      (payload.get("key") or "").strip(),
+        "pages":       payload.get("pages"),
+        "size_bytes":  payload.get("size"),
+        "sort_order":  payload.get("sort_order") or 0,
+    }
+    if not row["title"] or not row["r2_key"]:
+        raise HTTPException(status_code=400, detail="title and key are required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}", json=row,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.get("/admin/api/playbook/docs", dependencies=[Depends(_require_admin)])
+async def admin_pb_list_docs():
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "*", "order": "folder_path.asc,sort_order.asc,title.asc"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.delete("/admin/api/playbook/docs/{doc_id}", dependencies=[Depends(_require_admin)])
+async def admin_pb_delete_doc(doc_id: str):
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "r2_key", "id": f"eq.{doc_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+        key = (g.json()[0]["r2_key"] if g.status_code == 200 and g.json() else None)
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                           params={"id": f"eq.{doc_id}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+        if key:
+            try:
+                await c.delete(_r2_presign("DELETE", key, expires=300))
+            except Exception:
+                pass    # metadata is gone; an orphaned R2 object is harmless
+    return {"ok": True}
+
+
+@app.get("/playbook/manifest")
+async def playbook_manifest(_email: str = Depends(_require_player)):
+    """Folder tree for a signed-in player."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "id,folder_path,title,pages,sort_order",
+                                "order": "folder_path.asc,sort_order.asc,title.asc"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"sections": [{"id": d["id"], "folder": d.get("folder_path", ""),
+                          "title": d.get("title", ""), "pages": d.get("pages")}
+                         for d in r.json()]}
+
+
+@app.get("/playbook/doc/{doc_id}/url")
+async def playbook_doc_url(doc_id: str, _email: str = Depends(_require_player)):
+    """Short-lived signed URL for one PDF."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "r2_key", "id": f"eq.{doc_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+    if g.status_code != 200 or not g.json():
+        raise HTTPException(status_code=404, detail="Not found.")
+    return {"url": _r2_presign("GET", g.json()[0]["r2_key"], expires=600)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2303,6 +2463,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
     <button class="tab" onclick="showTab('crm-tab', this)">CRM</button>
     <button class="tab" onclick="showTab('gameday-tab', this)">Game Day</button>
     <button class="tab" onclick="showTab('playbook-tab', this)">Playbook</button>
+    <button class="tab" onclick="showTab('pbcontent-tab', this)">Playbook Files</button>
   </div>
   <div class="main-area">
 
@@ -2454,6 +2615,36 @@ _ADMIN_HTML = """<!DOCTYPE html>
           "Set up" = the player has created their password. Delete removes their access.
         </p>
         <div id="playbook-table"><div class="loading">Loading...</div></div>
+      </div>
+    </div>
+
+    <div class="panel" id="pbcontent-tab">
+      <div class="card">
+        <h2>Upload playbook PDFs</h2>
+        <p class="small" style="margin-bottom:14px;">
+          Files upload straight to Cloudflare R2. The <strong>folder</strong> you type becomes
+          the section path in the portal — use <code>/</code> to nest (e.g.
+          <code>Calls/Pressures</code>). Leave blank for the top level. The portal tree is built
+          from these folders; the PDF's title is its file name.
+        </p>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Folder path</label>
+            <input type="text" id="pbc-folder" placeholder="e.g. Calls/Pressures (blank = top level)">
+          </div>
+          <div class="form-group">
+            <label>PDF file(s)</label>
+            <input type="file" id="pbc-files" accept=".pdf,application/pdf" multiple>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="uploadPbDocs()">Upload</button>
+        <div class="result" id="pbc-upload-result"></div>
+      </div>
+      <div class="card">
+        <h2>Playbook contents
+          <button class="btn btn-primary" onclick="loadPbDocs()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <div id="pbcontent-table"><div class="loading">Loading...</div></div>
       </div>
     </div>
 
@@ -2622,6 +2813,7 @@ function showTab(id, btn) {
   if (id === "crm-tab") loadProspects();
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
+  if (id === "pbcontent-tab") loadPbDocs();
   closeSlideout();
 }
 
@@ -3308,6 +3500,57 @@ function loadPlaybookUsers(){
 function deletePlaybookUser(id,email){
   if(!confirm("Remove "+email+"? They will lose access to the playbook.")) return;
   api("DELETE","/playbook/users/"+id).then(function(){ loadPlaybookUsers(); });
+}
+
+// ── Playbook Files (R2 upload + contents) ─────────────────────────────────────
+function uploadPbDocs(){
+  var res=document.getElementById("pbc-upload-result");
+  var folder=(document.getElementById("pbc-folder").value||"").trim().replace(/^\\/+|\\/+$/g,"");
+  var files=document.getElementById("pbc-files").files;
+  if(!files || !files.length){ res.className="result err"; res.textContent="Choose at least one PDF."; return; }
+  var list=Array.prototype.slice.call(files), done=0, failed=0;
+  res.className="result"; res.textContent="Uploading 0/"+list.length+"...";
+  function next(i){
+    if(i>=list.length){
+      res.className=failed?"result err":"result ok";
+      res.textContent="Uploaded "+done+"/"+list.length+(failed?(" ("+failed+" failed)"):"")+".";
+      document.getElementById("pbc-files").value=""; loadPbDocs(); return;
+    }
+    var f=list[i], title=f.name.replace(/\\.pdf$/i,"");
+    api("POST","/playbook/docs/sign-upload",{folder:folder}).then(function(s){
+      if(!s || !s.put_url) throw new Error("sign failed");
+      return fetch(s.put_url,{method:"PUT",headers:{"Content-Type":"application/pdf"},body:f}).then(function(r){
+        if(!r.ok) throw new Error("R2 "+r.status);
+        return api("POST","/playbook/docs",{folder:folder,title:title,key:s.key,size:f.size});
+      });
+    }).then(function(){ done++; res.textContent="Uploading "+(done+failed)+"/"+list.length+"..."; next(i+1); })
+      .catch(function(e){ failed++; res.textContent="Uploading "+(done+failed)+"/"+list.length+" (err: "+e.message+")..."; next(i+1); });
+  }
+  next(0);
+}
+
+function loadPbDocs(){
+  var box=document.getElementById("pbcontent-table");
+  box.innerHTML='<div class="loading">Loading...</div>';
+  api("GET","/playbook/docs").then(function(data){
+    if(!Array.isArray(data)){ box.innerHTML='<div class="loading">Error loading files.</div>'; return; }
+    if(!data.length){ box.innerHTML='<div class="loading">No PDFs yet. Upload some above.</div>'; return; }
+    var rows=data.map(function(d){
+      return "<tr>"+
+        "<td>"+(pbEsc(d.folder_path)||'<span style="color:#8b95a1">(top level)</span>')+"</td>"+
+        "<td>"+pbEsc(d.title)+"</td>"+
+        "<td>"+(d.size_bytes?fmtBytes(d.size_bytes):"—")+"</td>"+
+        '<td><button class="btn btn-danger btn-sm" onclick="deletePbDoc(\\''+d.id+'\\',\\''+pbEsc(d.title)+'\\')">Delete</button></td>'+
+      "</tr>";
+    }).join("");
+    box.innerHTML='<table><thead><tr><th>Folder</th><th>Title</th><th>Size</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'+
+      '<p class="small" style="margin-top:10px;">'+data.length+' file(s).</p>';
+  }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
+}
+
+function deletePbDoc(id,title){
+  if(!confirm('Delete "'+title+'"? This removes it from the playbook and R2.')) return;
+  api("DELETE","/playbook/docs/"+id).then(function(){ loadPbDocs(); });
 }
 </script>
 </body>
