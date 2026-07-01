@@ -2191,6 +2191,164 @@ async def playbook_doc_url(doc_id: str, _email: str = Depends(_require_player)):
     return {"url": _r2_presign("GET", g.json()[0]["r2_key"], expires=600)}
 
 
+# ── Playbook Visio conversion — admin queues a Visio file; a Windows+Visio ──────
+# worker (or a LibreOffice fallback worker) claims it, converts to PDF, uploads
+# to R2, and the finished PDF is registered as a normal playbook_docs row.
+_PB_JOBS = "playbook_jobs"
+PB_WORKER_TOKEN = os.environ.get("PB_WORKER_TOKEN", "")
+_PB_VISIO_EXTS = ("vsd", "vsdx", "vsdm")
+
+
+def _require_worker(x_worker_token: str = Header("")):
+    if not PB_WORKER_TOKEN or x_worker_token != PB_WORKER_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized worker")
+
+
+@app.post("/admin/api/playbook/jobs/sign-upload", dependencies=[Depends(_require_admin)])
+async def admin_pb_job_sign_upload(payload: dict = Body(...)):
+    """Presigned PUT so the admin browser uploads the raw Visio file to R2."""
+    import uuid as _uuid
+    ext = (payload.get("ext") or "vsdx").lower().lstrip(".")
+    if ext not in _PB_VISIO_EXTS:
+        raise HTTPException(status_code=400, detail="Not a Visio file.")
+    key = f"raw/{_uuid.uuid4().hex}.{ext}"
+    return {"key": key, "put_url": _r2_presign("PUT", key, expires=900)}
+
+
+@app.post("/admin/api/playbook/jobs", dependencies=[Depends(_require_admin)])
+async def admin_pb_create_job(payload: dict = Body(...)):
+    """Queue a conversion job after its raw bytes were uploaded to R2."""
+    row = {
+        "raw_key":     (payload.get("key") or "").strip(),
+        "ext":         (payload.get("ext") or "").lower().lstrip("."),
+        "folder_path": (payload.get("folder") or "").strip().strip("/"),
+        "title":       (payload.get("title") or "").strip(),
+        "status":      "queued",
+    }
+    if not row["title"] or not row["raw_key"]:
+        raise HTTPException(status_code=400, detail="title and key are required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}", json=row,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.get("/admin/api/playbook/jobs", dependencies=[Depends(_require_admin)])
+async def admin_pb_list_jobs():
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "id,folder_path,title,ext,status,error,"
+                                          "claimed_by,claimed_at,created_at",
+                                "order": "created_at.desc"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.delete("/admin/api/playbook/jobs/{job_id}", dependencies=[Depends(_require_admin)])
+async def admin_pb_delete_job(job_id: str):
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "raw_key,out_key", "id": f"eq.{job_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+        keys = (g.json()[0] if g.status_code == 200 and g.json() else {})
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                           params={"id": f"eq.{job_id}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+        for k in (keys.get("raw_key"), keys.get("out_key")):
+            if k:
+                try:
+                    await c.delete(_r2_presign("DELETE", k, expires=300))
+                except Exception:
+                    pass    # orphaned R2 object is harmless
+    return {"ok": True}
+
+
+async def _pb_job_patch(job_id: str, fields: dict):
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                          params={"id": f"eq.{job_id}"},
+                          json={**fields, "updated_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+
+
+@app.post("/playbook/worker/claim", dependencies=[Depends(_require_worker)])
+async def pb_worker_claim(payload: dict = Body(default={})):
+    """Hand the next queued job to a worker: returns the job plus a signed GET for
+    the raw Visio file and a signed PUT for where to drop the converted PDF."""
+    import uuid as _uuid
+    worker = (payload.get("worker") or "worker").strip()[:64]
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/rpc/claim_playbook_job",
+                         json={"p_worker": worker}, headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    rows = r.json() or []
+    if not rows:
+        return {"job": None}
+    job = rows[0]
+    out_key = f"pdfs/{_uuid.uuid4().hex}.pdf"
+    await _pb_job_patch(job["id"], {"out_key": out_key})
+    return {
+        "job": {"id": job["id"], "title": job.get("title"),
+                "folder_path": job.get("folder_path", ""), "ext": job.get("ext")},
+        "raw_url": _r2_presign("GET", job["raw_key"], expires=1800),
+        "out_key": out_key,
+        "put_url": _r2_presign("PUT", out_key, expires=1800),
+    }
+
+
+@app.post("/playbook/worker/complete", dependencies=[Depends(_require_worker)])
+async def pb_worker_complete(payload: dict = Body(...)):
+    """Worker finished a job: register the converted PDF as a playbook_docs row
+    and mark the job done."""
+    job_id = (payload.get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id required.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "folder_path,title,out_key",
+                                "id": f"eq.{job_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+        if g.status_code != 200 or not g.json():
+            raise HTTPException(status_code=404, detail="Job not found.")
+        job = g.json()[0]
+        doc = {
+            "folder_path": job.get("folder_path") or "",
+            "title":       job.get("title") or "",
+            "r2_key":      job.get("out_key") or "",
+            "pages":       payload.get("pages"),
+            "size_bytes":  payload.get("size"),
+            "sort_order":  0,
+        }
+        d = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}", json=doc,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if d.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=d.text)
+    doc_id = (d.json() or [{}])[0].get("id")
+    await _pb_job_patch(job_id, {"status": "done", "doc_id": doc_id,
+                                 "pages": payload.get("pages"),
+                                 "size_bytes": payload.get("size"), "error": None})
+    return {"ok": True, "doc_id": doc_id}
+
+
+@app.post("/playbook/worker/fail", dependencies=[Depends(_require_worker)])
+async def pb_worker_fail(payload: dict = Body(...)):
+    job_id = (payload.get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id required.")
+    await _pb_job_patch(job_id, {"status": "error",
+                                 "error": (payload.get("error") or "conversion failed")[:2000]})
+    return {"ok": True}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CAPP Friends
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2641,6 +2799,31 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <div class="result" id="pbc-upload-result"></div>
       </div>
       <div class="card">
+        <h2>Upload a whole folder</h2>
+        <p class="small" style="margin-bottom:14px;">
+          Pick a <strong>root folder</strong> and its entire tree of subfolders is recreated in
+          the portal. <strong>PDFs</strong> go live immediately. <strong>Visio files</strong>
+          (<code>.vsd/.vsdx/.vsdm</code>) are queued and converted to PDF by the conversion worker,
+          then appear automatically. Each file keeps its folder path.
+        </p>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Folder</label>
+            <input type="file" id="pbc-dir" webkitdirectory directory multiple>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="uploadPbFolder()">Upload folder</button>
+        <div class="result" id="pbc-folder-result"></div>
+      </div>
+      <div class="card">
+        <h2>Conversion jobs
+          <button class="btn btn-primary" onclick="loadPbJobs()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p class="small" style="margin-bottom:10px;">Visio files waiting on / being processed by the
+          conversion worker. Done jobs become entries in Playbook contents below.</p>
+        <div id="pbjobs-table"><div class="loading">Loading...</div></div>
+      </div>
+      <div class="card">
         <h2>Playbook contents
           <button class="btn btn-primary" onclick="loadPbDocs()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
         </h2>
@@ -2813,7 +2996,7 @@ function showTab(id, btn) {
   if (id === "crm-tab") loadProspects();
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
-  if (id === "pbcontent-tab") loadPbDocs();
+  if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); }
   closeSlideout();
 }
 
@@ -3551,6 +3734,96 @@ function loadPbDocs(){
 function deletePbDoc(id,title){
   if(!confirm('Delete "'+title+'"? This removes it from the playbook and R2.')) return;
   api("DELETE","/playbook/docs/"+id).then(function(){ loadPbDocs(); });
+}
+
+// ── Whole-folder upload (PDFs go live; Visio files get queued for conversion) ──
+function _pbFolderOf(relPath){
+  // "2026 DEF/Pressures/Zero.pdf" -> "2026 DEF/Pressures"
+  var parts=String(relPath||"").split("/"); parts.pop();
+  return parts.join("/").replace(/^\\/+|\\/+$/g,"");
+}
+function uploadPbFolder(){
+  var res=document.getElementById("pbc-folder-result");
+  var files=document.getElementById("pbc-dir").files;
+  if(!files || !files.length){ res.className="result err"; res.textContent="Pick a folder first."; return; }
+  var list=Array.prototype.slice.call(files).filter(function(f){
+    return /\\.(pdf|vsdx?|vsdm)$/i.test(f.name);
+  });
+  if(!list.length){ res.className="result err"; res.textContent="No PDFs or Visio files in that folder."; return; }
+  var done=0, failed=0, queued=0;
+  res.className="result";
+  function report(){
+    res.textContent="Processed "+(done+failed)+"/"+list.length+
+      " ("+done+" ok"+(queued?(", "+queued+" queued for convert"):"")+(failed?(", "+failed+" failed"):"")+")...";
+  }
+  report();
+  function next(i){
+    if(i>=list.length){
+      res.className=failed?"result err":"result ok";
+      res.textContent="Done: "+done+"/"+list.length+" uploaded"+
+        (queued?(" ("+queued+" Visio queued for conversion)"):"")+(failed?(", "+failed+" failed"):"")+".";
+      document.getElementById("pbc-dir").value=""; loadPbDocs(); loadPbJobs(); return;
+    }
+    var f=list[i];
+    var rel=f.webkitRelativePath||f.name;
+    var folder=_pbFolderOf(rel);
+    var m=f.name.match(/\\.(pdf|vsdx?|vsdm)$/i);
+    var ext=(m?m[1]:"").toLowerCase();
+    var title=f.name.replace(/\\.(pdf|vsdx?|vsdm)$/i,"");
+    var p;
+    if(ext==="pdf"){
+      p=api("POST","/playbook/docs/sign-upload",{folder:folder}).then(function(s){
+        if(!s||!s.put_url) throw new Error("sign failed");
+        return fetch(s.put_url,{method:"PUT",headers:{"Content-Type":"application/pdf"},body:f}).then(function(r){
+          if(!r.ok) throw new Error("R2 "+r.status);
+          return api("POST","/playbook/docs",{folder:folder,title:title,key:s.key,size:f.size});
+        });
+      }).then(function(){ done++; });
+    } else {
+      p=api("POST","/playbook/jobs/sign-upload",{ext:ext}).then(function(s){
+        if(!s||!s.put_url) throw new Error("sign failed");
+        return fetch(s.put_url,{method:"PUT",headers:{"Content-Type":"application/octet-stream"},body:f}).then(function(r){
+          if(!r.ok) throw new Error("R2 "+r.status);
+          return api("POST","/playbook/jobs",{folder:folder,title:title,key:s.key,ext:ext});
+        });
+      }).then(function(){ done++; queued++; });
+    }
+    p.then(function(){ report(); next(i+1); })
+     .catch(function(e){ failed++; report(); next(i+1); });
+  }
+  next(0);
+}
+
+// ── Conversion jobs ───────────────────────────────────────────────────────────
+function loadPbJobs(){
+  var box=document.getElementById("pbjobs-table");
+  api("GET","/playbook/jobs").then(function(data){
+    if(!Array.isArray(data)){ box.innerHTML='<div class="loading">Error loading jobs.</div>'; return; }
+    if(!data.length){ box.innerHTML='<div class="loading">No conversion jobs.</div>'; return; }
+    var colors={queued:"#8b95a1",converting:"#d19a2f",done:"#2f9d55",error:"#d14343"};
+    var rows=data.map(function(j){
+      var st=j.status||"queued";
+      var badge='<span style="color:'+(colors[st]||"#8b95a1")+';font-weight:600;text-transform:capitalize">'+pbEsc(st)+'</span>';
+      if(st==="error"&&j.error) badge+=' <span class="small" style="color:#d14343" title="'+pbEsc(j.error)+'">(hover)</span>';
+      return "<tr>"+
+        "<td>"+(pbEsc(j.folder_path)||'<span style="color:#8b95a1">(top level)</span>')+"</td>"+
+        "<td>"+pbEsc(j.title)+"."+pbEsc(j.ext||"vsdx")+"</td>"+
+        "<td>"+badge+"</td>"+
+        '<td><button class="btn btn-danger btn-sm" onclick="deletePbJob(\\''+j.id+'\\')">Delete</button></td>'+
+      "</tr>";
+    }).join("");
+    box.innerHTML='<table><thead><tr><th>Folder</th><th>File</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
+    // Auto-refresh while anything is still in flight.
+    var busy=data.some(function(j){return j.status==="queued"||j.status==="converting";});
+    if(busy && !window._pbJobsTimer){
+      window._pbJobsTimer=setTimeout(function(){ window._pbJobsTimer=null; loadPbJobs(); },5000);
+    }
+  }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
+}
+
+function deletePbJob(id){
+  if(!confirm("Delete this conversion job and its uploaded source file?")) return;
+  api("DELETE","/playbook/jobs/"+id).then(function(){ loadPbJobs(); });
 }
 </script>
 </body>
