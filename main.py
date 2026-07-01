@@ -388,6 +388,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://cappvcs.com", "https://www.cappvcs.com"],
+    allow_origin_regex=r"https://.*\.pages\.dev",   # Cloudflare Pages preview/prod URLs
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -1879,6 +1880,158 @@ async def admin_delete_prospect(prospect_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Playbook Portal — player accounts
+# Admin uploads a roster (first/last/position/email). Email is the login AND the
+# allowlist (no self-signup). Each player sets their own password on first login.
+# Passwords are hashed (sha256 + per-user salt), same scheme as capp_clients.
+# ─────────────────────────────────────────────────────────────────────────────
+_PB_TABLE = "playbook_users"
+
+
+def _norm_email(e: str) -> str:
+    return (e or "").strip().lower()
+
+
+async def _pb_get(email: str):
+    """Fetch one player row by email, or None."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+            params={"select": "*", "email": f"eq.{email}", "limit": "1"},
+            headers=_supa_headers_json(),
+        )
+    if r.status_code != 200:
+        return None
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+@app.post("/admin/api/playbook/upload", dependencies=[Depends(_require_admin)])
+async def admin_playbook_upload(payload: dict = Body(...)):
+    """Bulk add/update players from parsed CSV rows:
+    payload = {"rows": [{first_name, last_name, position, email}, ...]}
+    New emails are inserted (no password yet); existing emails get their
+    name/position refreshed but their password is left untouched."""
+    rows = payload.get("rows") or []
+    processed, skipped = 0, []
+    async with httpx.AsyncClient() as c:
+        for raw in rows:
+            email = _norm_email(raw.get("email"))
+            if not email or "@" not in email:
+                skipped.append({"email": raw.get("email", ""), "reason": "invalid email"})
+                continue
+            row = {
+                "email": email,
+                "first_name": (raw.get("first_name") or "").strip(),
+                "last_name":  (raw.get("last_name") or "").strip(),
+                "position":   (raw.get("position") or "").strip(),
+            }
+            # Upsert on email; merge-duplicates updates only the columns we send
+            # (so an existing player's pw_hash/pw_salt are preserved). created_at
+            # is left to the table default for new rows.
+            r = await c.post(
+                f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                params={"on_conflict": "email"},
+                json=row,
+                headers={**_supa_headers_json(),
+                         "Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+            if r.status_code in (200, 201, 204):
+                processed += 1
+            else:
+                skipped.append({"email": email, "reason": r.text[:120]})
+    return {"processed": processed, "skipped": skipped, "total": len(rows)}
+
+
+@app.get("/admin/api/playbook/users", dependencies=[Depends(_require_admin)])
+async def admin_playbook_users():
+    """Roster list for the admin panel (no password material)."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+            params={"select": "id,email,first_name,last_name,position,pw_hash,created_at",
+                    "order": "last_name.asc,first_name.asc"},
+            headers=_supa_headers_json(),
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return [{
+        "id": u["id"], "email": u["email"],
+        "first_name": u.get("first_name", ""), "last_name": u.get("last_name", ""),
+        "position": u.get("position", ""),
+        "active": bool(u.get("pw_hash")),     # True once they've set a password
+    } for u in r.json()]
+
+
+@app.delete("/admin/api/playbook/users/{uid}", dependencies=[Depends(_require_admin)])
+async def admin_playbook_delete(uid: str):
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(
+            f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+            params={"id": f"eq.{uid}"},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.post("/playbook/check")
+async def playbook_check(email: str = Body(..., embed=True)):
+    """First step of login: is this email on the roster, and has it set a password?"""
+    u = await _pb_get(_norm_email(email))
+    if not u:
+        return {"status": "unknown"}
+    return {"status": "set" if u.get("pw_hash") else "needs_setup",
+            "first_name": u.get("first_name", "")}
+
+
+@app.post("/playbook/setup")
+async def playbook_setup(email: str = Body(..., embed=True),
+                         password: str = Body(..., embed=True)):
+    """First-time password creation. Allowed only for a rostered email with no
+    password yet."""
+    email = _norm_email(email)
+    if len(password or "") < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    u = await _pb_get(email)
+    if not u:
+        raise HTTPException(status_code=403, detail="This email isn't on the roster. Ask your coach to add you.")
+    if u.get("pw_hash"):
+        raise HTTPException(status_code=409, detail="Password already set — just sign in.")
+    salt = _secrets.token_hex(8)
+    row = {"pw_salt": salt, "pw_hash": _hash_pw(password, salt),
+           "password_set_at": _dt.now(_tz.utc).isoformat()}
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+            params={"id": f"eq.{u['id']}"}, json=row,
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"status": "ok", "first_name": u.get("first_name", ""),
+            "last_name": u.get("last_name", ""), "position": u.get("position", "")}
+
+
+@app.post("/playbook/login")
+async def playbook_login(email: str = Body(..., embed=True),
+                         password: str = Body(..., embed=True)):
+    """Returning login. If the rostered email has no password yet, tells the
+    client to run first-time setup instead."""
+    email = _norm_email(email)
+    u = await _pb_get(email)
+    if not u:
+        raise HTTPException(status_code=403, detail="This email isn't on the roster. Ask your coach to add you.")
+    if not u.get("pw_hash"):
+        return {"status": "needs_setup", "first_name": u.get("first_name", "")}
+    if _hash_pw(password, u.get("pw_salt", "")) != u["pw_hash"]:
+        raise HTTPException(status_code=401, detail="Wrong password.")
+    return {"status": "ok", "first_name": u.get("first_name", ""),
+            "last_name": u.get("last_name", ""), "position": u.get("position", "")}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CAPP Friends
 # ─────────────────────────────────────────────────────────────────────────────
 from datetime import datetime as _dt, timezone as _tz
@@ -2149,6 +2302,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
     <button class="tab" onclick="showTab('create-tab', this)">Create Account</button>
     <button class="tab" onclick="showTab('crm-tab', this)">CRM</button>
     <button class="tab" onclick="showTab('gameday-tab', this)">Game Day</button>
+    <button class="tab" onclick="showTab('playbook-tab', this)">Playbook</button>
   </div>
   <div class="main-area">
 
@@ -2269,6 +2423,37 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <div id="gameday-alerts" style="margin-top:18px;"></div>
         <div id="gameday-games" style="margin-top:18px;"></div>
         <div id="gameday-detail" style="margin-top:18px;"></div>
+      </div>
+    </div>
+
+    <div class="panel" id="playbook-tab">
+      <div class="card">
+        <h2>Add Players (roster upload)</h2>
+        <p class="small" style="margin-bottom:14px;">
+          Upload a CSV with columns <strong>First Name, Last Name, Position, Email</strong>
+          (a header row is fine). Players sign in with their <strong>email</strong> and set
+          their own password on first login. Re-uploading updates names/positions and never
+          changes anyone's existing password.
+        </p>
+        <div class="form-group" style="margin-bottom:12px;">
+          <label>CSV file</label>
+          <input type="file" id="pb-file" accept=".csv,text/csv">
+        </div>
+        <p class="small" style="margin:8px 0;">…or paste rows (First, Last, Position, Email — one per line):</p>
+        <div class="form-group" style="margin-bottom:12px;">
+          <textarea id="pb-paste" placeholder="John,Smith,QB,john.smith@school.edu&#10;Mary,Jones,WR,mary.jones@school.edu"></textarea>
+        </div>
+        <button class="btn btn-primary" onclick="uploadPlaybook()">Add Players</button>
+        <div class="result" id="pb-upload-result"></div>
+      </div>
+      <div class="card">
+        <h2>Players
+          <button class="btn btn-primary" onclick="loadPlaybookUsers()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">
+          "Set up" = the player has created their password. Delete removes their access.
+        </p>
+        <div id="playbook-table"><div class="loading">Loading...</div></div>
       </div>
     </div>
 
@@ -2436,6 +2621,7 @@ function showTab(id, btn) {
   if (id === "create-tab") loadTeams();
   if (id === "crm-tab") loadProspects();
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
+  if (id === "playbook-tab") loadPlaybookUsers();
   closeSlideout();
 }
 
@@ -3050,6 +3236,78 @@ function createClient() {
       }
     })
     .catch(e => { result.className = "result err"; result.textContent = "Network error: " + e; });
+}
+// ── Playbook Portal — player roster ───────────────────────────────────────────
+function pbEsc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[c];}); }
+
+function parseRoster(text){
+  // Columns: First, Last, Position, Email (header row optional). Robust to email
+  // being in any column — we pick the field containing "@".
+  var rows=[];
+  (text||"").split(/\\r?\\n/).forEach(function(line){
+    line=line.trim(); if(!line) return;
+    var low=line.toLowerCase();
+    if(low.indexOf("email")>=0 && (low.indexOf("first")>=0||low.indexOf("last")>=0||low.indexOf("name")>=0||low.indexOf("position")>=0)) return; // header
+    var parts=line.split(",").map(function(s){return s.trim();});
+    var ei=parts.findIndex(function(p){return p.indexOf("@")>=0;});
+    if(ei<0) return;
+    var email=parts[ei];
+    var rest=parts.filter(function(_,i){return i!==ei;});
+    rows.push({first_name:rest[0]||"",last_name:rest[1]||"",position:rest[2]||"",email:email});
+  });
+  return rows;
+}
+
+function uploadPlaybook(){
+  var res=document.getElementById("pb-upload-result");
+  var fileEl=document.getElementById("pb-file");
+  function doUpload(text){
+    var rows=parseRoster(text);
+    if(!rows.length){ res.className="result err"; res.textContent="No valid rows found (need a line with an email)."; return; }
+    res.className="result"; res.textContent="Uploading "+rows.length+" player(s)...";
+    api("POST","/playbook/upload",{rows:rows}).then(function(d){
+      if(d && d.processed!==undefined){
+        res.className="result ok";
+        var msg="Added/updated "+d.processed+" player(s).";
+        if(d.skipped && d.skipped.length) msg+=" Skipped "+d.skipped.length+" (invalid email).";
+        res.textContent=msg;
+        document.getElementById("pb-paste").value=""; fileEl.value="";
+        loadPlaybookUsers();
+      } else { res.className="result err"; res.textContent="Error: "+((d&&d.detail)||JSON.stringify(d)); }
+    }).catch(function(e){ res.className="result err"; res.textContent="Network error: "+e; });
+  }
+  if(fileEl.files && fileEl.files[0]){
+    var rd=new FileReader(); rd.onload=function(){ doUpload(rd.result); }; rd.readAsText(fileEl.files[0]);
+  } else {
+    doUpload(document.getElementById("pb-paste").value);
+  }
+}
+
+function loadPlaybookUsers(){
+  var box=document.getElementById("playbook-table");
+  box.innerHTML='<div class="loading">Loading...</div>';
+  api("GET","/playbook/users").then(function(data){
+    if(!Array.isArray(data)){ box.innerHTML='<div class="loading">Error loading players.</div>'; return; }
+    if(!data.length){ box.innerHTML='<div class="loading">No players yet. Upload a roster above.</div>'; return; }
+    var rows=data.map(function(u){
+      var name=((u.last_name||"")+", "+(u.first_name||"")).replace(/^, |, $/g,"").trim();
+      return "<tr>"+
+        "<td>"+(pbEsc(name)||"—")+"</td>"+
+        "<td>"+(pbEsc(u.position)||"—")+"</td>"+
+        "<td>"+pbEsc(u.email)+"</td>"+
+        "<td>"+(u.active?'<span style="color:#22c55e;">Set up</span>':'<span style="color:#8b95a1;">Pending</span>')+"</td>"+
+        '<td><button class="btn btn-danger btn-sm" onclick="deletePlaybookUser(\\''+u.id+'\\',\\''+pbEsc(u.email)+'\\')">Delete</button></td>'+
+      "</tr>";
+    }).join("");
+    var setup=data.filter(function(u){return u.active;}).length;
+    box.innerHTML='<table><thead><tr><th>Name</th><th>Position</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'+
+      '<p class="small" style="margin-top:10px;">'+data.length+' player(s), '+setup+' set up.</p>';
+  }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
+}
+
+function deletePlaybookUser(id,email){
+  if(!confirm("Remove "+email+"? They will lose access to the playbook.")) return;
+  api("DELETE","/playbook/users/"+id).then(function(){ loadPlaybookUsers(); });
 }
 </script>
 </body>
