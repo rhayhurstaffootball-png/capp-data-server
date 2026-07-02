@@ -2547,6 +2547,43 @@ async def coach_pb_create_doc(payload: dict = Body(...)):
     return (r.json() or [{}])[0]
 
 
+@app.get("/coach/playbook/jobs", dependencies=[Depends(_require_coach)])
+async def coach_pb_list_jobs():
+    """Conversion queue state so the coach page can show real progress after
+    the upload itself finishes (queued → converting → done/error)."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "id,folder_path,title,ext,status,error,created_at",
+                                "order": "created_at.desc", "limit": "50"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.patch("/coach/playbook/docs/{doc_id}/move", dependencies=[Depends(_require_coach)])
+async def coach_pb_move_doc(doc_id: str, payload: dict = Body(...)):
+    """Move a doc to another folder. Same row/id, so Touch Notes stay attached."""
+    folder = (payload.get("folder") or "").strip().strip("/")
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                          params={"id": f"eq.{doc_id}"},
+                          json={"folder_path": folder},
+                          headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    rows = r.json() if r.status_code == 200 else []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Doc not found.")
+    return rows[0]
+
+
+@app.delete("/coach/playbook/docs/{doc_id}", dependencies=[Depends(_require_coach)])
+async def coach_pb_delete_doc(doc_id: str):
+    """Coach delete — same behavior as the admin delete (row + R2 object)."""
+    return await admin_pb_delete_doc(doc_id)
+
+
 @app.post("/coach/playbook/jobs", dependencies=[Depends(_require_coach)])
 async def coach_pb_create_job(payload: dict = Body(...)):
     """Queue a coach-uploaded PowerPoint/Visio file for conversion."""
