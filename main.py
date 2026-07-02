@@ -2133,6 +2133,36 @@ async def admin_pb_create_doc(payload: dict = Body(...)):
     return (r.json() or [{}])[0]
 
 
+@app.post("/admin/api/playbook/docs/{doc_id}/replace", dependencies=[Depends(_require_admin)])
+async def admin_pb_replace_doc(doc_id: str, payload: dict = Body(...)):
+    """Swap a doc's PDF for new bytes already uploaded to R2. The row keeps its
+    id, folder, title, and sort order — so player Touch Notes stay attached."""
+    new_key = (payload.get("key") or "").strip()
+    if not new_key:
+        raise HTTPException(status_code=400, detail="key is required.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "r2_key", "id": f"eq.{doc_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+        if g.status_code != 200 or not g.json():
+            raise HTTPException(status_code=404, detail="Doc not found.")
+        old_key = g.json()[0].get("r2_key")
+        patch = {"r2_key": new_key,
+                 "size_bytes": payload.get("size"),
+                 "pages": payload.get("pages")}
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                          params={"id": f"eq.{doc_id}"}, json=patch,
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+        if old_key and old_key != new_key:
+            try:
+                await c.delete(_r2_presign("DELETE", old_key, expires=300))
+            except Exception:
+                pass    # row already points at the new PDF; orphaned object is harmless
+    return {"ok": True}
+
+
 @app.get("/admin/api/playbook/docs", dependencies=[Depends(_require_admin)])
 async def admin_pb_list_docs():
     async with httpx.AsyncClient() as c:
@@ -2874,6 +2904,10 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <h2>Playbook contents
           <button class="btn btn-primary" onclick="loadPbDocs()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
         </h2>
+        <p class="small" style="margin-bottom:10px;"><strong>Replace</strong> swaps in a new PDF for
+          that entry — same spot in the portal, and players' Touch Notes on it are kept.</p>
+        <input type="file" id="pbc-replace" accept=".pdf,application/pdf" style="display:none" onchange="_pbReplacePicked()">
+        <div class="result" id="pbc-replace-result"></div>
         <div id="pbcontent-table"><div class="loading">Loading...</div></div>
       </div>
     </div>
@@ -3770,7 +3804,8 @@ function loadPbDocs(){
         "<td>"+(pbEsc(d.folder_path)||'<span style="color:#8b95a1">(top level)</span>')+"</td>"+
         "<td>"+pbEsc(d.title)+"</td>"+
         "<td>"+(d.size_bytes?fmtBytes(d.size_bytes):"—")+"</td>"+
-        '<td><button class="btn btn-danger btn-sm" onclick="deletePbDoc(\\''+d.id+'\\',\\''+pbEsc(d.title)+'\\')">Delete</button></td>'+
+        '<td style="white-space:nowrap"><button class="btn btn-primary btn-sm" onclick="replacePbDoc(\\''+d.id+'\\',\\''+pbEsc(d.title)+'\\')">Replace</button> '+
+        '<button class="btn btn-danger btn-sm" onclick="deletePbDoc(\\''+d.id+'\\',\\''+pbEsc(d.title)+'\\')">Delete</button></td>'+
       "</tr>";
     }).join("");
     box.innerHTML='<table><thead><tr><th>Folder</th><th>Title</th><th>Size</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'+
@@ -3781,6 +3816,38 @@ function loadPbDocs(){
 function deletePbDoc(id,title){
   if(!confirm('Delete "'+title+'"? This removes it from the playbook and R2.')) return;
   api("DELETE","/playbook/docs/"+id).then(function(){ loadPbDocs(); });
+}
+
+// ── Replace one PDF in place (same doc id — keeps portal spot + Touch Notes) ──
+var _pbReplaceId=null, _pbReplaceTitle="";
+function replacePbDoc(id,title){
+  _pbReplaceId=id; _pbReplaceTitle=title;
+  var inp=document.getElementById("pbc-replace");
+  inp.value=""; inp.click();
+}
+function _pbReplacePicked(){
+  var inp=document.getElementById("pbc-replace");
+  var f=inp.files && inp.files[0];
+  var res=document.getElementById("pbc-replace-result");
+  if(!f || !_pbReplaceId) return;
+  var id=_pbReplaceId, title=_pbReplaceTitle; _pbReplaceId=null;
+  if(!confirm('Replace the PDF for "'+title+'" with "'+f.name+'"? The entry keeps its folder, title, and player notes.')){
+    res.className="result"; res.textContent=""; return;
+  }
+  res.className="result"; res.textContent='Replacing "'+title+'"...';
+  api("POST","/playbook/docs/sign-upload",{}).then(function(s){
+    if(!s || !s.put_url) throw new Error("sign failed");
+    return fetch(s.put_url,{method:"PUT",headers:{"Content-Type":"application/pdf"},body:f}).then(function(r){
+      if(!r.ok) throw new Error("R2 "+r.status);
+      return api("POST","/playbook/docs/"+id+"/replace",{key:s.key,size:f.size});
+    });
+  }).then(function(d){
+    if(d && d.ok){
+      res.className="result ok";
+      res.textContent='Replaced "'+title+'". Players get the new PDF the next time they open it.';
+      loadPbDocs();
+    } else { throw new Error((d&&d.detail)||"replace failed"); }
+  }).catch(function(e){ res.className="result err"; res.textContent='Replace failed for "'+title+'": '+e.message; });
 }
 
 // ── Whole-folder upload (PDFs go live; Visio files get queued for conversion) ──
