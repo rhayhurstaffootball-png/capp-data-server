@@ -2959,7 +2959,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <div class="form-row">
           <div class="form-group">
             <label>Folder path</label>
-            <input type="text" id="pbf-path" placeholder="e.g. 2026 GAME PLANS/01 DUQUESNE (SEP 5)">
+            <input type="text" id="pbf-path" placeholder="e.g. 2026 GAME PLAN/01 DUQUESNE (SEP 5)">
           </div>
         </div>
         <button class="btn btn-primary" onclick="createPbFolder()">Create folder</button>
