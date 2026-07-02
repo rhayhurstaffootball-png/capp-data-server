@@ -123,6 +123,49 @@ def page_count(pdf: pathlib.Path):
         return None
 
 
+def normalize_pdf(pdf_path: pathlib.Path) -> None:
+    """Scale every page to the document's most common page size (off-size pages
+    fit aspect-preserved + centered via show_pdf_page, so vector stays vector).
+    Same behavior as the Visio Converter's booklet normalization — keeps a
+    converted doc reading at one steady size in the Binder."""
+    try:
+        import collections
+        import fitz
+    except ImportError:
+        print("  (PyMuPDF not available — skipping page normalization)")
+        return
+    book = fitz.open(pdf_path)
+    if book.page_count == 0:
+        book.close()
+        return
+    counts = collections.Counter()
+    for i in range(book.page_count):
+        r = book[i].rect
+        counts[(round(r.width, 1), round(r.height, 1))] += 1
+    (tw, th), same = counts.most_common(1)[0]
+    off_size = book.page_count - same
+    if off_size == 0:
+        book.close()
+        return
+    out = fitz.open()
+    for i in range(book.page_count):
+        r = book[i].rect
+        if abs(r.width - tw) < 0.6 and abs(r.height - th) < 0.6:
+            out.insert_pdf(book, from_page=i, to_page=i)
+            continue
+        page = out.new_page(width=tw, height=th)
+        scale = min(tw / r.width, th / r.height)
+        w, h = r.width * scale, r.height * scale
+        x, y = (tw - w) / 2.0, (th - h) / 2.0
+        page.show_pdf_page(fitz.Rect(x, y, x + w, y + h), book, i)
+    book.close()
+    tmp = pdf_path.with_suffix(".norm.pdf")
+    out.save(tmp, deflate=True)
+    out.close()
+    tmp.replace(pdf_path)
+    print(f"  normalized {off_size} page(s) to {tw / 72:.1f} x {th / 72:.1f} in")
+
+
 def process(claim: dict) -> None:
     job = claim["job"]
     ext = (job.get("ext") or "").lower()
@@ -140,6 +183,7 @@ def process(claim: dict) -> None:
             raise RuntimeError(f"unsupported extension: {ext}")
         if not out.exists() or out.stat().st_size == 0:
             raise RuntimeError("conversion produced no PDF")
+        normalize_pdf(out)
         http_put(claim["put_url"], out)
         api("/playbook/worker/complete",
             {"job_id": job["id"], "pages": page_count(out), "size": out.stat().st_size})
