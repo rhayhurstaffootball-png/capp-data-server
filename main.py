@@ -2321,7 +2321,7 @@ async def playbook_notes_put(doc_id: str, page: int, payload: dict = Body(...),
 # to R2, and the finished PDF is registered as a normal playbook_docs row.
 _PB_JOBS = "playbook_jobs"
 PB_WORKER_TOKEN = os.environ.get("PB_WORKER_TOKEN", "")
-_PB_VISIO_EXTS = ("vsd", "vsdx", "vsdm")
+_PB_CONVERT_EXTS = ("vsd", "vsdx", "vsdm", "ppt", "pptx")   # worker converts these to PDF
 
 
 def _require_worker(x_worker_token: str = Header("")):
@@ -2331,11 +2331,11 @@ def _require_worker(x_worker_token: str = Header("")):
 
 @app.post("/admin/api/playbook/jobs/sign-upload", dependencies=[Depends(_require_admin)])
 async def admin_pb_job_sign_upload(payload: dict = Body(...)):
-    """Presigned PUT so the admin browser uploads the raw Visio file to R2."""
+    """Presigned PUT so the admin browser uploads the raw Visio/PowerPoint file to R2."""
     import uuid as _uuid
     ext = (payload.get("ext") or "vsdx").lower().lstrip(".")
-    if ext not in _PB_VISIO_EXTS:
-        raise HTTPException(status_code=400, detail="Not a Visio file.")
+    if ext not in _PB_CONVERT_EXTS:
+        raise HTTPException(status_code=400, detail="Not a convertible file.")
     key = f"raw/{_uuid.uuid4().hex}.{ext}"
     return {"key": key, "put_url": _r2_presign("PUT", key, expires=900)}
 
@@ -2462,6 +2462,107 @@ async def pb_worker_complete(payload: dict = Body(...)):
                                  "pages": payload.get("pages"),
                                  "size_bytes": payload.get("size"), "error": None})
     return {"ok": True, "doc_id": doc_id}
+
+
+@app.post("/playbook/worker/error", dependencies=[Depends(_require_worker)])
+async def pb_worker_error(payload: dict = Body(...)):
+    """Worker couldn't convert a job — mark it errored so the admin panel shows it."""
+    job_id = (payload.get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id required.")
+    await _pb_job_patch(job_id, {"status": "error",
+                                 "error": (payload.get("error") or "conversion failed")[:500]})
+    return {"ok": True}
+
+
+# ── Coach upload — lightweight password-gated page; upload-only, no admin access ─
+PB_COACH_PASSWORD = os.environ.get("PB_COACH_PASSWORD", "")
+
+
+def _require_coach(x_coach_token: str = Header("")):
+    if not PB_COACH_PASSWORD or x_coach_token != PB_COACH_PASSWORD:
+        raise HTTPException(status_code=401, detail="Wrong coach password.")
+
+
+@app.get("/coach/playbook/folders", dependencies=[Depends(_require_coach)])
+async def coach_pb_folders():
+    """Every folder path a coach can upload into (docs' folders ∪ registered
+    empty folders, plus all their ancestors)."""
+    async with httpx.AsyncClient() as c:
+        d = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "folder_path"}, headers=_supa_headers_json())
+        f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "folder_path"}, headers=_supa_headers_json())
+    paths = set()
+    for resp in (d, f):
+        if resp.status_code == 200:
+            for row in resp.json():
+                p = (row.get("folder_path") or "").strip().strip("/")
+                if p:
+                    parts = p.split("/")
+                    for i in range(1, len(parts) + 1):
+                        paths.add("/".join(parts[:i]))
+    return {"folders": sorted(paths)}
+
+
+@app.post("/coach/playbook/sign-upload", dependencies=[Depends(_require_coach)])
+async def coach_pb_sign_upload(payload: dict = Body(...)):
+    """Presigned PUT for a coach upload. PDFs go straight to the content area;
+    PowerPoint/Visio go to raw/ and get queued for conversion."""
+    import uuid as _uuid
+    ext = (payload.get("ext") or "").lower().lstrip(".")
+    if ext == "pdf":
+        key = f"pdfs/{_uuid.uuid4().hex}.pdf"
+    elif ext in _PB_CONVERT_EXTS:
+        key = f"raw/{_uuid.uuid4().hex}.{ext}"
+    else:
+        raise HTTPException(status_code=400, detail="Only PDF, PowerPoint, or Visio files.")
+    return {"key": key, "put_url": _r2_presign("PUT", key, expires=900),
+            "kind": "pdf" if ext == "pdf" else "convert"}
+
+
+@app.post("/coach/playbook/docs", dependencies=[Depends(_require_coach)])
+async def coach_pb_create_doc(payload: dict = Body(...)):
+    """Register a coach-uploaded PDF (bytes already in R2)."""
+    row = {
+        "folder_path": (payload.get("folder") or "").strip().strip("/"),
+        "title":       (payload.get("title") or "").strip(),
+        "r2_key":      (payload.get("key") or "").strip(),
+        "pages":       payload.get("pages"),
+        "size_bytes":  payload.get("size"),
+        "sort_order":  0,
+    }
+    if not row["title"] or not row["r2_key"]:
+        raise HTTPException(status_code=400, detail="title and key are required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}", json=row,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.post("/coach/playbook/jobs", dependencies=[Depends(_require_coach)])
+async def coach_pb_create_job(payload: dict = Body(...)):
+    """Queue a coach-uploaded PowerPoint/Visio file for conversion."""
+    ext = (payload.get("ext") or "").lower().lstrip(".")
+    if ext not in _PB_CONVERT_EXTS:
+        raise HTTPException(status_code=400, detail="Not a convertible file.")
+    row = {
+        "raw_key":     (payload.get("key") or "").strip(),
+        "ext":         ext,
+        "folder_path": (payload.get("folder") or "").strip().strip("/"),
+        "title":       (payload.get("title") or "").strip(),
+        "status":      "queued",
+    }
+    if not row["title"] or not row["raw_key"]:
+        raise HTTPException(status_code=400, detail="title and key are required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}", json=row,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
 
 
 @app.post("/playbook/worker/fail", dependencies=[Depends(_require_worker)])
@@ -2927,9 +3028,9 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <h2>Upload a whole folder</h2>
         <p class="small" style="margin-bottom:14px;">
           Pick a <strong>root folder</strong> and its entire tree of subfolders is recreated in
-          the portal. <strong>PDFs</strong> go live immediately. <strong>Visio files</strong>
-          (<code>.vsd/.vsdx/.vsdm</code>) are queued and converted to PDF by the conversion worker,
-          then appear automatically. Each file keeps its folder path.
+          the portal. <strong>PDFs</strong> go live immediately. <strong>Visio and PowerPoint files</strong>
+          (<code>.vsd/.vsdx/.vsdm/.ppt/.pptx</code>) are queued and converted to PDF by the conversion
+          worker, then appear automatically. Each file keeps its folder path.
         </p>
         <div class="form-row">
           <div class="form-group">
@@ -3930,9 +4031,9 @@ function uploadPbFolder(){
   var files=document.getElementById("pbc-dir").files;
   if(!files || !files.length){ res.className="result err"; res.textContent="Pick a folder first."; return; }
   var list=Array.prototype.slice.call(files).filter(function(f){
-    return /\\.(pdf|vsdx?|vsdm)$/i.test(f.name);
+    return /\\.(pdf|vsdx?|vsdm|pptx?)$/i.test(f.name);
   });
-  if(!list.length){ res.className="result err"; res.textContent="No PDFs or Visio files in that folder."; return; }
+  if(!list.length){ res.className="result err"; res.textContent="No PDF, Visio, or PowerPoint files in that folder."; return; }
   if(window._pbUploadBusy){ res.className="result err"; res.textContent="An upload is already running — wait for it to finish."; return; }
   window._pbUploadBusy=true;
   var done=0, failed=0, queued=0;
@@ -3953,9 +4054,9 @@ function uploadPbFolder(){
     var f=list[i];
     var rel=f.webkitRelativePath||f.name;
     var folder=_pbFolderOf(rel);
-    var m=f.name.match(/\\.(pdf|vsdx?|vsdm)$/i);
+    var m=f.name.match(/\\.(pdf|vsdx?|vsdm|pptx?)$/i);
     var ext=(m?m[1]:"").toLowerCase();
-    var title=f.name.replace(/\\.(pdf|vsdx?|vsdm)$/i,"");
+    var title=f.name.replace(/\\.(pdf|vsdx?|vsdm|pptx?)$/i,"");
     var p;
     if(ext==="pdf"){
       p=api("POST","/playbook/docs/sign-upload",{folder:folder}).then(function(s){
