@@ -3772,10 +3772,13 @@ function uploadPbDocs(){
   var folder=(document.getElementById("pbc-folder").value||"").trim().replace(/^\\/+|\\/+$/g,"");
   var files=document.getElementById("pbc-files").files;
   if(!files || !files.length){ res.className="result err"; res.textContent="Choose at least one PDF."; return; }
+  if(window._pbUploadBusy){ res.className="result err"; res.textContent="An upload is already running — wait for it to finish."; return; }
+  window._pbUploadBusy=true;
   var list=Array.prototype.slice.call(files), done=0, failed=0;
   res.className="result"; res.textContent="Uploading 0/"+list.length+"...";
   function next(i){
     if(i>=list.length){
+      window._pbUploadBusy=false;
       res.className=failed?"result err":"result ok";
       res.textContent="Uploaded "+done+"/"+list.length+(failed?(" ("+failed+" failed)"):"")+".";
       document.getElementById("pbc-files").value=""; loadPbDocs(); return;
@@ -3864,6 +3867,8 @@ function uploadPbFolder(){
     return /\\.(pdf|vsdx?|vsdm)$/i.test(f.name);
   });
   if(!list.length){ res.className="result err"; res.textContent="No PDFs or Visio files in that folder."; return; }
+  if(window._pbUploadBusy){ res.className="result err"; res.textContent="An upload is already running — wait for it to finish."; return; }
+  window._pbUploadBusy=true;
   var done=0, failed=0, queued=0;
   res.className="result";
   function report(){
@@ -3873,6 +3878,7 @@ function uploadPbFolder(){
   report();
   function next(i){
     if(i>=list.length){
+      window._pbUploadBusy=false;
       res.className=failed?"result err":"result ok";
       res.textContent="Done: "+done+"/"+list.length+" uploaded"+
         (queued?(" ("+queued+" Visio queued for conversion)"):"")+(failed?(", "+failed+" failed"):"")+".";
