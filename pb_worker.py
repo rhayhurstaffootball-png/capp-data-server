@@ -81,6 +81,161 @@ def _worker_token() -> str:
 
 TOKEN = _worker_token()
 
+# ── Visio Converter toolkit (same PC) — reused for font fidelity ─────────────
+# Gives the worker the converter's proven protections: the portable Fonts
+# bundle loaded into the session (so coach files using fonts this PC lacks
+# still render right), and the variable-font hybrid (Visio can't embed a
+# variable font like Bahnschrift into vector PDF → those pages come out with
+# wrong glyphs; re-render just those pages via EMF→GDI+ raster).
+_VTP_DIR = r"C:\Users\roger.hayhurst.ctr\VisioToPPT"
+vtp = None
+try:
+    sys.path.insert(0, _VTP_DIR)
+    import visio_to_ppt as vtp
+except Exception as _e:
+    vtp = None
+    _VTP_IMPORT_ERR = str(_e)
+
+_NAMEFILE = None
+_FVAR_CACHE = {}
+_WARNED_FONTS = set()
+
+
+def _font_name_to_file():
+    """family-name (lower) -> font file, from installed fonts + the converter's
+    Fonts bundle (mirrors ConvertWorker._name_to_file)."""
+    global _NAMEFILE
+    if _NAMEFILE is None:
+        m = {}
+        try:
+            m = dict(vtp.installed_font_file_map())
+            for d in vtp.font_dirs():
+                try:
+                    entries = os.listdir(d)
+                except OSError:
+                    continue
+                for fn in entries:
+                    if fn.lower().endswith(vtp.FONT_EXTS):
+                        p = os.path.join(d, fn)
+                        for nm in vtp.ConvertWorker._font_family_names(p):
+                            m.setdefault(nm, p)
+        except Exception:
+            pass
+        _NAMEFILE = m
+    return _NAMEFILE
+
+
+def _font_is_variable(fam):
+    key = (fam or "").strip().lower()
+    if not key:
+        return False
+    if key in _FVAR_CACHE:
+        return _FVAR_CACHE[key]
+    m = _font_name_to_file()
+    path = m.get(key)
+    if not path:
+        pre = key + " "
+        path = next((p for n, p in m.items() if n == key or n.startswith(pre)), None)
+    res = vtp._font_has_fvar(path) if path else False
+    _FVAR_CACHE[key] = res
+    return res
+
+
+def _basefont_family(bf):
+    """'BCDIEE+Bahnschrift-Bold' -> 'Bahnschrift' (same as the converter)."""
+    bf = bf.split("+", 1)[-1]
+    bf = bf.split("-", 1)[0]
+    return bf.strip()
+
+
+def _raster_dpi_for(w_in, h_in, dpi=300, cap_mp=220):
+    if w_in > 0 and h_in > 0:
+        mp = (w_in * dpi) * (h_in * dpi) / 1e6
+        if mp > cap_mp:
+            dpi = int(((cap_mp * 1e6) / (w_in * h_in)) ** 0.5)
+    return max(150, dpi)
+
+
+def _log_missing_fonts(doc):
+    """Name any font the file uses that is neither installed here nor in the
+    Fonts bundle — Visio will substitute it and layout can shift."""
+    if vtp is None:
+        return
+    try:
+        used = vtp.collect_used_fonts(doc)
+        have = set(_font_name_to_file().keys())
+        for f in sorted(used):
+            fl = (f or "").strip().lower()
+            if not fl or fl in _WARNED_FONTS:
+                continue
+            if fl not in have and not any(n == fl or n.startswith(fl + " ") for n in have):
+                _WARNED_FONTS.add(fl)
+                log(f'  WARNING: font "{f}" is not on this PC or in the Fonts bundle — '
+                    f'Visio will substitute it (layout may shift). Add its file to '
+                    f'{_VTP_DIR}\\Fonts to fix.')
+    except Exception:
+        pass
+
+
+def _hybrid_fix_variable_fonts(fg_pages, pdf_path):
+    """Re-render variable-font pages as high-DPI images inside the PDF —
+    the converter's proven hybrid (vector everywhere else)."""
+    if vtp is None:
+        return
+    try:
+        import fitz
+        need = set()
+        with fitz.open(pdf_path) as d:
+            n_pdf = d.page_count
+            for i in range(n_pdf):
+                for f in d[i].get_fonts(full=True):
+                    fam = _basefont_family(f[3])
+                    if _font_is_variable(fam):
+                        need.add(i)
+                        if fam.lower() not in _WARNED_FONTS:
+                            _WARNED_FONTS.add(fam.lower())
+                            log(f'  "{fam}" is a variable font — its pages get '
+                                f'rasterized at high DPI (vector can\'t embed it)')
+                        break
+        if not need:
+            return
+        if len(fg_pages) != n_pdf:
+            log("  (page count mismatch — skipping variable-font raster pass)")
+            return
+        png_for = {}
+        with tempfile.TemporaryDirectory(prefix="pbhybrid_") as tmp:
+            for fi in sorted(need):
+                try:
+                    pg = fg_pages[fi]
+                    w_in = float(pg.PageSheet.CellsU("PageWidth").ResultIU)
+                    h_in = float(pg.PageSheet.CellsU("PageHeight").ResultIU)
+                    emf = os.path.join(tmp, f"p{fi}.emf")
+                    pg.Export(emf)
+                    img = os.path.join(tmp, f"p{fi}.png")
+                    vtp.emf_to_image(emf, img, w_in, h_in, dpi=_raster_dpi_for(w_in, h_in))
+                    png_for[fi] = img
+                except Exception as e:
+                    log(f"  (raster of page {fi + 1} failed: {e} — leaving it vector)")
+            if not png_for:
+                return
+            src = fitz.open(pdf_path)
+            out = fitz.open()
+            for i in range(src.page_count):
+                rect = src[i].rect
+                if i in png_for:
+                    p = out.new_page(width=rect.width, height=rect.height)
+                    p.insert_image(p.rect, filename=png_for[i])
+                else:
+                    out.insert_pdf(src, from_page=i, to_page=i)
+            tmp_out = pdf_path + ".hyb"
+            out.save(tmp_out, deflate=True, garbage=3)
+            out.close()
+            src.close()
+            os.replace(tmp_out, pdf_path)
+        log(f"  rasterized {len(png_for)} variable-font page(s)")
+    except Exception as e:
+        log(f"  (variable-font pass skipped: {e})")
+
 
 def api(path: str, body: dict) -> dict:
     req = urllib.request.Request(
@@ -143,11 +298,16 @@ atexit.register(_reset_office)
 
 def convert_visio(src: str, out: str) -> None:
     """Visio COM native vector PDF export (visFixedFormatPDF=1, intent=print,
-    all pages) — same call the Visio Converter's PDF mode uses."""
+    all pages) — same call the Visio Converter's PDF mode uses — plus the
+    converter's missing-font warning and variable-font hybrid raster pass."""
     visio = _get_visio()
     doc = visio.Documents.OpenEx(os.path.normpath(src), 0x2 | 0x80)  # RO + macros off
     try:
+        _log_missing_fonts(doc)
+        fg = [doc.Pages.Item(i) for i in range(1, doc.Pages.Count + 1)
+              if not bool(doc.Pages.Item(i).Background)]
         doc.ExportAsFixedFormat(1, os.path.normpath(out), 1, 0)
+        _hybrid_fix_variable_fonts(fg, os.path.normpath(out))
     finally:
         doc.Close()
 
@@ -254,6 +414,17 @@ def main() -> None:
     _trim_log()
     log(f"CAPP Binder worker '{WORKER_NAME}' polling {SERVER} every {POLL_SECONDS}s "
         f"(headless; log = {_LOG_PATH.name}).")
+    if vtp is None:
+        log(f"converter toolkit NOT loaded ({globals().get('_VTP_IMPORT_ERR', 'missing')}) — "
+            f"font protections off, plain Visio export only")
+    else:
+        try:
+            loaded = vtp.register_session_fonts()
+            atexit.register(vtp.unregister_session_fonts, loaded)
+            log(f"loaded {len(loaded or [])} bundled font file(s) into the session "
+                f"({_VTP_DIR}\\Fonts)")
+        except Exception as e:
+            log(f"(session font load failed: {e})")
     while True:
         try:
             claim = api("/playbook/worker/claim", {"worker": WORKER_NAME})
