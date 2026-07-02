@@ -2194,6 +2194,48 @@ async def admin_pb_delete_doc(doc_id: str):
     return {"ok": True}
 
 
+# ── Playbook folders — rows that make EMPTY folders visible in the portal tree ─
+_PB_FOLDERS = "playbook_folders"
+
+
+@app.get("/admin/api/playbook/folders", dependencies=[Depends(_require_admin)])
+async def admin_pb_list_folders():
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "*", "order": "folder_path.asc"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.post("/admin/api/playbook/folders", dependencies=[Depends(_require_admin)])
+async def admin_pb_create_folder(payload: dict = Body(...)):
+    path = (payload.get("path") or "").strip().strip("/")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                         params={"on_conflict": "folder_path"},
+                         json={"folder_path": path},
+                         headers={**_supa_headers_json(),
+                                  "Prefer": "resolution=merge-duplicates,return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.delete("/admin/api/playbook/folders/{folder_id}", dependencies=[Depends(_require_admin)])
+async def admin_pb_delete_folder(folder_id: str):
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                           params={"id": f"eq.{folder_id}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
 @app.get("/playbook/manifest")
 async def playbook_manifest(_email: str = Depends(_require_player)):
     """Folder tree for a signed-in player."""
@@ -2202,11 +2244,17 @@ async def playbook_manifest(_email: str = Depends(_require_player)):
                         params={"select": "id,folder_path,title,pages,sort_order",
                                 "order": "folder_path.asc,sort_order.asc,title.asc"},
                         headers=_supa_headers_json())
+        f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "folder_path", "order": "folder_path.asc"},
+                        headers=_supa_headers_json())
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
+    # Folders are additive; if the table doesn't exist yet, just omit them.
+    folders = ([x["folder_path"] for x in f.json()] if f.status_code == 200 else [])
     return {"sections": [{"id": d["id"], "folder": d.get("folder_path", ""),
                           "title": d.get("title", ""), "pages": d.get("pages")}
-                         for d in r.json()]}
+                         for d in r.json()],
+            "folders": folders}
 
 
 @app.get("/playbook/doc/{doc_id}/url")
@@ -2901,6 +2949,24 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <div id="pbjobs-table"><div class="loading">Loading...</div></div>
       </div>
       <div class="card">
+        <h2>Empty folders</h2>
+        <p class="small" style="margin-bottom:14px;">
+          Folders normally appear in the portal only once a PDF is uploaded into them. A folder
+          registered here shows up in the players' tree <strong>even while empty</strong> — e.g.
+          pre-made game-plan folders. Once files are uploaded into it, the entry here is redundant
+          (but harmless). Use <code>/</code> to nest.
+        </p>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Folder path</label>
+            <input type="text" id="pbf-path" placeholder="e.g. 2026 GAME PLANS/01 DUQUESNE (SEP 5)">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="createPbFolder()">Create folder</button>
+        <div class="result" id="pbf-result"></div>
+        <div id="pbfolders-table" style="margin-top:14px;"><div class="loading">Loading...</div></div>
+      </div>
+      <div class="card">
         <h2>Playbook contents
           <button class="btn btn-primary" onclick="loadPbDocs()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
         </h2>
@@ -3077,7 +3143,7 @@ function showTab(id, btn) {
   if (id === "crm-tab") loadProspects();
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
-  if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); }
+  if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); }
   closeSlideout();
 }
 
@@ -3944,6 +4010,38 @@ function loadPbJobs(){
 function deletePbJob(id){
   if(!confirm("Delete this conversion job and its uploaded source file?")) return;
   api("DELETE","/playbook/jobs/"+id).then(function(){ loadPbJobs(); });
+}
+
+// ── Empty folders (visible in the portal tree before any PDFs land in them) ───
+function loadPbFolders(){
+  var box=document.getElementById("pbfolders-table");
+  api("GET","/playbook/folders").then(function(data){
+    if(!Array.isArray(data)){ box.innerHTML='<div class="loading">Error loading folders.</div>'; return; }
+    if(!data.length){ box.innerHTML='<div class="loading">No registered folders.</div>'; return; }
+    var rows=data.map(function(f){
+      return "<tr>"+
+        "<td>"+pbEsc(f.folder_path)+"</td>"+
+        '<td><button class="btn btn-danger btn-sm" onclick="deletePbFolder(\\''+f.id+'\\',\\''+pbEsc(f.folder_path)+'\\')">Delete</button></td>'+
+      "</tr>";
+    }).join("");
+    box.innerHTML='<table><thead><tr><th>Folder</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
+  }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
+}
+
+function createPbFolder(){
+  var res=document.getElementById("pbf-result");
+  var path=(document.getElementById("pbf-path").value||"").trim().replace(/^\\/+|\\/+$/g,"");
+  if(!path){ res.className="result err"; res.textContent="Type a folder path first."; return; }
+  api("POST","/playbook/folders",{path:path}).then(function(d){
+    if(d && d.id){ res.className="result ok"; res.textContent='Created "'+path+'".';
+      document.getElementById("pbf-path").value=""; loadPbFolders(); }
+    else { res.className="result err"; res.textContent="Error: "+((d&&d.detail)||JSON.stringify(d)); }
+  }).catch(function(e){ res.className="result err"; res.textContent="Network error: "+e; });
+}
+
+function deletePbFolder(id,path){
+  if(!confirm('Remove the empty-folder entry "'+path+'"? (Any PDFs already uploaded there are NOT affected.)')) return;
+  api("DELETE","/playbook/folders/"+id).then(function(){ loadPbFolders(); });
 }
 </script>
 </body>
