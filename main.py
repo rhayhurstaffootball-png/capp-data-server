@@ -2377,7 +2377,7 @@ async def admin_pb_list_jobs():
 async def admin_pb_delete_job(job_id: str):
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
-                        params={"select": "raw_key,out_key", "id": f"eq.{job_id}", "limit": "1"},
+                        params={"select": "raw_key,out_key,status", "id": f"eq.{job_id}", "limit": "1"},
                         headers=_supa_headers_json())
         keys = (g.json()[0] if g.status_code == 200 and g.json() else {})
         r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
@@ -2385,13 +2385,45 @@ async def admin_pb_delete_job(job_id: str):
                            headers={**_supa_headers_json(), "Prefer": "return=minimal"})
         if r.status_code not in (200, 204):
             raise HTTPException(status_code=500, detail=r.text)
-        for k in (keys.get("raw_key"), keys.get("out_key")):
+        # A done job's out_key IS the live playbook_docs PDF — never delete it here.
+        drop = [keys.get("raw_key")]
+        if keys.get("status") != "done":
+            drop.append(keys.get("out_key"))
+        for k in drop:
             if k:
                 try:
                     await c.delete(_r2_presign("DELETE", k, expires=300))
                 except Exception:
                     pass    # orphaned R2 object is harmless
     return {"ok": True}
+
+
+@app.post("/coach/playbook/jobs/clear-finished", dependencies=[Depends(_require_coach)])
+async def coach_pb_clear_finished_jobs():
+    """Clear done/error rows out of the conversion activity feed. Leftover raw
+    source files are removed from R2; produced PDFs are live docs and untouched."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "id,raw_key,out_key,status",
+                                "status": "in.(done,error)"},
+                        headers=_supa_headers_json())
+        rows = g.json() if g.status_code == 200 else []
+        for j in rows:
+            keys = [j.get("raw_key")]
+            if j.get("status") != "done":
+                keys.append(j.get("out_key"))
+            for k in keys:
+                if k:
+                    try:
+                        await c.delete(_r2_presign("DELETE", k, expires=300))
+                    except Exception:
+                        pass
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                           params={"status": "in.(done,error)"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True, "cleared": len(rows)}
 
 
 async def _pb_job_patch(job_id: str, fields: dict):
