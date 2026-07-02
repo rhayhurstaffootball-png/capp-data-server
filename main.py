@@ -2191,6 +2191,53 @@ async def playbook_doc_url(doc_id: str, _email: str = Depends(_require_player)):
     return {"url": _r2_presign("GET", g.json()[0]["r2_key"], expires=600)}
 
 
+# ── Touch Notes — private, per-player, per-play (doc page) typed notes ──────────
+_PB_NOTES = "playbook_notes"
+
+
+@app.get("/playbook/notes")
+async def playbook_notes_list(email: str = Depends(_require_player)):
+    """Every note belonging to the signed-in player (drives the editor + 📝 dots).
+    Scoped to the token's email — a player only ever sees their own notes."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_NOTES}",
+                        params={"select": "doc_id,page,body,updated_at",
+                                "email": f"eq.{email}",
+                                "order": "doc_id.asc,page.asc"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"notes": r.json()}
+
+
+@app.put("/playbook/notes/{doc_id}/{page}")
+async def playbook_notes_put(doc_id: str, page: int, payload: dict = Body(...),
+                             email: str = Depends(_require_player)):
+    """Auto-save a player's note for one play (doc page). Empty text deletes it
+    (so its dot clears). Keyed on (email, doc_id, page) — always the player's own."""
+    text = (payload.get("text") or "").strip()
+    async with httpx.AsyncClient() as c:
+        if not text:
+            r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_NOTES}",
+                               params={"email": f"eq.{email}",
+                                       "doc_id": f"eq.{doc_id}",
+                                       "page": f"eq.{page}"},
+                               headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+            if r.status_code not in (200, 204):
+                raise HTTPException(status_code=500, detail=r.text)
+            return {"ok": True, "deleted": True}
+        row = {"email": email, "doc_id": doc_id, "page": page, "body": text,
+               "updated_at": _dtmod.datetime.utcnow().isoformat() + "Z"}
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_NOTES}",
+                         params={"on_conflict": "email,doc_id,page"},
+                         json=row,
+                         headers={**_supa_headers_json(),
+                                  "Prefer": "resolution=merge-duplicates,return=minimal"})
+    if r.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
 # ── Playbook Visio conversion — admin queues a Visio file; a Windows+Visio ──────
 # worker (or a LibreOffice fallback worker) claims it, converts to PDF, uploads
 # to R2, and the finished PDF is registered as a normal playbook_docs row.
