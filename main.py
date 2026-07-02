@@ -2475,13 +2475,18 @@ async def pb_worker_error(payload: dict = Body(...)):
     return {"ok": True}
 
 
-# ── Coach upload — lightweight password-gated page; upload-only, no admin access ─
-PB_COACH_PASSWORD = os.environ.get("PB_COACH_PASSWORD", "")
-
-
-def _require_coach(x_coach_token: str = Header("")):
-    if not PB_COACH_PASSWORD or x_coach_token != PB_COACH_PASSWORD:
-        raise HTTPException(status_code=401, detail="Wrong coach password.")
+# ── Coach upload — coaches are roster rows whose Position contains "coach"; ──
+# they sign in exactly like players (email + self-set password, same token).
+async def _require_coach(x_pb_token: str = Header("")):
+    email = _pb_read_token(x_pb_token)
+    if not email:
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+    u = await _pb_get(email)
+    if not u:
+        raise HTTPException(status_code=401, detail="Account not found.")
+    if "coach" not in (u.get("position") or "").lower():
+        raise HTTPException(status_code=403, detail="This page is for coaches.")
+    return email
 
 
 @app.get("/coach/playbook/folders", dependencies=[Depends(_require_coach)])
