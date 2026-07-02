@@ -2398,34 +2398,6 @@ async def admin_pb_delete_job(job_id: str):
     return {"ok": True}
 
 
-@app.post("/coach/playbook/jobs/clear-finished", dependencies=[Depends(_require_coach)])
-async def coach_pb_clear_finished_jobs():
-    """Clear done/error rows out of the conversion activity feed. Leftover raw
-    source files are removed from R2; produced PDFs are live docs and untouched."""
-    async with httpx.AsyncClient() as c:
-        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
-                        params={"select": "id,raw_key,out_key,status",
-                                "status": "in.(done,error)"},
-                        headers=_supa_headers_json())
-        rows = g.json() if g.status_code == 200 else []
-        for j in rows:
-            keys = [j.get("raw_key")]
-            if j.get("status") != "done":
-                keys.append(j.get("out_key"))
-            for k in keys:
-                if k:
-                    try:
-                        await c.delete(_r2_presign("DELETE", k, expires=300))
-                    except Exception:
-                        pass
-        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
-                           params={"status": "in.(done,error)"},
-                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
-        if r.status_code not in (200, 204):
-            raise HTTPException(status_code=500, detail=r.text)
-    return {"ok": True, "cleared": len(rows)}
-
-
 async def _pb_job_patch(job_id: str, fields: dict):
     async with httpx.AsyncClient() as c:
         r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
@@ -2516,7 +2488,8 @@ async def _require_coach(x_pb_token: str = Header("")):
     u = await _pb_get(email)
     if not u:
         raise HTTPException(status_code=401, detail="Account not found.")
-    if "coach" not in (u.get("position") or "").lower():
+    pos = (u.get("position") or "").lower()
+    if "coach" not in pos and "video" not in pos:   # "video" = Roger/video staff
         raise HTTPException(status_code=403, detail="This page is for coaches.")
     return email
 
@@ -2577,6 +2550,34 @@ async def coach_pb_create_doc(payload: dict = Body(...)):
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
     return (r.json() or [{}])[0]
+
+
+@app.post("/coach/playbook/jobs/clear-finished", dependencies=[Depends(_require_coach)])
+async def coach_pb_clear_finished_jobs():
+    """Clear done/error rows out of the conversion activity feed. Leftover raw
+    source files are removed from R2; produced PDFs are live docs and untouched."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "id,raw_key,out_key,status",
+                                "status": "in.(done,error)"},
+                        headers=_supa_headers_json())
+        rows = g.json() if g.status_code == 200 else []
+        for j in rows:
+            keys = [j.get("raw_key")]
+            if j.get("status") != "done":
+                keys.append(j.get("out_key"))
+            for k in keys:
+                if k:
+                    try:
+                        await c.delete(_r2_presign("DELETE", k, expires=300))
+                    except Exception:
+                        pass
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                           params={"status": "in.(done,error)"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True, "cleared": len(rows)}
 
 
 @app.get("/coach/playbook/jobs", dependencies=[Depends(_require_coach)])
