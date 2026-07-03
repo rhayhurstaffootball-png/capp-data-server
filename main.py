@@ -3981,26 +3981,55 @@ function uploadPlaybook(){
   }
 }
 
+var _pbUsers=[], _pbSort={key:"name",asc:true};
 function loadPlaybookUsers(){
   var box=document.getElementById("playbook-table");
   box.innerHTML='<div class="loading">Loading...</div>';
   api("GET","/playbook/users").then(function(data){
     if(!Array.isArray(data)){ box.innerHTML='<div class="loading">Error loading players.</div>'; return; }
-    if(!data.length){ box.innerHTML='<div class="loading">No players yet. Upload a roster above.</div>'; return; }
-    var rows=data.map(function(u){
-      var name=((u.last_name||"")+", "+(u.first_name||"")).replace(/^, |, $/g,"").trim();
-      return "<tr>"+
-        "<td>"+(pbEsc(name)||"—")+"</td>"+
-        "<td>"+(pbEsc(u.position)||"—")+"</td>"+
-        "<td>"+pbEsc(u.email)+"</td>"+
-        "<td>"+(u.active?'<span style="color:#22c55e;">Set up</span>':'<span style="color:#8b95a1;">Pending</span>')+"</td>"+
-        '<td><button class="btn btn-danger btn-sm" onclick="deletePlaybookUser(\\''+u.id+'\\',\\''+pbEsc(u.email)+'\\')">Delete</button></td>'+
-      "</tr>";
-    }).join("");
-    var setup=data.filter(function(u){return u.active;}).length;
-    box.innerHTML='<table><thead><tr><th>Name</th><th>Position</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'+
-      '<p class="small" style="margin-top:10px;">'+data.length+' player(s), '+setup+' set up.</p>';
+    _pbUsers=data; renderPlaybookUsers();
   }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
+}
+
+function sortPlaybookUsers(key){
+  if(_pbSort.key===key){ _pbSort.asc=!_pbSort.asc; } else { _pbSort={key:key,asc:true}; }
+  renderPlaybookUsers();
+}
+
+function renderPlaybookUsers(){
+  var box=document.getElementById("playbook-table");
+  var data=_pbUsers;
+  if(!data.length){ box.innerHTML='<div class="loading">No players yet. Upload a roster above.</div>'; return; }
+  var key=_pbSort.key, dir=_pbSort.asc?1:-1;
+  function val(u){
+    if(key==="name") return (((u.last_name||"")+", "+(u.first_name||"")).trim().toLowerCase());
+    if(key==="position") return (u.position||"").toLowerCase();
+    if(key==="email") return (u.email||"").toLowerCase();
+    if(key==="status") return u.active?1:0;
+    return "";
+  }
+  var sorted=data.slice().sort(function(a,b){
+    var va=val(a), vb=val(b);
+    if(va<vb) return -dir; if(va>vb) return dir; return 0;
+  });
+  function hdr(label,k){
+    var arrow=(_pbSort.key===k)?(_pbSort.asc?" ▲":" ▼"):"";
+    return '<th style="cursor:pointer;user-select:none;white-space:nowrap" '+
+           'onclick="sortPlaybookUsers(\\''+k+'\\')">'+label+arrow+'</th>';
+  }
+  var rows=sorted.map(function(u){
+    var name=((u.last_name||"")+", "+(u.first_name||"")).replace(/^, |, $/g,"").trim();
+    return "<tr>"+
+      "<td>"+(pbEsc(name)||"—")+"</td>"+
+      "<td>"+(pbEsc(u.position)||"—")+"</td>"+
+      "<td>"+pbEsc(u.email)+"</td>"+
+      "<td>"+(u.active?'<span style="color:#22c55e;">Set up</span>':'<span style="color:#8b95a1;">Pending</span>')+"</td>"+
+      '<td><button class="btn btn-danger btn-sm" onclick="deletePlaybookUser(\\''+u.id+'\\',\\''+pbEsc(u.email)+'\\')">Delete</button></td>'+
+    "</tr>";
+  }).join("");
+  var setup=data.filter(function(u){return u.active;}).length;
+  box.innerHTML='<table><thead><tr>'+hdr("Name","name")+hdr("Position","position")+hdr("Email","email")+hdr("Status","status")+'<th></th></tr></thead><tbody>'+rows+'</tbody></table>'+
+    '<p class="small" style="margin-top:10px;">'+data.length+' player(s), '+setup+' set up.</p>';
 }
 
 function deletePlaybookUser(id,email){
