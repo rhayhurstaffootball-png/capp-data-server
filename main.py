@@ -2241,7 +2241,7 @@ async def playbook_manifest(_email: str = Depends(_require_player)):
     """Folder tree for a signed-in player."""
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
-                        params={"select": "id,folder_path,title,pages,sort_order",
+                        params={"select": "id,folder_path,title,pages,sort_order,r2_key",
                                 "order": "folder_path.asc,sort_order.asc,title.asc"},
                         headers=_supa_headers_json())
         f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
@@ -2251,8 +2251,11 @@ async def playbook_manifest(_email: str = Depends(_require_player)):
         raise HTTPException(status_code=500, detail=r.text)
     # Folders are additive; if the table doesn't exist yet, just omit them.
     folders = ([x["folder_path"] for x in f.json()] if f.status_code == 200 else [])
+    # "v" = the doc's r2_key: replacing a PDF always writes a new key, so the
+    # portal's offline cache uses it as a version stamp to spot stale copies.
     return {"sections": [{"id": d["id"], "folder": d.get("folder_path", ""),
-                          "title": d.get("title", ""), "pages": d.get("pages")}
+                          "title": d.get("title", ""), "pages": d.get("pages"),
+                          "v": d.get("r2_key", "")}
                          for d in r.json()],
             "folders": folders}
 
