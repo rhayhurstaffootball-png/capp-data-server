@@ -3072,6 +3072,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
       <div class="card">
         <h2>Players
           <button class="btn btn-primary" onclick="loadPlaybookUsers()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+          <button class="btn btn-primary" onclick="exportPlaybookUsers()" style="float:right;font-size:12px;padding:5px 14px;margin-right:8px;">Export Excel</button>
         </h2>
         <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">
           "Set up" = the player has created their password. Delete removes their access.
@@ -4038,6 +4039,34 @@ function renderPlaybookUsers(){
 function deletePlaybookUser(id,email){
   if(!confirm("Remove "+email+"? They will lose access to the playbook.")) return;
   api("DELETE","/playbook/users/"+id).then(function(){ loadPlaybookUsers(); });
+}
+
+function exportPlaybookUsers(){
+  if(!_pbUsers.length){ alert("No players to export. Load the roster first."); return; }
+  var key=_pbSort.key, dir=_pbSort.asc?1:-1;
+  function val(u){
+    if(key==="name") return (((u.last_name||"")+", "+(u.first_name||"")).trim().toLowerCase());
+    if(key==="position") return (u.position||"").toLowerCase();
+    if(key==="email") return (u.email||"").toLowerCase();
+    if(key==="status") return u.active?1:0;
+    return "";
+  }
+  var sorted=_pbUsers.slice().sort(function(a,b){
+    var va=val(a), vb=val(b);
+    if(va<vb) return -dir; if(va>vb) return dir; return 0;
+  });
+  function cell(s){ s=String(s==null?"":s); return '"'+s.replace(/"/g,'""')+'"'; }
+  var lines=[["Name","Position","Email","Status"].map(cell).join(",")];
+  sorted.forEach(function(u){
+    var name=((u.last_name||"")+", "+(u.first_name||"")).replace(/^, |, $/g,"").trim();
+    lines.push([name,u.position||"",u.email||"",u.active?"Set up":"Pending"].map(cell).join(","));
+  });
+  var blob=new Blob(["\\ufeff"+lines.join("\\r\\n")],{type:"text/csv;charset=utf-8"});
+  var a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="binder_players_"+new Date().toISOString().slice(0,10)+".csv";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function(){ URL.revokeObjectURL(a.href); },1000);
 }
 
 // ── Playbook Files (R2 upload + contents) ─────────────────────────────────────
