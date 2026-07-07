@@ -1800,8 +1800,10 @@ async def admin_delete_client(username: str):
 # CRM — demo prospects (separate from licensed capp_clients)
 # Simple pipeline tracker: schools Roger has demoed who may not be customers yet.
 # ─────────────────────────────────────────────────────────────────────────────
-_PROSPECT_STATUSES = ("Demo Done", "Quote/Contract Sent", "Trial", "Paid", "Lost")
+_PROSPECT_STATUSES = ("Demo Done", "Quote/Agreement Sent", "Trial", "Paid", "Lost")
 _PROSPECT_FIELDS   = ("school", "contact", "email", "phone", "status", "quote_sent_date", "notes")
+# Old rows/clients may still carry the pre-Jul-2026 status wording — map it forward.
+_LEGACY_STATUSES   = {"Quote/Contract Sent": "Quote/Agreement Sent"}
 
 
 @app.get("/admin/api/prospects", dependencies=[Depends(_require_admin)])
@@ -1815,7 +1817,10 @@ async def admin_list_prospects():
         )
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
-    return r.json()
+    rows = r.json()
+    for p in rows:
+        p["status"] = _LEGACY_STATUSES.get(p.get("status"), p.get("status"))
+    return rows
 
 
 @app.post("/admin/api/prospects", dependencies=[Depends(_require_admin)])
@@ -1825,6 +1830,7 @@ async def admin_create_prospect(payload: dict = Body(...)):
     if not (row.get("school") or "").strip():
         raise HTTPException(status_code=400, detail="School is required.")
     row.setdefault("status", "Demo Done")
+    row["status"] = _LEGACY_STATUSES.get(row["status"], row["status"])
     if row["status"] not in _PROSPECT_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid status.")
     row["quote_sent_date"] = row.get("quote_sent_date") or None
@@ -1848,8 +1854,10 @@ async def admin_update_prospect(prospect_id: str, payload: dict = Body(...)):
     row = {k: v for k, v in payload.items() if k in _PROSPECT_FIELDS}
     if not row:
         raise HTTPException(status_code=400, detail="No editable fields provided.")
-    if "status" in row and row["status"] not in _PROSPECT_STATUSES:
-        raise HTTPException(status_code=400, detail="Invalid status.")
+    if "status" in row:
+        row["status"] = _LEGACY_STATUSES.get(row["status"], row["status"])
+        if row["status"] not in _PROSPECT_STATUSES:
+            raise HTTPException(status_code=400, detail="Invalid status.")
     if "quote_sent_date" in row:
         row["quote_sent_date"] = row["quote_sent_date"] or None
     row["updated_at"] = _dt.now(_tz.utc).isoformat()
@@ -3009,14 +3017,14 @@ _ADMIN_HTML = """<!DOCTYPE html>
             <label>Status</label>
             <select id="p-status">
               <option>Demo Done</option>
-              <option>Quote/Contract Sent</option>
+              <option>Quote/Agreement Sent</option>
               <option>Trial</option>
               <option>Paid</option>
               <option>Lost</option>
             </select>
           </div>
           <div class="form-group">
-            <label>Quote / Contract Sent Date</label>
+            <label>Quote / Agreement Sent Date</label>
             <input type="date" id="p-quote-date">
           </div>
         </div>
@@ -3253,13 +3261,13 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <label>Status</label>
         <select id="crm-status">
           <option>Demo Done</option>
-          <option>Quote/Contract Sent</option>
+          <option>Quote/Agreement Sent</option>
           <option>Trial</option>
           <option>Paid</option>
           <option>Lost</option>
         </select>
       </div>
-      <div class="form-group" style="margin-bottom:10px;"><label>Quote / Contract Sent Date</label><input type="date" id="crm-quote-date"></div>
+      <div class="form-group" style="margin-bottom:10px;"><label>Quote / Agreement Sent Date</label><input type="date" id="crm-quote-date"></div>
     </div>
     <div class="so-section">
       <h3>Notes</h3>
@@ -3627,7 +3635,7 @@ function closeSlideout() {
 function prospectStatusBadge(status) {
   const map = {
     "Demo Done":           "badge-blue",
-    "Quote/Contract Sent": "badge-yellow",
+    "Quote/Agreement Sent": "badge-yellow",
     "Trial":               "badge-gray",
     "Paid":                "badge-green",
     "Lost":                "badge-red2",
