@@ -1894,6 +1894,23 @@ async def admin_delete_prospect(prospect_id: str):
 # Passwords are hashed (sha256 + per-user salt), same scheme as capp_clients.
 # ─────────────────────────────────────────────────────────────────────────────
 _PB_TABLE = "playbook_users"
+_PB_TEAMS = "playbook_teams"
+
+
+async def _team_get(team_id: str = None, slug: str = None):
+    """Fetch one team row by id or slug, or None. Exactly one of team_id/slug."""
+    params = {"select": "*", "limit": "1"}
+    if slug:
+        params["slug"] = f"eq.{slug}"
+    else:
+        params["id"] = f"eq.{team_id}"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}", params=params,
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        return None
+    rows = r.json()
+    return rows[0] if rows else None
 
 
 def _norm_email(e: str) -> str:
@@ -1917,9 +1934,17 @@ async def _pb_get(email: str):
 @app.post("/admin/api/playbook/upload", dependencies=[Depends(_require_admin)])
 async def admin_playbook_upload(payload: dict = Body(...)):
     """Bulk add/update players from parsed CSV rows:
-    payload = {"rows": [{first_name, last_name, position, email}, ...]}
-    New emails are inserted (no password yet); existing emails get their
-    name/position refreshed but their password is left untouched."""
+    payload = {"rows": [...], "team": "airforce"}  (team slug optional, defaults
+    to airforce so the current admin panel keeps working unchanged.)
+    New emails are inserted (no password yet) under the target team; existing
+    emails get their name/position refreshed but their password is left
+    untouched. An email that ALREADY belongs to a DIFFERENT team is skipped,
+    never silently reassigned — email is globally unique across all teams, so
+    one team's roster upload can never absorb another team's player."""
+    team = await _team_get(slug=(payload.get("team") or "airforce"))
+    if not team:
+        raise HTTPException(status_code=400, detail="Unknown team.")
+    team_id = team["id"]
     rows = payload.get("rows") or []
     processed, skipped = 0, []
     async with httpx.AsyncClient() as c:
@@ -1928,8 +1953,13 @@ async def admin_playbook_upload(payload: dict = Body(...)):
             if not email or "@" not in email:
                 skipped.append({"email": raw.get("email", ""), "reason": "invalid email"})
                 continue
+            existing = await _pb_get(email)
+            if existing and existing.get("team_id") != team_id:
+                skipped.append({"email": email, "reason": "already registered to a different team"})
+                continue
             row = {
                 "email": email,
+                "team_id": team_id,
                 "first_name": (raw.get("first_name") or "").strip(),
                 "last_name":  (raw.get("last_name") or "").strip(),
                 "position":   (raw.get("position") or "").strip(),
@@ -1952,12 +1982,17 @@ async def admin_playbook_upload(payload: dict = Body(...)):
 
 
 @app.get("/admin/api/playbook/users", dependencies=[Depends(_require_admin)])
-async def admin_playbook_users():
-    """Roster list for the admin panel (no password material)."""
+async def admin_playbook_users(team: str = "airforce"):
+    """Roster list for the admin panel (no password material) — one team's
+    roster; defaults to airforce so the current admin panel is unchanged."""
+    t = await _team_get(slug=team)
+    if not t:
+        raise HTTPException(status_code=400, detail="Unknown team.")
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
-            params={"select": "id,email,first_name,last_name,position,pw_hash,created_at",
+            params={"select": "id,email,first_name,last_name,position,pw_hash,is_admin,created_at",
+                    "team_id": f"eq.{t['id']}",
                     "order": "last_name.asc,first_name.asc"},
             headers=_supa_headers_json(),
         )
@@ -1966,7 +2001,7 @@ async def admin_playbook_users():
     return [{
         "id": u["id"], "email": u["email"],
         "first_name": u.get("first_name", ""), "last_name": u.get("last_name", ""),
-        "position": u.get("position", ""),
+        "position": u.get("position", ""), "is_admin": bool(u.get("is_admin")),
         "active": bool(u.get("pw_hash")),     # True once they've set a password
     } for u in r.json()]
 
@@ -1982,6 +2017,100 @@ async def admin_playbook_delete(uid: str):
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
+
+
+# ── Owner (super-admin) — team creation, the top of the multi-tenancy chain ───
+# Roger creates a team + seeds its FIRST Team Admin; that admin then builds
+# their own roster and can promote more admins (see /team-admin/* above).
+
+@app.get("/admin/api/playbook/teams", dependencies=[Depends(_require_admin)])
+async def admin_list_teams():
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}",
+                        params={"select": "*", "order": "name.asc"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.post("/admin/api/playbook/teams", dependencies=[Depends(_require_admin)])
+async def admin_create_team(payload: dict = Body(...)):
+    """Create a team. slug must be unique (e.g. 'navy'); name is the display
+    name shown post-login."""
+    slug = _re.sub(r'[^a-z0-9_]+', '_', (payload.get("slug") or "").lower().strip()).strip('_')
+    name = (payload.get("name") or "").strip()
+    if not slug or not name:
+        raise HTTPException(status_code=400, detail="slug and name are required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}",
+                         json={"slug": slug, "name": name},
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code == 409 or (r.status_code == 400 and "duplicate" in r.text.lower()):
+        raise HTTPException(status_code=409, detail="That team slug already exists.")
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.patch("/admin/api/playbook/teams/{team_id}", dependencies=[Depends(_require_admin)])
+async def admin_update_team(team_id: str, payload: dict = Body(...)):
+    """Rename / relabel / activate-deactivate a team. slug is immutable on
+    purpose (it's baked into R2 keys as a storage prefix)."""
+    patch = {}
+    if "name" in payload:
+        patch["name"] = (payload.get("name") or "").strip()
+    if "active" in payload:
+        patch["active"] = bool(payload.get("active"))
+    if "logo_r2_key" in payload:
+        patch["logo_r2_key"] = payload.get("logo_r2_key")
+    if not patch:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}",
+                          params={"id": f"eq.{team_id}"}, json=patch,
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.post("/admin/api/playbook/teams/{team_id}/logo-sign-upload", dependencies=[Depends(_require_admin)])
+async def admin_team_logo_sign_upload(team_id: str):
+    """Presigned PUT for a team logo image (small, no size cap enforced here)."""
+    import uuid as _uuid
+    key = f"{team_id}/logo/{_uuid.uuid4().hex}"
+    return {"key": key, "put_url": _r2_presign("PUT", key, expires=900)}
+
+
+@app.post("/admin/api/playbook/teams/{team_id}/seed-admin", dependencies=[Depends(_require_admin)])
+async def admin_seed_team_admin(team_id: str, payload: dict = Body(...)):
+    """Add the FIRST Team Admin for a new team. They appear on the roster with
+    is_admin=true and no password yet — they set one on first login exactly
+    like any player, then see the Team Admin roster tools."""
+    team = await _team_get(team_id=team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found.")
+    email = _norm_email(payload.get("email"))
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required.")
+    existing = await _pb_get(email)
+    if existing and existing.get("team_id") != team_id:
+        raise HTTPException(status_code=409, detail="That email already belongs to a different team.")
+    row = {
+        "email": email, "team_id": team_id, "is_admin": True,
+        "first_name": (payload.get("first_name") or "").strip(),
+        "last_name":  (payload.get("last_name") or "").strip(),
+        "position":   (payload.get("position") or "Team Admin").strip(),
+    }
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                         params={"on_conflict": "email"}, json=row,
+                         headers={**_supa_headers_json(),
+                                  "Prefer": "resolution=merge-duplicates,return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
 
 
 @app.post("/playbook/check")
@@ -2069,12 +2198,18 @@ def _pb_read_token(token: str):
 
 
 async def _require_player(x_pb_token: str = Header("")):
+    """Validates the session and returns the FULL user row (dict), not just the
+    email. team_id is always resolved fresh from the DB on every request — never
+    trusted from the token — so a stale/forged team can't leak cross-team data,
+    and no existing session (token format unchanged) is invalidated by adding
+    multi-tenancy. Deleted players are revoked automatically (row lookup fails)."""
     email = _pb_read_token(x_pb_token)
     if not email:
         raise HTTPException(status_code=401, detail="Please sign in again.")
-    if not await _pb_get(email):        # deleted players are revoked automatically
+    u = await _pb_get(email)
+    if not u:
         raise HTTPException(status_code=401, detail="Account not found.")
-    return email
+    return u
 
 
 def _r2_presign(method: str, key: str, expires: int = 600) -> str:
@@ -2114,16 +2249,25 @@ _PB_DOCS = "playbook_docs"
 
 @app.post("/admin/api/playbook/docs/sign-upload", dependencies=[Depends(_require_admin)])
 async def admin_pb_sign_upload(payload: dict = Body(...)):
-    """Presigned PUT so the admin browser uploads the PDF straight to R2."""
+    """Presigned PUT so the admin browser uploads the PDF straight to R2.
+    team (slug, defaults airforce) picks the storage prefix."""
     import uuid as _uuid
-    key = f"pdfs/{_uuid.uuid4().hex}.pdf"
+    team = await _team_get(slug=(payload.get("team") or "airforce"))
+    if not team:
+        raise HTTPException(status_code=400, detail="Unknown team.")
+    key = f"{team['id']}/pdfs/{_uuid.uuid4().hex}.pdf"
     return {"key": key, "put_url": _r2_presign("PUT", key, expires=900)}
 
 
 @app.post("/admin/api/playbook/docs", dependencies=[Depends(_require_admin)])
 async def admin_pb_create_doc(payload: dict = Body(...)):
-    """Record a doc after its bytes were uploaded to R2."""
+    """Record a doc after its bytes were uploaded to R2. team (slug) defaults
+    to airforce so the current admin panel keeps working unchanged."""
+    team = await _team_get(slug=(payload.get("team") or "airforce"))
+    if not team:
+        raise HTTPException(status_code=400, detail="Unknown team.")
     row = {
+        "team_id":     team["id"],
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
         "title":       (payload.get("title") or "").strip(),
         "r2_key":      (payload.get("key") or "").strip(),
@@ -2172,10 +2316,14 @@ async def admin_pb_replace_doc(doc_id: str, payload: dict = Body(...)):
 
 
 @app.get("/admin/api/playbook/docs", dependencies=[Depends(_require_admin)])
-async def admin_pb_list_docs():
+async def admin_pb_list_docs(team: str = "airforce"):
+    t = await _team_get(slug=team)
+    if not t:
+        raise HTTPException(status_code=400, detail="Unknown team.")
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
-                        params={"select": "*", "order": "folder_path.asc,sort_order.asc,title.asc"},
+                        params={"select": "*", "team_id": f"eq.{t['id']}",
+                                "order": "folder_path.asc,sort_order.asc,title.asc"},
                         headers=_supa_headers_json())
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
@@ -2207,10 +2355,14 @@ _PB_FOLDERS = "playbook_folders"
 
 
 @app.get("/admin/api/playbook/folders", dependencies=[Depends(_require_admin)])
-async def admin_pb_list_folders():
+async def admin_pb_list_folders(team: str = "airforce"):
+    t = await _team_get(slug=team)
+    if not t:
+        raise HTTPException(status_code=400, detail="Unknown team.")
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
-                        params={"select": "*", "order": "folder_path.asc"},
+                        params={"select": "*", "team_id": f"eq.{t['id']}",
+                                "order": "folder_path.asc"},
                         headers=_supa_headers_json())
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
@@ -2222,10 +2374,13 @@ async def admin_pb_create_folder(payload: dict = Body(...)):
     path = (payload.get("path") or "").strip().strip("/")
     if not path:
         raise HTTPException(status_code=400, detail="path is required.")
+    team = await _team_get(slug=(payload.get("team") or "airforce"))
+    if not team:
+        raise HTTPException(status_code=400, detail="Unknown team.")
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
-                         params={"on_conflict": "folder_path"},
-                         json={"folder_path": path},
+                         params={"on_conflict": "team_id,folder_path"},
+                         json={"folder_path": path, "team_id": team["id"]},
                          headers={**_supa_headers_json(),
                                   "Prefer": "resolution=merge-duplicates,return=representation"})
     if r.status_code not in (200, 201):
@@ -2245,15 +2400,19 @@ async def admin_pb_delete_folder(folder_id: str):
 
 
 @app.get("/playbook/manifest")
-async def playbook_manifest(_email: str = Depends(_require_player)):
-    """Folder tree for a signed-in player."""
+async def playbook_manifest(_u: dict = Depends(_require_player)):
+    """Folder tree for a signed-in player — scoped to their own team only."""
+    team_id = _u["team_id"]
+    team = await _team_get(team_id=team_id)
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                         params={"select": "id,folder_path,title,pages,sort_order,r2_key",
+                                "team_id": f"eq.{team_id}",
                                 "order": "folder_path.asc,sort_order.asc,title.asc"},
                         headers=_supa_headers_json())
         f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
-                        params={"select": "folder_path", "order": "folder_path.asc"},
+                        params={"select": "folder_path", "team_id": f"eq.{team_id}",
+                                "order": "folder_path.asc"},
                         headers=_supa_headers_json())
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
@@ -2265,19 +2424,23 @@ async def playbook_manifest(_email: str = Depends(_require_player)):
                           "title": d.get("title", ""), "pages": d.get("pages"),
                           "v": d.get("r2_key", "")}
                          for d in r.json()],
-            "folders": folders}
+            "folders": folders,
+            "team": {"name": (team or {}).get("name", "CAPP Binder"),
+                     "logo_r2_key": (team or {}).get("logo_r2_key")}}
 
 
 @app.get("/playbook/doc/{doc_id}/url")
-async def playbook_doc_url(doc_id: str, _email: str = Depends(_require_player)):
-    """Short-lived signed URL for one PDF."""
+async def playbook_doc_url(doc_id: str, _u: dict = Depends(_require_player)):
+    """Short-lived signed URL for one PDF — 404s if the doc isn't this player's
+    own team (never leaks whether the doc exists on another team)."""
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
-                        params={"select": "r2_key", "id": f"eq.{doc_id}", "limit": "1"},
+                        params={"select": "r2_key,team_id", "id": f"eq.{doc_id}", "limit": "1"},
                         headers=_supa_headers_json())
-    if g.status_code != 200 or not g.json():
+    rows = g.json() if g.status_code == 200 else []
+    if not rows or rows[0].get("team_id") != _u["team_id"]:
         raise HTTPException(status_code=404, detail="Not found.")
-    return {"url": _r2_presign("GET", g.json()[0]["r2_key"], expires=600)}
+    return {"url": _r2_presign("GET", rows[0]["r2_key"], expires=600)}
 
 
 # ── Touch Notes — private, per-player, per-play (doc page) typed notes ──────────
@@ -2285,9 +2448,10 @@ _PB_NOTES = "playbook_notes"
 
 
 @app.get("/playbook/notes")
-async def playbook_notes_list(email: str = Depends(_require_player)):
+async def playbook_notes_list(_u: dict = Depends(_require_player)):
     """Every note belonging to the signed-in player (drives the editor + 📝 dots).
     Scoped to the token's email — a player only ever sees their own notes."""
+    email = _u["email"]
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_NOTES}",
                         params={"select": "doc_id,page,body,updated_at",
@@ -2301,9 +2465,10 @@ async def playbook_notes_list(email: str = Depends(_require_player)):
 
 @app.put("/playbook/notes/{doc_id}/{page}")
 async def playbook_notes_put(doc_id: str, page: int, payload: dict = Body(...),
-                             email: str = Depends(_require_player)):
+                             _u: dict = Depends(_require_player)):
     """Auto-save a player's note for one play (doc page). Empty text deletes it
     (so its dot clears). Keyed on (email, doc_id, page) — always the player's own."""
+    email = _u["email"]
     text = (payload.get("text") or "").strip()
     async with httpx.AsyncClient() as c:
         if not text:
@@ -2347,14 +2512,21 @@ async def admin_pb_job_sign_upload(payload: dict = Body(...)):
     ext = (payload.get("ext") or "vsdx").lower().lstrip(".")
     if ext not in _PB_CONVERT_EXTS:
         raise HTTPException(status_code=400, detail="Not a convertible file.")
-    key = f"raw/{_uuid.uuid4().hex}.{ext}"
+    team = await _team_get(slug=(payload.get("team") or "airforce"))
+    if not team:
+        raise HTTPException(status_code=400, detail="Unknown team.")
+    key = f"{team['id']}/raw/{_uuid.uuid4().hex}.{ext}"
     return {"key": key, "put_url": _r2_presign("PUT", key, expires=900)}
 
 
 @app.post("/admin/api/playbook/jobs", dependencies=[Depends(_require_admin)])
 async def admin_pb_create_job(payload: dict = Body(...)):
     """Queue a conversion job after its raw bytes were uploaded to R2."""
+    team = await _team_get(slug=(payload.get("team") or "airforce"))
+    if not team:
+        raise HTTPException(status_code=400, detail="Unknown team.")
     row = {
+        "team_id":     team["id"],
         "raw_key":     (payload.get("key") or "").strip(),
         "ext":         (payload.get("ext") or "").lower().lstrip("."),
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
@@ -2372,11 +2544,15 @@ async def admin_pb_create_job(payload: dict = Body(...)):
 
 
 @app.get("/admin/api/playbook/jobs", dependencies=[Depends(_require_admin)])
-async def admin_pb_list_jobs():
+async def admin_pb_list_jobs(team: str = "airforce"):
+    t = await _team_get(slug=team)
+    if not t:
+        raise HTTPException(status_code=400, detail="Unknown team.")
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
                         params={"select": "id,folder_path,title,ext,status,error,"
                                           "claimed_by,claimed_at,created_at",
+                                "team_id": f"eq.{t['id']}",
                                 "order": "created_at.desc"},
                         headers=_supa_headers_json())
     if r.status_code != 200:
@@ -2434,7 +2610,7 @@ async def pb_worker_claim(payload: dict = Body(default={})):
     if not rows:
         return {"job": None}
     job = rows[0]
-    out_key = f"pdfs/{_uuid.uuid4().hex}.pdf"
+    out_key = f"{job['team_id']}/pdfs/{_uuid.uuid4().hex}.pdf"
     await _pb_job_patch(job["id"], {"out_key": out_key})
     return {
         "job": {"id": job["id"], "title": job.get("title"),
@@ -2454,13 +2630,14 @@ async def pb_worker_complete(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="job_id required.")
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
-                        params={"select": "folder_path,title,out_key",
+                        params={"select": "folder_path,title,out_key,team_id",
                                 "id": f"eq.{job_id}", "limit": "1"},
                         headers=_supa_headers_json())
         if g.status_code != 200 or not g.json():
             raise HTTPException(status_code=404, detail="Job not found.")
         job = g.json()[0]
         doc = {
+            "team_id":     job.get("team_id"),
             "folder_path": job.get("folder_path") or "",
             "title":       job.get("title") or "",
             "r2_key":      job.get("out_key") or "",
@@ -2493,6 +2670,8 @@ async def pb_worker_error(payload: dict = Body(...)):
 # ── Coach upload — coaches are roster rows whose Position contains "coach"; ──
 # they sign in exactly like players (email + self-set password, same token).
 async def _require_coach(x_pb_token: str = Header("")):
+    """Validates the session, checks the coach role, and returns the FULL user
+    row (team_id resolved fresh from the DB — see _require_player)."""
     email = _pb_read_token(x_pb_token)
     if not email:
         raise HTTPException(status_code=401, detail="Please sign in again.")
@@ -2502,18 +2681,175 @@ async def _require_coach(x_pb_token: str = Header("")):
     pos = (u.get("position") or "").lower()
     if "coach" not in pos and "video" not in pos:   # "video" = Roger/video staff
         raise HTTPException(status_code=403, detail="This page is for coaches.")
-    return email
+    return u
 
 
-@app.get("/coach/playbook/folders", dependencies=[Depends(_require_coach)])
-async def coach_pb_folders():
+async def _require_team_admin(x_pb_token: str = Header("")):
+    """Team Admin gate (roster management + promoting other admins) — a role
+    granted by an Owner/existing admin via is_admin, NOT tied to coach Position.
+    'Coaches can't be trusted with roster power' (Roger, Jul 8 2026)."""
+    email = _pb_read_token(x_pb_token)
+    if not email:
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+    u = await _pb_get(email)
+    if not u:
+        raise HTTPException(status_code=401, detail="Account not found.")
+    if not u.get("is_admin"):
+        raise HTTPException(status_code=403, detail="This page is for team admins.")
+    return u
+
+
+async def _doc_in_team(doc_id: str, team_id: str) -> bool:
+    """True only if doc_id exists AND belongs to team_id. Used before any
+    coach/team-admin write to a doc, so one team can never touch another's row
+    even by guessing/replaying a doc_id."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "id", "id": f"eq.{doc_id}",
+                                "team_id": f"eq.{team_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+    return g.status_code == 200 and bool(g.json())
+
+
+# ── Team Admin — roster + admin management, scoped to the admin's OWN team ────
+# "Coaches can't be trusted with that kind of power" (Roger, Jul 8 2026): roster
+# control is a dedicated role (is_admin), independent of the coach Position
+# check. A Team Admin is appointed by the Owner (or by another Team Admin on
+# the SAME team) — never self-granted, never cross-team.
+
+@app.get("/team-admin/roster")
+async def team_admin_roster(_u: dict = Depends(_require_team_admin)):
+    """This team's full roster (no password material)."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+            params={"select": "id,email,first_name,last_name,position,pw_hash,is_admin,created_at",
+                    "team_id": f"eq.{_u['team_id']}",
+                    "order": "last_name.asc,first_name.asc"},
+            headers=_supa_headers_json(),
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return [{
+        "id": row["id"], "email": row["email"],
+        "first_name": row.get("first_name", ""), "last_name": row.get("last_name", ""),
+        "position": row.get("position", ""), "is_admin": bool(row.get("is_admin")),
+        "active": bool(row.get("pw_hash")),
+    } for row in r.json()]
+
+
+@app.post("/team-admin/roster/upload")
+async def team_admin_roster_upload(payload: dict = Body(...), _u: dict = Depends(_require_team_admin)):
+    """Bulk add/update this team's roster from parsed CSV rows. Same email-
+    collision protection as the Owner upload: an email already registered to a
+    DIFFERENT team is skipped, never silently reassigned."""
+    team_id = _u["team_id"]
+    rows = payload.get("rows") or []
+    processed, skipped = 0, []
+    async with httpx.AsyncClient() as c:
+        for raw in rows:
+            email = _norm_email(raw.get("email"))
+            if not email or "@" not in email:
+                skipped.append({"email": raw.get("email", ""), "reason": "invalid email"})
+                continue
+            existing = await _pb_get(email)
+            if existing and existing.get("team_id") != team_id:
+                skipped.append({"email": email, "reason": "already registered to a different team"})
+                continue
+            row = {
+                "email": email,
+                "team_id": team_id,
+                "first_name": (raw.get("first_name") or "").strip(),
+                "last_name":  (raw.get("last_name") or "").strip(),
+                "position":   (raw.get("position") or "").strip(),
+            }
+            r = await c.post(
+                f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                params={"on_conflict": "email"},
+                json=row,
+                headers={**_supa_headers_json(),
+                         "Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+            if r.status_code in (200, 201, 204):
+                processed += 1
+            else:
+                skipped.append({"email": email, "reason": r.text[:120]})
+    return {"processed": processed, "skipped": skipped, "total": len(rows)}
+
+
+@app.delete("/team-admin/roster/{uid}")
+async def team_admin_roster_delete(uid: str, _u: dict = Depends(_require_team_admin)):
+    """Remove a player/coach from THIS team's roster only — 404s (never a plain
+    delete) if the row belongs to another team, so an admin can't be tricked
+    into deleting a row by id from outside their own team."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "id", "id": f"eq.{uid}",
+                                "team_id": f"eq.{_u['team_id']}", "limit": "1"},
+                        headers=_supa_headers_json())
+        if g.status_code != 200 or not g.json():
+            raise HTTPException(status_code=404, detail="Not found.")
+        r = await c.delete(
+            f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+            params={"id": f"eq.{uid}"},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.post("/team-admin/admins/{uid}")
+async def team_admin_promote(uid: str, _u: dict = Depends(_require_team_admin)):
+    """Promote an existing roster member (same team) to Team Admin."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "id", "id": f"eq.{uid}",
+                                "team_id": f"eq.{_u['team_id']}", "limit": "1"},
+                        headers=_supa_headers_json())
+        if g.status_code != 200 or not g.json():
+            raise HTTPException(status_code=404, detail="Not found.")
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                          params={"id": f"eq.{uid}"}, json={"is_admin": True},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.delete("/team-admin/admins/{uid}")
+async def team_admin_demote(uid: str, _u: dict = Depends(_require_team_admin)):
+    """Demote a Team Admin (same team) back to a regular roster member. An
+    admin CANNOT demote themselves — a team must always keep at least one."""
+    if uid == _u["id"]:
+        raise HTTPException(status_code=400, detail="You can't remove your own admin access.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "id", "id": f"eq.{uid}",
+                                "team_id": f"eq.{_u['team_id']}", "limit": "1"},
+                        headers=_supa_headers_json())
+        if g.status_code != 200 or not g.json():
+            raise HTTPException(status_code=404, detail="Not found.")
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                          params={"id": f"eq.{uid}"}, json={"is_admin": False},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.get("/coach/playbook/folders")
+async def coach_pb_folders(_u: dict = Depends(_require_coach)):
     """Every folder path a coach can upload into (docs' folders ∪ registered
-    empty folders, plus all their ancestors)."""
+    empty folders, plus all their ancestors) — scoped to the coach's own team."""
+    team_id = _u["team_id"]
     async with httpx.AsyncClient() as c:
         d = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
-                        params={"select": "folder_path"}, headers=_supa_headers_json())
+                        params={"select": "folder_path", "team_id": f"eq.{team_id}"},
+                        headers=_supa_headers_json())
         f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
-                        params={"select": "folder_path"}, headers=_supa_headers_json())
+                        params={"select": "folder_path", "team_id": f"eq.{team_id}"},
+                        headers=_supa_headers_json())
     paths = set()
     for resp in (d, f):
         if resp.status_code == 200:
@@ -2526,26 +2862,31 @@ async def coach_pb_folders():
     return {"folders": sorted(paths)}
 
 
-@app.post("/coach/playbook/sign-upload", dependencies=[Depends(_require_coach)])
-async def coach_pb_sign_upload(payload: dict = Body(...)):
+@app.post("/coach/playbook/sign-upload")
+async def coach_pb_sign_upload(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
     """Presigned PUT for a coach upload. PDFs go straight to the content area;
-    PowerPoint/Visio go to raw/ and get queued for conversion."""
+    PowerPoint/Visio go to raw/ and get queued for conversion. R2 key is always
+    prefixed with the coach's OWN team_id — never client-supplied — so a coach
+    can only ever write into their own team's storage drawer."""
     import uuid as _uuid
+    team_id = _u["team_id"]
     ext = (payload.get("ext") or "").lower().lstrip(".")
     if ext == "pdf":
-        key = f"pdfs/{_uuid.uuid4().hex}.pdf"
+        key = f"{team_id}/pdfs/{_uuid.uuid4().hex}.pdf"
     elif ext in _PB_CONVERT_EXTS:
-        key = f"raw/{_uuid.uuid4().hex}.{ext}"
+        key = f"{team_id}/raw/{_uuid.uuid4().hex}.{ext}"
     else:
         raise HTTPException(status_code=400, detail="Only PDF, PowerPoint, or Visio files.")
     return {"key": key, "put_url": _r2_presign("PUT", key, expires=900),
             "kind": "pdf" if ext == "pdf" else "convert"}
 
 
-@app.post("/coach/playbook/docs", dependencies=[Depends(_require_coach)])
-async def coach_pb_create_doc(payload: dict = Body(...)):
-    """Register a coach-uploaded PDF (bytes already in R2)."""
+@app.post("/coach/playbook/docs")
+async def coach_pb_create_doc(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Register a coach-uploaded PDF (bytes already in R2). team_id is always
+    the coach's own — never taken from the request body."""
     row = {
+        "team_id":     _u["team_id"],
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
         "title":       (payload.get("title") or "").strip(),
         "r2_key":      (payload.get("key") or "").strip(),
@@ -2563,13 +2904,16 @@ async def coach_pb_create_doc(payload: dict = Body(...)):
     return (r.json() or [{}])[0]
 
 
-@app.post("/coach/playbook/jobs/clear-finished", dependencies=[Depends(_require_coach)])
-async def coach_pb_clear_finished_jobs():
-    """Clear done/error rows out of the conversion activity feed. Leftover raw
-    source files are removed from R2; produced PDFs are live docs and untouched."""
+@app.post("/coach/playbook/jobs/clear-finished")
+async def coach_pb_clear_finished_jobs(_u: dict = Depends(_require_coach)):
+    """Clear done/error rows out of the conversion activity feed — this team's
+    jobs only. Leftover raw source files are removed from R2; produced PDFs
+    are live docs and untouched."""
+    team_id = _u["team_id"]
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
                         params={"select": "id,raw_key,out_key,status",
+                                "team_id": f"eq.{team_id}",
                                 "status": "in.(done,error)"},
                         headers=_supa_headers_json())
         rows = g.json() if g.status_code == 200 else []
@@ -2584,20 +2928,22 @@ async def coach_pb_clear_finished_jobs():
                     except Exception:
                         pass
         r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
-                           params={"status": "in.(done,error)"},
+                           params={"team_id": f"eq.{team_id}", "status": "in.(done,error)"},
                            headers={**_supa_headers_json(), "Prefer": "return=minimal"})
         if r.status_code not in (200, 204):
             raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True, "cleared": len(rows)}
 
 
-@app.get("/coach/playbook/jobs", dependencies=[Depends(_require_coach)])
-async def coach_pb_list_jobs():
+@app.get("/coach/playbook/jobs")
+async def coach_pb_list_jobs(_u: dict = Depends(_require_coach)):
     """Conversion queue state so the coach page can show real progress after
-    the upload itself finishes (queued → converting → done/error)."""
+    the upload itself finishes (queued → converting → done/error) — this
+    team's jobs only."""
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
                         params={"select": "id,folder_path,title,ext,status,error,created_at",
+                                "team_id": f"eq.{_u['team_id']}",
                                 "order": "created_at.desc", "limit": "50"},
                         headers=_supa_headers_json())
     if r.status_code != 200:
@@ -2605,9 +2951,13 @@ async def coach_pb_list_jobs():
     return r.json()
 
 
-@app.patch("/coach/playbook/docs/{doc_id}/move", dependencies=[Depends(_require_coach)])
-async def coach_pb_move_doc(doc_id: str, payload: dict = Body(...)):
-    """Move a doc to another folder. Same row/id, so Touch Notes stay attached."""
+@app.patch("/coach/playbook/docs/{doc_id}/move")
+async def coach_pb_move_doc(doc_id: str, payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Move a doc to another folder. Same row/id, so Touch Notes stay attached.
+    Rejects a doc that isn't this coach's own team (404 — never confirms another
+    team's doc even exists)."""
+    if not await _doc_in_team(doc_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Doc not found.")
     folder = (payload.get("folder") or "").strip().strip("/")
     async with httpx.AsyncClient() as c:
         r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
@@ -2622,19 +2972,24 @@ async def coach_pb_move_doc(doc_id: str, payload: dict = Body(...)):
     return rows[0]
 
 
-@app.delete("/coach/playbook/docs/{doc_id}", dependencies=[Depends(_require_coach)])
-async def coach_pb_delete_doc(doc_id: str):
-    """Coach delete — same behavior as the admin delete (row + R2 object)."""
+@app.delete("/coach/playbook/docs/{doc_id}")
+async def coach_pb_delete_doc(doc_id: str, _u: dict = Depends(_require_coach)):
+    """Coach delete — same behavior as the admin delete (row + R2 object), but
+    only if the doc belongs to the coach's own team."""
+    if not await _doc_in_team(doc_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Doc not found.")
     return await admin_pb_delete_doc(doc_id)
 
 
-@app.post("/coach/playbook/jobs", dependencies=[Depends(_require_coach)])
-async def coach_pb_create_job(payload: dict = Body(...)):
-    """Queue a coach-uploaded PowerPoint/Visio file for conversion."""
+@app.post("/coach/playbook/jobs")
+async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Queue a coach-uploaded PowerPoint/Visio file for conversion, stamped with
+    the coach's own team_id (never client-supplied)."""
     ext = (payload.get("ext") or "").lower().lstrip(".")
     if ext not in _PB_CONVERT_EXTS:
         raise HTTPException(status_code=400, detail="Not a convertible file.")
     row = {
+        "team_id":     _u["team_id"],
         "raw_key":     (payload.get("key") or "").strip(),
         "ext":         ext,
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
