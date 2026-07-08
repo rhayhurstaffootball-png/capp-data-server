@@ -1960,6 +1960,23 @@ async def admin_delete_prospect(prospect_id: str):
 _PB_TABLE = "playbook_users"
 _PB_TEAMS = "playbook_teams"
 
+# Auto-populate a known program's logo at team-creation time from the SAME
+# numbered logo library the desktop suite already uses (TEAM_LOGOS_NUMBERED +
+# TEAM_NUMBER_MAP in capp_launcher_qt.py) — "we have the logos in several
+# places in CAPP, we should be able to have it populate automatically"
+# (Roger, Jul 8 2026). team_logo_numbers.json is a one-time export of that
+# same map; the actual PNG files are bulk-uploaded to R2 once under
+# _team_logos/{number}.png (shared, public-read brand assets — NOT
+# per-team-scoped storage, so no team_id prefix). If a school isn't in this
+# list (independent/non-CAPP program), the Team Admin's manual logo upload
+# (/team-admin/logo) is the fallback.
+_TEAM_LOGO_NUMBERS = {}
+try:
+    with open(os.path.join(os.path.dirname(__file__), "team_logo_numbers.json"), encoding="utf-8") as _f:
+        _TEAM_LOGO_NUMBERS = json.load(_f)
+except Exception:
+    pass   # catalog is optional — teams just fall back to manual upload
+
 
 async def _team_get(team_id: str = None, slug: str = None):
     """Fetch one team row by id or slug, or None. Exactly one of team_id/slug."""
@@ -2101,20 +2118,35 @@ async def admin_list_teams():
 @app.post("/admin/api/playbook/teams", dependencies=[Depends(_require_admin)])
 async def admin_create_team(payload: dict = Body(...)):
     """Create a team. slug must be unique (e.g. 'navy'); name is the display
-    name shown post-login."""
+    name shown post-login. Optional logo_school: an EXACT key from the
+    known-programs catalog (see /admin/api/playbook/team-logo-catalog) —
+    when given, the team's logo is set immediately from the shared CAPP
+    logo library, no upload needed. Free-text name is NEVER auto-matched
+    against the catalog (too error-prone); the picker is what drives this."""
     slug = _re.sub(r'[^a-z0-9_]+', '_', (payload.get("slug") or "").lower().strip()).strip('_')
     name = (payload.get("name") or "").strip()
     if not slug or not name:
         raise HTTPException(status_code=400, detail="slug and name are required.")
+    row = {"slug": slug, "name": name}
+    logo_school = (payload.get("logo_school") or "").strip()
+    if logo_school and logo_school in _TEAM_LOGO_NUMBERS:
+        row["logo_r2_key"] = f"_team_logos/{_TEAM_LOGO_NUMBERS[logo_school]}.png"
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}",
-                         json={"slug": slug, "name": name},
+                         json=row,
                          headers={**_supa_headers_json(), "Prefer": "return=representation"})
     if r.status_code == 409 or (r.status_code == 400 and "duplicate" in r.text.lower()):
         raise HTTPException(status_code=409, detail="That team slug already exists.")
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
     return (r.json() or [{}])[0]
+
+
+@app.get("/admin/api/playbook/team-logo-catalog", dependencies=[Depends(_require_admin)])
+async def admin_team_logo_catalog():
+    """Known-program list for the Create Team logo picker — name -> already
+    has a logo on file, no upload needed."""
+    return {"schools": sorted(_TEAM_LOGO_NUMBERS.keys())}
 
 
 @app.patch("/admin/api/playbook/teams/{team_id}", dependencies=[Depends(_require_admin)])
@@ -2490,7 +2522,11 @@ async def playbook_manifest(_u: dict = Depends(_require_player)):
                          for d in r.json()],
             "folders": folders,
             "team": {"name": (team or {}).get("name", "CAPP Binder"),
-                     "logo_r2_key": (team or {}).get("logo_r2_key")}}
+                     "logo_r2_key": (team or {}).get("logo_r2_key"),
+                     # Presigned so the header <img> can just use it directly —
+                     # same pattern as doc URLs, no separate endpoint needed.
+                     "logo_url": (_r2_presign("GET", (team or {}).get("logo_r2_key"), expires=3600)
+                                  if (team or {}).get("logo_r2_key") else None)}}
 
 
 @app.get("/playbook/doc/{doc_id}/url")
@@ -2897,6 +2933,61 @@ async def team_admin_demote(uid: str, _u: dict = Depends(_require_team_admin)):
         r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
                           params={"id": f"eq.{uid}"}, json={"is_admin": False},
                           headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.post("/team-admin/logo-sign-upload")
+async def team_admin_logo_sign_upload(_u: dict = Depends(_require_team_admin)):
+    """Presigned PUT for THIS team's logo image — self-service, no Owner
+    involvement needed. Key is always prefixed with the admin's own team_id."""
+    import uuid as _uuid
+    key = f"{_u['team_id']}/logo/{_uuid.uuid4().hex}"
+    return {"key": key, "put_url": _r2_presign("PUT", key, expires=900)}
+
+
+@app.post("/team-admin/logo")
+async def team_admin_set_logo(payload: dict = Body(...), _u: dict = Depends(_require_team_admin)):
+    """Save the logo key onto THIS admin's own team row (bytes already in R2
+    from team_admin_logo_sign_upload above). playbook_teams has no team_id
+    column of its own — ownership is enforced by matching the row's id to the
+    admin's own team_id before allowing the patch, never trusting a client-
+    supplied team id."""
+    key = (payload.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}",
+                          params={"id": f"eq.{_u['team_id']}"},
+                          json={"logo_r2_key": key},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.get("/team-admin/logo-catalog")
+async def team_admin_logo_catalog(_u: dict = Depends(_require_team_admin)):
+    """Same known-program list as the Owner's picker, for a Team Admin who
+    wants to switch to (or pick, if none was set at creation) a logo already
+    on file — no upload needed for any of CAPP's existing programs."""
+    return {"schools": sorted(_TEAM_LOGO_NUMBERS.keys())}
+
+
+@app.post("/team-admin/logo-from-catalog")
+async def team_admin_logo_from_catalog(payload: dict = Body(...), _u: dict = Depends(_require_team_admin)):
+    """Set THIS team's logo from the shared CAPP logo library by exact name —
+    the auto-populate path, no upload/no R2 round-trip needed."""
+    school = (payload.get("school") or "").strip()
+    if school not in _TEAM_LOGO_NUMBERS:
+        raise HTTPException(status_code=404, detail="Not in the known-programs list.")
+    key = f"_team_logos/{_TEAM_LOGO_NUMBERS[school]}.png"
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}",
+                          params={"id": f"eq.{_u['team_id']}"},
+                          json={"logo_r2_key": key},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
@@ -3609,6 +3700,10 @@ _ADMIN_HTML = """<!DOCTYPE html>
             <input type="text" id="team-name" placeholder="e.g. Navy Midshipmen">
           </div>
         </div>
+        <div class="form-group" style="margin-top:10px;">
+          <label>Logo (optional — auto-fills from CAPP's existing logo library)</label>
+          <select id="team-logo-school"><option value="">— No logo yet (team can upload their own later) —</option></select>
+        </div>
         <button class="btn btn-primary" onclick="createBinderTeam()">Create team</button>
         <div class="result" id="team-create-result"></div>
       </div>
@@ -3790,7 +3885,7 @@ function showTab(id, btn) {
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
   if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); }
-  if (id === "teams-tab") loadBinderTeams();
+  if (id === "teams-tab") { loadBinderTeams(); loadTeamLogoCatalog(); }
   closeSlideout();
 }
 
@@ -4776,16 +4871,30 @@ function renderBinderTeams(){
   box.innerHTML='<table><thead><tr><th>Name</th><th>Slug</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
+var _teamLogoCatalogLoaded=false;
+function loadTeamLogoCatalog(){
+  if(_teamLogoCatalogLoaded) return;
+  _teamLogoCatalogLoaded=true;
+  api("GET","/playbook/team-logo-catalog").then(function(d){
+    var sel=document.getElementById("team-logo-school");
+    (d.schools||[]).forEach(function(s){
+      var o=document.createElement("option"); o.value=s; o.textContent=s; sel.appendChild(o);
+    });
+  }).catch(function(){});
+}
+
 function createBinderTeam(){
   var res=document.getElementById("team-create-result");
   var slug=(document.getElementById("team-slug").value||"").trim();
   var name=(document.getElementById("team-name").value||"").trim();
+  var logoSchool=(document.getElementById("team-logo-school").value||"");
   if(!slug||!name){ res.className="result err"; res.textContent="Slug and name are both required."; return; }
   res.className="result"; res.textContent="Creating...";
-  api("POST","/playbook/teams",{slug:slug,name:name}).then(function(d){
+  api("POST","/playbook/teams",{slug:slug,name:name,logo_school:logoSchool}).then(function(d){
     if(d && d.id){
-      res.className="result ok"; res.textContent='Created "'+name+'". Now seed its first admin below.';
+      res.className="result ok"; res.textContent='Created "'+name+'"'+(logoSchool?' with logo from "'+logoSchool+'"':'')+'. Now seed its first admin below.';
       document.getElementById("team-slug").value=""; document.getElementById("team-name").value="";
+      document.getElementById("team-logo-school").value="";
       loadBinderTeams();
     } else { res.className="result err"; res.textContent="Error: "+((d&&d.detail)||JSON.stringify(d)); }
   }).catch(function(e){ res.className="result err"; res.textContent="Network error: "+e; });
