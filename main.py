@@ -2844,7 +2844,11 @@ async def _require_coach(x_pb_token: str = Header("")):
     if not u:
         raise HTTPException(status_code=401, detail="Account not found.")
     pos = (u.get("position") or "").lower()
-    if "coach" not in pos and "video" not in pos:   # "video" = Roger/video staff
+    # "video" = Roger/video staff. Team Admins always get content-upload access
+    # too, regardless of what their Position text says — a Team Admin managing
+    # a program obviously needs to manage its playbook content, not just its
+    # roster (Roger, Jul 8 2026: "they need the sections... I have on my admin page").
+    if "coach" not in pos and "video" not in pos and not u.get("is_admin"):
         raise HTTPException(status_code=403, detail="This page is for coaches.")
     if not await _team_is_active(u["team_id"]):
         raise HTTPException(status_code=401, detail="This team's account is currently deactivated.")
@@ -2875,6 +2879,16 @@ async def _doc_in_team(doc_id: str, team_id: str) -> bool:
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                         params={"select": "id", "id": f"eq.{doc_id}",
+                                "team_id": f"eq.{team_id}", "limit": "1"},
+                        headers=_scoped_headers(team_id))
+    return g.status_code == 200 and bool(g.json())
+
+
+async def _folder_in_team(folder_id: str, team_id: str) -> bool:
+    """Same idea as _doc_in_team, for playbook_folders (empty-folder rows)."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "id", "id": f"eq.{folder_id}",
                                 "team_id": f"eq.{team_id}", "limit": "1"},
                         headers=_scoped_headers(team_id))
     return g.status_code == 200 and bool(g.json())
@@ -3086,6 +3100,53 @@ async def coach_pb_folders(_u: dict = Depends(_require_coach)):
     return {"folders": sorted(paths)}
 
 
+@app.post("/coach/playbook/folders/create")
+async def coach_pb_create_folder(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Register an empty folder so it shows in the players' tree before any
+    PDF lands in it — team-scoped version of the Owner's create-folder."""
+    path = (payload.get("path") or "").strip().strip("/")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                         params={"on_conflict": "team_id,folder_path"},
+                         json={"folder_path": path, "team_id": _u["team_id"]},
+                         headers={**_scoped_headers(_u["team_id"]),
+                                  "Prefer": "resolution=merge-duplicates,return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.get("/coach/playbook/folders/list")
+async def coach_pb_list_empty_folders(_u: dict = Depends(_require_coach)):
+    """Just the registered EMPTY folder rows (not the docs-derived ancestor
+    list from coach_pb_folders above) — for a manage/delete table."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "*", "team_id": f"eq.{_u['team_id']}",
+                                "order": "folder_path.asc"},
+                        headers=_scoped_headers(_u["team_id"]))
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.delete("/coach/playbook/folders/{folder_id}")
+async def coach_pb_delete_folder(folder_id: str, _u: dict = Depends(_require_coach)):
+    """Remove an empty-folder entry — only if it belongs to the coach's own
+    team (any PDFs already uploaded there are untouched either way)."""
+    if not await _folder_in_team(folder_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Folder not found.")
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                           params={"id": f"eq.{folder_id}"},
+                           headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
 @app.post("/coach/playbook/sign-upload")
 async def coach_pb_sign_upload(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
     """Presigned PUT for a coach upload. PDFs go straight to the content area;
@@ -3126,6 +3187,53 @@ async def coach_pb_create_doc(payload: dict = Body(...), _u: dict = Depends(_req
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
     return (r.json() or [{}])[0]
+
+
+@app.get("/coach/playbook/docs")
+async def coach_pb_list_docs(_u: dict = Depends(_require_coach)):
+    """Full contents list for the coach's own team — same shape as the Owner's
+    admin_pb_list_docs, so the coach page can render the same 'Playbook
+    contents' table with Replace/Delete."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "*", "team_id": f"eq.{_u['team_id']}",
+                                "order": "folder_path.asc,sort_order.asc,title.asc"},
+                        headers=_scoped_headers(_u["team_id"]))
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.post("/coach/playbook/docs/{doc_id}/replace")
+async def coach_pb_replace_doc(doc_id: str, payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Swap a doc's PDF for new bytes already uploaded to R2 — team-scoped
+    version of the Owner's replace. The row keeps its id/folder/title/sort
+    order, so player Touch Notes stay attached. Rejects a doc that isn't this
+    coach's own team."""
+    if not await _doc_in_team(doc_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Doc not found.")
+    new_key = (payload.get("key") or "").strip()
+    if not new_key:
+        raise HTTPException(status_code=400, detail="key is required.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "r2_key", "id": f"eq.{doc_id}", "limit": "1"},
+                        headers=_scoped_headers(_u["team_id"]))
+        if g.status_code != 200 or not g.json():
+            raise HTTPException(status_code=404, detail="Doc not found.")
+        old_key = g.json()[0].get("r2_key")
+        patch = {"r2_key": new_key, "size_bytes": payload.get("size"), "pages": payload.get("pages")}
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                          params={"id": f"eq.{doc_id}"}, json=patch,
+                          headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+        if old_key and old_key != new_key:
+            try:
+                await c.delete(_r2_presign("DELETE", old_key, expires=300))
+            except Exception:
+                pass    # row already points at the new PDF; orphaned object is harmless
+    return {"ok": True}
 
 
 @app.post("/coach/playbook/jobs/clear-finished")
