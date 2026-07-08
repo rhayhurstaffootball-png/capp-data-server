@@ -1978,6 +1978,16 @@ except Exception:
     pass   # catalog is optional — teams just fall back to manual upload
 
 
+async def _team_is_active(team_id: str) -> bool:
+    """False only if the team exists and is explicitly deactivated. A missing/
+    unresolvable team fails OPEN here on purpose — this is a courtesy check,
+    not a security boundary (that's Wall #1 team_id filtering + Wall #2 RLS,
+    which don't depend on this flag at all); we'd rather a lookup hiccup not
+    lock everyone out than silently under-protect anything."""
+    team = await _team_get(team_id=team_id)
+    return bool(team) and team.get("active", True) is not False
+
+
 async def _team_get(team_id: str = None, slug: str = None):
     """Fetch one team row by id or slug, or None. Exactly one of team_id/slug."""
     params = {"select": "*", "limit": "1"}
@@ -2142,6 +2152,55 @@ async def admin_create_team(payload: dict = Body(...)):
     return (r.json() or [{}])[0]
 
 
+@app.post("/admin/api/playbook/teams/create-with-admin", dependencies=[Depends(_require_admin)])
+async def admin_create_team_with_admin(payload: dict = Body(...)):
+    """Create a team AND seed its first admin in ONE action. Replaces the old
+    two-step flow (create team, then find its row in a list and click its own
+    'Seed admin' button) — that flow let Roger click the WRONG row's button
+    and seed a new team's admin onto an existing team by mistake (Jul 8 2026
+    incident). Checking the admin email BEFORE creating the team also avoids
+    ending up with an orphan team if the email turns out to be taken."""
+    slug = _re.sub(r'[^a-z0-9_]+', '_', (payload.get("slug") or "").lower().strip()).strip('_')
+    name = (payload.get("name") or "").strip()
+    admin_email = _norm_email(payload.get("admin_email"))
+    if not slug or not name:
+        raise HTTPException(status_code=400, detail="slug and name are required.")
+    if not admin_email or "@" not in admin_email:
+        raise HTTPException(status_code=400, detail="A valid admin email is required.")
+    existing = await _pb_get(admin_email)
+    if existing:
+        raise HTTPException(status_code=409, detail="That email already belongs to a team — pick a different admin email.")
+
+    team_row = {"slug": slug, "name": name}
+    logo_school = (payload.get("logo_school") or "").strip()
+    if logo_school and logo_school in _TEAM_LOGO_NUMBERS:
+        team_row["logo_r2_key"] = f"_team_logos/{_TEAM_LOGO_NUMBERS[logo_school]}.png"
+
+    async with httpx.AsyncClient() as c:
+        tr = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_TEAMS}", json=team_row,
+                          headers={**_supa_headers_json(), "Prefer": "return=representation"})
+        if tr.status_code == 409 or (tr.status_code == 400 and "duplicate" in tr.text.lower()):
+            raise HTTPException(status_code=409, detail="That team slug already exists.")
+        if tr.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=tr.text)
+        team = (tr.json() or [{}])[0]
+
+        admin_row = {
+            "email": admin_email, "team_id": team["id"], "is_admin": True,
+            "first_name": (payload.get("admin_first_name") or "").strip(),
+            "last_name":  (payload.get("admin_last_name") or "").strip(),
+            "position":   "Team Admin",
+        }
+        ar = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}", json=admin_row,
+                          headers={**_supa_headers_json(), "Prefer": "return=representation"})
+        if ar.status_code not in (200, 201):
+            # Team exists but the admin didn't get created — surface this
+            # loudly rather than silently leaving a team with no admin.
+            return {"team": team, "admin": None,
+                    "error": "Team created, but seeding the admin failed: " + ar.text[:200]}
+    return {"team": team, "admin": (ar.json() or [{}])[0]}
+
+
 @app.get("/admin/api/playbook/team-logo-catalog", dependencies=[Depends(_require_admin)])
 async def admin_team_logo_catalog():
     """Known-program list for the Create Team logo picker — name -> already
@@ -2230,6 +2289,8 @@ async def playbook_setup(email: str = Body(..., embed=True),
     u = await _pb_get(email)
     if not u:
         raise HTTPException(status_code=403, detail="This email isn't on the roster. Ask your coach to add you.")
+    if not await _team_is_active(u["team_id"]):
+        raise HTTPException(status_code=403, detail="This team's account is currently deactivated.")
     if u.get("pw_hash"):
         raise HTTPException(status_code=409, detail="Password already set — just sign in.")
     salt = _secrets.token_hex(8)
@@ -2257,6 +2318,8 @@ async def playbook_login(email: str = Body(..., embed=True),
     u = await _pb_get(email)
     if not u:
         raise HTTPException(status_code=403, detail="This email isn't on the roster. Ask your coach to add you.")
+    if not await _team_is_active(u["team_id"]):
+        raise HTTPException(status_code=403, detail="This team's account is currently deactivated.")
     if not u.get("pw_hash"):
         return {"status": "needs_setup", "first_name": u.get("first_name", "")}
     if _hash_pw(password, u.get("pw_salt", "")) != u["pw_hash"]:
@@ -2305,6 +2368,8 @@ async def _require_player(x_pb_token: str = Header("")):
     u = await _pb_get(email)
     if not u:
         raise HTTPException(status_code=401, detail="Account not found.")
+    if not await _team_is_active(u["team_id"]):
+        raise HTTPException(status_code=401, detail="This team's account is currently deactivated.")
     return u
 
 
@@ -2781,6 +2846,8 @@ async def _require_coach(x_pb_token: str = Header("")):
     pos = (u.get("position") or "").lower()
     if "coach" not in pos and "video" not in pos:   # "video" = Roger/video staff
         raise HTTPException(status_code=403, detail="This page is for coaches.")
+    if not await _team_is_active(u["team_id"]):
+        raise HTTPException(status_code=401, detail="This team's account is currently deactivated.")
     return u
 
 
@@ -2796,6 +2863,8 @@ async def _require_team_admin(x_pb_token: str = Header("")):
         raise HTTPException(status_code=401, detail="Account not found.")
     if not u.get("is_admin"):
         raise HTTPException(status_code=403, detail="This page is for team admins.")
+    if not await _team_is_active(u["team_id"]):
+        raise HTTPException(status_code=401, detail="This team's account is currently deactivated.")
     return u
 
 
@@ -3686,9 +3755,10 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <p class="small" style="margin-bottom:14px;">
           <strong>Slug</strong> is permanent (used as the storage prefix — pick something short
           and stable, e.g. <code>navy</code>). <strong>Name</strong> is what shows on their login
-          splash. After creating a team, seed its <strong>first Team Admin</strong> below — that
-          person signs in like any player, sets a password, then manages their own roster and can
-          promote more admins. Coaches never get roster access; that's the Team Admin's job only.
+          splash. This creates the team AND its <strong>first Team Admin</strong> together in one
+          step — that person signs in with the email below, sets a password, then manages their
+          own roster and can promote more admins. Coaches never get roster access; that's the
+          Team Admin's job only.
         </p>
         <div class="form-row">
           <div class="form-group">
@@ -3704,7 +3774,17 @@ _ADMIN_HTML = """<!DOCTYPE html>
           <label>Logo (optional — auto-fills from CAPP's existing logo library)</label>
           <select id="team-logo-school"><option value="">— No logo yet (team can upload their own later) —</option></select>
         </div>
-        <button class="btn btn-primary" onclick="createBinderTeam()">Create team</button>
+        <div class="form-row" style="margin-top:10px;">
+          <div class="form-group">
+            <label>First Team Admin's email</label>
+            <input type="text" id="team-admin-email" placeholder="coach@school.edu">
+          </div>
+          <div class="form-group">
+            <label>Their name (optional)</label>
+            <input type="text" id="team-admin-name" placeholder="First Last">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="createBinderTeam()">Create team + admin</button>
         <div class="result" id="team-create-result"></div>
       </div>
       <div class="card">
@@ -3712,8 +3792,10 @@ _ADMIN_HTML = """<!DOCTYPE html>
           <button class="btn btn-primary" onclick="loadBinderTeams()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
         </h2>
         <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">
-          Toggling a team inactive signs its players/coaches out on next check but keeps all their
-          data intact — nothing is deleted.
+          Toggling a team inactive signs its players/coaches out immediately and blocks new
+          logins — data stays intact, nothing is deleted. "+ Add admin" here is only for adding
+          a SECOND/backup admin to a team that already exists — double-check you're on the right
+          row before using it (a new team's first admin is created together with the team above).
         </p>
         <div id="teams-table"><div class="loading">Loading...</div></div>
       </div>
@@ -4863,7 +4945,7 @@ function renderBinderTeams(){
       +'<td><code>'+pbEsc(t.slug)+'</code></td>'
       +'<td>'+(t.active?'<span style="color:#4caf50">Active</span>':'<span style="color:#e05555">Inactive</span>')+'</td>'
       +'<td>'
-        +'<button class="btn" style="font-size:12px;padding:4px 10px;margin-right:6px;" onclick="seedBinderTeamAdmin(\\''+t.id+'\\',\\''+pbEsc(t.name).replace(/'/g,"\\\\'")+'\\')">+ Seed admin</button>'
+        +'<button class="btn" style="font-size:12px;padding:4px 10px;margin-right:6px;" onclick="seedBinderTeamAdmin(\\''+t.id+'\\',\\''+pbEsc(t.name).replace(/'/g,"\\\\'")+'\\')" title="Adds ANOTHER admin to THIS team — not for a new team, use the form above for that">+ Add admin</button>'
         +'<button class="btn" style="font-size:12px;padding:4px 10px;" onclick="toggleBinderTeamActive(\\''+t.id+'\\','+(!t.active)+')">'+(t.active?'Deactivate':'Activate')+'</button>'
       +'</td>'
     +'</tr>';
@@ -4888,13 +4970,27 @@ function createBinderTeam(){
   var slug=(document.getElementById("team-slug").value||"").trim();
   var name=(document.getElementById("team-name").value||"").trim();
   var logoSchool=(document.getElementById("team-logo-school").value||"");
+  var adminEmail=(document.getElementById("team-admin-email").value||"").trim().toLowerCase();
+  var adminName=(document.getElementById("team-admin-name").value||"").trim();
+  var first="", last="";
+  if(adminName){ var parts=adminName.split(/\s+/); first=parts[0]||""; last=parts.slice(1).join(" ")||""; }
   if(!slug||!name){ res.className="result err"; res.textContent="Slug and name are both required."; return; }
+  if(!adminEmail||adminEmail.indexOf("@")<0){ res.className="result err"; res.textContent="A valid admin email is required — this is who signs in first for this team."; return; }
   res.className="result"; res.textContent="Creating...";
-  api("POST","/playbook/teams",{slug:slug,name:name,logo_school:logoSchool}).then(function(d){
-    if(d && d.id){
-      res.className="result ok"; res.textContent='Created "'+name+'"'+(logoSchool?' with logo from "'+logoSchool+'"':'')+'. Now seed its first admin below.';
+  api("POST","/playbook/teams/create-with-admin",{
+    slug:slug, name:name, logo_school:logoSchool,
+    admin_email:adminEmail, admin_first_name:first, admin_last_name:last
+  }).then(function(d){
+    if(d && d.team && d.admin){
+      res.className="result ok";
+      res.textContent='Created "'+name+'"'+(logoSchool?' with logo from "'+logoSchool+'"':'')+'. '+adminEmail+' can now sign in to set up as Team Admin.';
       document.getElementById("team-slug").value=""; document.getElementById("team-name").value="";
       document.getElementById("team-logo-school").value="";
+      document.getElementById("team-admin-email").value=""; document.getElementById("team-admin-name").value="";
+      loadBinderTeams();
+    } else if(d && d.team && !d.admin){
+      res.className="result err";
+      res.textContent='Team "'+name+'" was created, but seeding the admin failed: '+(d.error||"unknown error")+'. Use "+ Add admin" on its row below to retry.';
       loadBinderTeams();
     } else { res.className="result err"; res.textContent="Error: "+((d&&d.detail)||JSON.stringify(d)); }
   }).catch(function(e){ res.className="result err"; res.textContent="Network error: "+e; });
