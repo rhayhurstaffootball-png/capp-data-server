@@ -3353,6 +3353,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
     <button class="tab" onclick="showTab('gameday-tab', this)">Game Day</button>
     <button class="tab" onclick="showTab('playbook-tab', this)">Playbook</button>
     <button class="tab" onclick="showTab('pbcontent-tab', this)">Playbook Files</button>
+    <button class="tab" onclick="showTab('teams-tab', this)">Binder Teams</button>
   </div>
   <div class="main-area">
 
@@ -3585,6 +3586,44 @@ _ADMIN_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Binder Teams — the top of the multi-tenancy chain: create a team, seed
+         its first Team Admin, then hand off. Roster + content after that are
+         managed by that team's own admin/coaches, not from here. -->
+    <div class="panel" id="teams-tab">
+      <div class="card">
+        <h2>Create a team</h2>
+        <p class="small" style="margin-bottom:14px;">
+          <strong>Slug</strong> is permanent (used as the storage prefix — pick something short
+          and stable, e.g. <code>navy</code>). <strong>Name</strong> is what shows on their login
+          splash. After creating a team, seed its <strong>first Team Admin</strong> below — that
+          person signs in like any player, sets a password, then manages their own roster and can
+          promote more admins. Coaches never get roster access; that's the Team Admin's job only.
+        </p>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Team slug</label>
+            <input type="text" id="team-slug" placeholder="e.g. navy">
+          </div>
+          <div class="form-group">
+            <label>Team name</label>
+            <input type="text" id="team-name" placeholder="e.g. Navy Midshipmen">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="createBinderTeam()">Create team</button>
+        <div class="result" id="team-create-result"></div>
+      </div>
+      <div class="card">
+        <h2>Teams
+          <button class="btn btn-primary" onclick="loadBinderTeams()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">
+          Toggling a team inactive signs its players/coaches out on next check but keeps all their
+          data intact — nothing is deleted.
+        </p>
+        <div id="teams-table"><div class="loading">Loading...</div></div>
+      </div>
+    </div>
+
   </div><!-- end main-area -->
 </div><!-- end app -->
 
@@ -3751,6 +3790,7 @@ function showTab(id, btn) {
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
   if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); }
+  if (id === "teams-tab") loadBinderTeams();
   closeSlideout();
 }
 
@@ -4706,6 +4746,66 @@ function createPbFolder(){
 function deletePbFolder(id,path){
   if(!confirm('Remove the empty-folder entry "'+path+'"? (Any PDFs already uploaded there are NOT affected.)')) return;
   api("DELETE","/playbook/folders/"+id).then(function(){ loadPbFolders(); });
+}
+
+// ── Binder Teams — the top of the multi-tenancy chain ──────────────────────
+var _teams=[];
+function loadBinderTeams(){
+  var box=document.getElementById("teams-table");
+  box.innerHTML='<div class="loading">Loading...</div>';
+  api("GET","/playbook/teams").then(function(data){
+    if(!Array.isArray(data)){ box.innerHTML='<div class="loading">Error loading teams.</div>'; return; }
+    _teams=data; renderBinderTeams();
+  }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
+}
+
+function renderBinderTeams(){
+  var box=document.getElementById("teams-table");
+  if(!_teams.length){ box.innerHTML='<div class="loading">No teams yet — create one above.</div>'; return; }
+  var rows=_teams.map(function(t){
+    return '<tr>'
+      +'<td>'+pbEsc(t.name)+'</td>'
+      +'<td><code>'+pbEsc(t.slug)+'</code></td>'
+      +'<td>'+(t.active?'<span style="color:#4caf50">Active</span>':'<span style="color:#e05555">Inactive</span>')+'</td>'
+      +'<td>'
+        +'<button class="btn" style="font-size:12px;padding:4px 10px;margin-right:6px;" onclick="seedBinderTeamAdmin(\\''+t.id+'\\',\\''+pbEsc(t.name).replace(/'/g,"\\\\'")+'\\')">+ Seed admin</button>'
+        +'<button class="btn" style="font-size:12px;padding:4px 10px;" onclick="toggleBinderTeamActive(\\''+t.id+'\\','+(!t.active)+')">'+(t.active?'Deactivate':'Activate')+'</button>'
+      +'</td>'
+    +'</tr>';
+  }).join("");
+  box.innerHTML='<table><thead><tr><th>Name</th><th>Slug</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+
+function createBinderTeam(){
+  var res=document.getElementById("team-create-result");
+  var slug=(document.getElementById("team-slug").value||"").trim();
+  var name=(document.getElementById("team-name").value||"").trim();
+  if(!slug||!name){ res.className="result err"; res.textContent="Slug and name are both required."; return; }
+  res.className="result"; res.textContent="Creating...";
+  api("POST","/playbook/teams",{slug:slug,name:name}).then(function(d){
+    if(d && d.id){
+      res.className="result ok"; res.textContent='Created "'+name+'". Now seed its first admin below.';
+      document.getElementById("team-slug").value=""; document.getElementById("team-name").value="";
+      loadBinderTeams();
+    } else { res.className="result err"; res.textContent="Error: "+((d&&d.detail)||JSON.stringify(d)); }
+  }).catch(function(e){ res.className="result err"; res.textContent="Network error: "+e; });
+}
+
+function seedBinderTeamAdmin(teamId, teamName){
+  var email=prompt('First Team Admin for "'+teamName+'" — their email:');
+  if(!email) return;
+  email=email.trim();
+  if(!email || email.indexOf("@")<0){ alert("That doesn't look like a valid email."); return; }
+  var first=prompt("Their first name (optional):")||"";
+  var last=prompt("Their last name (optional):")||"";
+  api("POST","/playbook/teams/"+teamId+"/seed-admin",{email:email,first_name:first,last_name:last}).then(function(d){
+    if(d && d.id){ alert(email+" can now sign in at the Binder to set a password and manage "+teamName+"'s roster."); }
+    else { alert("Error: "+((d&&d.detail)||JSON.stringify(d))); }
+  }).catch(function(e){ alert("Network error: "+e); });
+}
+
+function toggleBinderTeamActive(teamId, makeActive){
+  api("PATCH","/playbook/teams/"+teamId,{active:makeActive}).then(function(){ loadBinderTeams(); });
 }
 </script>
 </body>
