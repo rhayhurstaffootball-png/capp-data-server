@@ -2491,6 +2491,25 @@ async def admin_pb_list_docs(team: str = "airforce"):
     return r.json()
 
 
+@app.get("/admin/api/playbook/access-log", dependencies=[Depends(_require_admin)])
+async def admin_pb_access_log(team: str = "airforce", limit: int = 200):
+    """Who viewed which doc and when — metadata only, NEVER file content. This
+    is the accountability record for the fact that the Owner has no code path
+    to view a team's PDFs directly; every legitimate in-app view is logged
+    here instead. (Roger, Jul 8 2026.)"""
+    t = await _team_get(slug=team)
+    if not t:
+        raise HTTPException(status_code=400, detail="Unknown team.")
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/playbook_access_log",
+                        params={"select": "email,doc_id,created_at", "team_id": f"eq.{t['id']}",
+                                "order": "created_at.desc", "limit": str(min(limit, 1000))},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
 @app.delete("/admin/api/playbook/docs/{doc_id}", dependencies=[Depends(_require_admin)])
 async def admin_pb_delete_doc(doc_id: str):
     async with httpx.AsyncClient() as c:
@@ -2597,7 +2616,10 @@ async def playbook_manifest(_u: dict = Depends(_require_player)):
 @app.get("/playbook/doc/{doc_id}/url")
 async def playbook_doc_url(doc_id: str, _u: dict = Depends(_require_player)):
     """Short-lived signed URL for one PDF — 404s if the doc isn't this player's
-    own team (never leaks whether the doc exists on another team)."""
+    own team (never leaks whether the doc exists on another team). Every issued
+    URL is logged (playbook_access_log) — permanent, who/what/when accountability
+    record. This is the ONLY code path anywhere that can produce a viewable link
+    for a doc's content, and it always requires a real rostered login."""
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                         params={"select": "r2_key,team_id", "id": f"eq.{doc_id}", "limit": "1"},
@@ -2605,6 +2627,13 @@ async def playbook_doc_url(doc_id: str, _u: dict = Depends(_require_player)):
     rows = g.json() if g.status_code == 200 else []
     if not rows or rows[0].get("team_id") != _u["team_id"]:
         raise HTTPException(status_code=404, detail="Not found.")
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{SUPABASE_URL}/rest/v1/playbook_access_log",
+                        json={"team_id": _u["team_id"], "doc_id": doc_id, "email": _u["email"]},
+                        headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    except Exception:
+        pass   # never let logging failure block a legitimate view
     return {"url": _r2_presign("GET", rows[0]["r2_key"], expires=600)}
 
 
@@ -3852,6 +3881,17 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <div class="result" id="pbc-replace-result"></div>
         <div id="pbcontent-table"><div class="loading">Loading...</div></div>
       </div>
+      <div class="card">
+        <h2>Access log
+          <button class="btn btn-primary" onclick="loadPbAccessLog()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">
+          Every time a player, coach, or team admin opens a PDF, it's logged here — who, which
+          file, and when. There is no button anywhere in this admin panel that opens a team's
+          PDF content directly; this log is the accountability record for that.
+        </p>
+        <div id="pbaccesslog-table"><div class="loading">Loading...</div></div>
+      </div>
     </div>
 
     <!-- Binder Teams — the top of the multi-tenancy chain: create a team, seed
@@ -4074,7 +4114,7 @@ function showTab(id, btn) {
   if (id === "crm-tab") loadProspects();
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
-  if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); }
+  if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); loadPbAccessLog(); }
   if (id === "teams-tab") { loadBinderTeams(); loadTeamLogoCatalog(); }
   closeSlideout();
 }
@@ -5031,6 +5071,25 @@ function createPbFolder(){
 function deletePbFolder(id,path){
   if(!confirm('Remove the empty-folder entry "'+path+'"? (Any PDFs already uploaded there are NOT affected.)')) return;
   api("DELETE","/playbook/folders/"+id).then(function(){ loadPbFolders(); });
+}
+
+// ── Access log — who viewed which PDF and when (metadata only) ────────────────
+function loadPbAccessLog(){
+  var box=document.getElementById("pbaccesslog-table");
+  box.innerHTML='<div class="loading">Loading...</div>';
+  Promise.all([api("GET","/playbook/access-log"), api("GET","/playbook/docs")]).then(function(res){
+    var log=res[0], docs=res[1];
+    if(!Array.isArray(log)){ box.innerHTML='<div class="loading">Error loading log.</div>'; return; }
+    if(!log.length){ box.innerHTML='<div class="loading">No views logged yet.</div>'; return; }
+    var titleById={};
+    if(Array.isArray(docs)) docs.forEach(function(d){ titleById[d.id]=(d.folder_path?d.folder_path+"/":"")+d.title; });
+    var rows=log.map(function(e){
+      var when=(e.created_at||"").replace("T"," ").slice(0,19);
+      return "<tr><td>"+pbEsc(e.email)+"</td><td>"+pbEsc(titleById[e.doc_id]||e.doc_id)+"</td><td>"+pbEsc(when)+"</td></tr>";
+    }).join("");
+    box.innerHTML='<table><thead><tr><th>Who</th><th>File</th><th>When</th></tr></thead><tbody>'+rows+'</tbody></table>'+
+      '<p class="small" style="margin-top:10px;">'+log.length+' most recent view(s).</p>';
+  }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
 }
 
 // ── Binder Teams — the top of the multi-tenancy chain ──────────────────────
