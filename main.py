@@ -1315,6 +1315,70 @@ def _supa_headers_json():
         "Content-Type": "application/json",
     }
 
+
+# ── Binder Wall #2 — Row-Level Security enforcement ─────────────────────────
+# _supa_headers_json() above uses the SERVICE-ROLE key, which BYPASSES Postgres
+# RLS by design (Supabase grants service_role the BYPASSRLS attribute). That's
+# correct for the Owner admin panel and the conversion worker (both are meant
+# to see across teams) but WRONG for player/coach/team-admin requests — those
+# must be enforced by the database itself, independent of the app's own
+# team_id filters (Wall #1), so a bug in application code can never leak
+# another team's data. "Total isolation... a data breach would ruin us."
+# (Roger, Jul 8 2026.)
+#
+# Mechanism: PostgREST accepts ANY JWT signed with the project's JWT secret —
+# not only ones issued by Supabase Auth. So for every team-scoped request we
+# mint a short-lived JWT carrying {role: authenticated, team_id: <caller's
+# team>}, and RLS policies (playbook_rls_policies.sql) check
+# auth.jwt()->>'team_id' against each row's team_id. The DB then physically
+# cannot return another team's rows to this request, no matter what filter
+# the Python code did or didn't apply.
+#
+# SAFE-BY-DEFAULT ROLLOUT: if SUPABASE_JWT_SECRET (or SUPABASE_ANON_KEY) isn't
+# set, _scoped_headers() silently falls back to the service-role key — i.e.
+# Wall #1 only, today's behavior, zero risk of breaking anything. Wall #2
+# switches ON automatically the moment both env vars are set on Render; no
+# code change needed at that point. Find both values in the Supabase
+# dashboard: Project Settings -> API -> "JWT Secret" and "anon public" key.
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+
+import hmac as _rls_hmac
+import base64 as _rls_b64
+
+
+def _sign_hs256(payload: dict, secret: str) -> str:
+    """Hand-rolled HS256 JWT (header+payload+sig, base64url, no padding) — no
+    new dependency, same pattern as this file's R2 SigV4 signer."""
+    header = {"alg": "HS256", "typ": "JWT"}
+    def _b64u(obj) -> str:
+        raw = json.dumps(obj, separators=(",", ":")).encode() if isinstance(obj, dict) else obj
+        return _rls_b64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    signing_input = f"{_b64u(header)}.{_b64u(payload)}".encode()
+    sig = _rls_hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+    sig_b64 = _rls_b64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+    return f"{signing_input.decode()}.{sig_b64}"
+
+
+def _scoped_headers(team_id: str) -> dict:
+    """Headers for a Supabase REST call that must be confined to ONE team by
+    the database itself (Wall #2), not just by the query filters we add in
+    Python (Wall #1). Falls back to the service key (Wall #1 only) if RLS
+    enforcement isn't configured yet — see the block comment above."""
+    if not SUPABASE_JWT_SECRET or not SUPABASE_ANON_KEY:
+        return _supa_headers_json()
+    now = int(time.time())
+    token = _sign_hs256(
+        {"role": "authenticated", "team_id": str(team_id), "iat": now, "exp": now + 120},
+        SUPABASE_JWT_SECRET,
+    )
+    return {
+        "Authorization": f"Bearer {token}",
+        "apikey": SUPABASE_ANON_KEY,
+        "Content-Type": "application/json",
+    }
+
+
 import secrets as _secrets
 import string as _string
 import re as _re
@@ -2409,11 +2473,11 @@ async def playbook_manifest(_u: dict = Depends(_require_player)):
                         params={"select": "id,folder_path,title,pages,sort_order,r2_key",
                                 "team_id": f"eq.{team_id}",
                                 "order": "folder_path.asc,sort_order.asc,title.asc"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(team_id))
         f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
                         params={"select": "folder_path", "team_id": f"eq.{team_id}",
                                 "order": "folder_path.asc"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(team_id))
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
     # Folders are additive; if the table doesn't exist yet, just omit them.
@@ -2436,7 +2500,7 @@ async def playbook_doc_url(doc_id: str, _u: dict = Depends(_require_player)):
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                         params={"select": "r2_key,team_id", "id": f"eq.{doc_id}", "limit": "1"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(_u["team_id"]))
     rows = g.json() if g.status_code == 200 else []
     if not rows or rows[0].get("team_id") != _u["team_id"]:
         raise HTTPException(status_code=404, detail="Not found.")
@@ -2707,7 +2771,7 @@ async def _doc_in_team(doc_id: str, team_id: str) -> bool:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                         params={"select": "id", "id": f"eq.{doc_id}",
                                 "team_id": f"eq.{team_id}", "limit": "1"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(team_id))
     return g.status_code == 200 and bool(g.json())
 
 
@@ -2726,7 +2790,7 @@ async def team_admin_roster(_u: dict = Depends(_require_team_admin)):
             params={"select": "id,email,first_name,last_name,position,pw_hash,is_admin,created_at",
                     "team_id": f"eq.{_u['team_id']}",
                     "order": "last_name.asc,first_name.asc"},
-            headers=_supa_headers_json(),
+            headers=_scoped_headers(_u["team_id"]),
         )
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
@@ -2767,7 +2831,7 @@ async def team_admin_roster_upload(payload: dict = Body(...), _u: dict = Depends
                 f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
                 params={"on_conflict": "email"},
                 json=row,
-                headers={**_supa_headers_json(),
+                headers={**_scoped_headers(team_id),
                          "Prefer": "resolution=merge-duplicates,return=minimal"},
             )
             if r.status_code in (200, 201, 204):
@@ -2786,13 +2850,13 @@ async def team_admin_roster_delete(uid: str, _u: dict = Depends(_require_team_ad
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
                         params={"select": "id", "id": f"eq.{uid}",
                                 "team_id": f"eq.{_u['team_id']}", "limit": "1"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(_u["team_id"]))
         if g.status_code != 200 or not g.json():
             raise HTTPException(status_code=404, detail="Not found.")
         r = await c.delete(
             f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
             params={"id": f"eq.{uid}"},
-            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+            headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=minimal"},
         )
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
@@ -2806,12 +2870,12 @@ async def team_admin_promote(uid: str, _u: dict = Depends(_require_team_admin)):
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
                         params={"select": "id", "id": f"eq.{uid}",
                                 "team_id": f"eq.{_u['team_id']}", "limit": "1"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(_u["team_id"]))
         if g.status_code != 200 or not g.json():
             raise HTTPException(status_code=404, detail="Not found.")
         r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
                           params={"id": f"eq.{uid}"}, json={"is_admin": True},
-                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+                          headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=minimal"})
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
@@ -2827,12 +2891,12 @@ async def team_admin_demote(uid: str, _u: dict = Depends(_require_team_admin)):
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
                         params={"select": "id", "id": f"eq.{uid}",
                                 "team_id": f"eq.{_u['team_id']}", "limit": "1"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(_u["team_id"]))
         if g.status_code != 200 or not g.json():
             raise HTTPException(status_code=404, detail="Not found.")
         r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
                           params={"id": f"eq.{uid}"}, json={"is_admin": False},
-                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+                          headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=minimal"})
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
@@ -2846,10 +2910,10 @@ async def coach_pb_folders(_u: dict = Depends(_require_coach)):
     async with httpx.AsyncClient() as c:
         d = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                         params={"select": "folder_path", "team_id": f"eq.{team_id}"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(team_id))
         f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
                         params={"select": "folder_path", "team_id": f"eq.{team_id}"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(team_id))
     paths = set()
     for resp in (d, f):
         if resp.status_code == 200:
@@ -2898,7 +2962,7 @@ async def coach_pb_create_doc(payload: dict = Body(...), _u: dict = Depends(_req
         raise HTTPException(status_code=400, detail="title and key are required.")
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}", json=row,
-                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+                         headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=representation"})
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
     return (r.json() or [{}])[0]
@@ -2915,7 +2979,7 @@ async def coach_pb_clear_finished_jobs(_u: dict = Depends(_require_coach)):
                         params={"select": "id,raw_key,out_key,status",
                                 "team_id": f"eq.{team_id}",
                                 "status": "in.(done,error)"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(team_id))
         rows = g.json() if g.status_code == 200 else []
         for j in rows:
             keys = [j.get("raw_key")]
@@ -2929,7 +2993,7 @@ async def coach_pb_clear_finished_jobs(_u: dict = Depends(_require_coach)):
                         pass
         r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
                            params={"team_id": f"eq.{team_id}", "status": "in.(done,error)"},
-                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+                           headers={**_scoped_headers(team_id), "Prefer": "return=minimal"})
         if r.status_code not in (200, 204):
             raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True, "cleared": len(rows)}
@@ -2945,7 +3009,7 @@ async def coach_pb_list_jobs(_u: dict = Depends(_require_coach)):
                         params={"select": "id,folder_path,title,ext,status,error,created_at",
                                 "team_id": f"eq.{_u['team_id']}",
                                 "order": "created_at.desc", "limit": "50"},
-                        headers=_supa_headers_json())
+                        headers=_scoped_headers(_u["team_id"]))
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
     return r.json()
@@ -2963,7 +3027,7 @@ async def coach_pb_move_doc(doc_id: str, payload: dict = Body(...), _u: dict = D
         r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                           params={"id": f"eq.{doc_id}"},
                           json={"folder_path": folder},
-                          headers={**_supa_headers_json(), "Prefer": "return=representation"})
+                          headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=representation"})
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     rows = r.json() if r.status_code == 200 else []
@@ -3000,7 +3064,7 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
         raise HTTPException(status_code=400, detail="title and key are required.")
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}", json=row,
-                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+                         headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=representation"})
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
     return (r.json() or [{}])[0]
