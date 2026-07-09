@@ -4,3 +4,4 @@ requests
 httpx
 websockets
 apscheduler
+pywebpush

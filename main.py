@@ -1457,6 +1457,85 @@ def _send_registration_email(to_email: str, to_name: str, username: str, school:
         s.sendmail(from_addr, [to_email], msg.as_string())
 
 
+# ── Binder playbook-update notifications — email + Web Push ─────────────────
+# Coach-triggered (never automatic): a "Send Notification" control on the
+# upload page lets a coach pick position(s), or All Team, and fire one
+# notification. No opt-in step — anyone signed in (web or the installed app)
+# is eligible; email always fires (everyone has one on file), push fires for
+# whichever of the recipient's devices have actually granted notification
+# permission (a hard browser/OS requirement, not something an app can skip).
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_CLAIMS_EMAIL = os.environ.get("VAPID_CLAIMS_EMAIL", "roger@cappvcs.com")
+
+
+def _send_playbook_update_email(to_email: str, to_name: str, team_name: str,
+                                 folder_path: str, message: str) -> None:
+    """Same SMTP pattern as _send_registration_email. Silently skips if SMTP
+    isn't configured — never blocks/breaks the notify request over this."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host = os.environ.get("SMTP_HOST", "")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    from_addr = os.environ.get("FROM_EMAIL", smtp_user)
+    if not smtp_host or not smtp_user or not smtp_pass:
+        return
+
+    first = (to_name.split() or [to_name])[0] if to_name else "there"
+    folder_line = f'New content in <strong style="color:#e8edf5;">{folder_path}</strong>.' if folder_path else "The playbook has been updated."
+    msg_line = f'<p style="color:#8b96a8;font-size:0.85rem;margin:16px 0 0;">{message}</p>' if message else ""
+    body_html = f"""
+    <div style="font-family:'Segoe UI',Arial,sans-serif;background:#070a0f;color:#e8edf5;padding:40px 0;">
+      <div style="max-width:480px;margin:0 auto;background:#111825;border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:36px;">
+        <div style="text-align:center;margin-bottom:24px;">
+          <img src="https://cappvcs.com/capplogo.png" alt="CAPP" style="height:36px;" />
+        </div>
+        <h2 style="color:#e8edf5;font-size:1.15rem;font-weight:700;margin:0 0 10px;">Hey {first} — the {team_name} playbook was just updated</h2>
+        <p style="color:#8b96a8;font-size:0.9rem;margin:0;">{folder_line}</p>
+        {msg_line}
+        <a href="https://www.cappvcs.com/binder/" style="display:inline-block;margin-top:22px;background:#0873EC;color:#fff;text-decoration:none;padding:10px 20px;border-radius:8px;font-size:0.85rem;font-weight:700;">Open the Binder</a>
+      </div>
+    </div>
+    """
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"{team_name} Playbook Updated"
+    msg["From"]    = f"CAPP Binder <{from_addr}>"
+    msg["To"]      = to_email
+    msg.attach(MIMEText(body_html, "html"))
+    with smtplib.SMTP(smtp_host, smtp_port) as s:
+        s.starttls()
+        s.login(smtp_user, smtp_pass)
+        s.sendmail(from_addr, [to_email], msg.as_string())
+
+
+def _send_push(sub: dict, title: str, body: str) -> str:
+    """Push one notification to one subscribed device. Returns "ok",
+    "expired" (dead subscription — 404/410, caller should delete the row),
+    "unconfigured" (VAPID keys not set), or "failed" (any other error)."""
+    if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
+        return "unconfigured"
+    try:
+        from pywebpush import webpush
+        webpush(
+            subscription_info={
+                "endpoint": sub["endpoint"],
+                "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]},
+            },
+            data=json.dumps({"title": title, "body": body, "url": "/binder/"}),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": f"mailto:{VAPID_CLAIMS_EMAIL}"},
+            ttl=86400,
+        )
+        return "ok"
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        return "expired" if status in (404, 410) else "failed"
+
+
 @app.post("/register")
 async def self_register(
     school:     str = Body(..., embed=True),
@@ -2278,6 +2357,14 @@ async def playbook_check(email: str = Body(..., embed=True)):
             "first_name": u.get("first_name", "")}
 
 
+@app.get("/vapid-public-key")
+async def vapid_public_key():
+    """Public by design — the VAPID public key identifies this app to push
+    services, same as a website's own domain; it's meant to be handed to any
+    browser subscribing to push, not a secret."""
+    return {"key": VAPID_PUBLIC_KEY}
+
+
 @app.post("/playbook/setup")
 async def playbook_setup(email: str = Body(..., embed=True),
                          password: str = Body(..., embed=True)):
@@ -2371,6 +2458,43 @@ async def _require_player(x_pb_token: str = Header("")):
     if not await _team_is_active(u["team_id"]):
         raise HTTPException(status_code=401, detail="This team's account is currently deactivated.")
     return u
+
+
+@app.post("/playbook/push/subscribe")
+async def playbook_push_subscribe(payload: dict = Body(...), _u: dict = Depends(_require_player)):
+    """Register (or refresh) this browser/device's push subscription. Upserts
+    on endpoint — a device re-subscribing (e.g. after clearing storage) just
+    updates its keys rather than creating a duplicate row."""
+    endpoint = (payload.get("endpoint") or "").strip()
+    keys = payload.get("keys") or {}
+    p256dh, auth = (keys.get("p256dh") or "").strip(), (keys.get("auth") or "").strip()
+    if not endpoint or not p256dh or not auth:
+        raise HTTPException(status_code=400, detail="endpoint and keys are required.")
+    row = {"team_id": _u["team_id"], "email": _u["email"],
+           "endpoint": endpoint, "p256dh": p256dh, "auth": auth}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/playbook_push_subscriptions",
+                         params={"on_conflict": "endpoint"}, json=row,
+                         headers={**_supa_headers_json(),
+                                  "Prefer": "resolution=merge-duplicates,return=minimal"})
+    if r.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.post("/playbook/push/unsubscribe")
+async def playbook_push_unsubscribe(payload: dict = Body(...), _u: dict = Depends(_require_player)):
+    """Remove this device's subscription (e.g. player turned notifications
+    off). Scoped to the caller's own email — can't unsubscribe someone else's
+    device even by guessing an endpoint string."""
+    endpoint = (payload.get("endpoint") or "").strip()
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/playbook_push_subscriptions",
+                           params={"endpoint": f"eq.{endpoint}", "email": f"eq.{_u['email']}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
 
 
 def _r2_presign(method: str, key: str, expires: int = 600) -> str:
@@ -3365,6 +3489,98 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
     return (r.json() or [{}])[0]
+
+
+@app.get("/coach/playbook/positions")
+async def coach_pb_positions(_u: dict = Depends(_require_coach)):
+    """Distinct, non-blank Position values actually on THIS team's roster —
+    drives the notification-target dropdown. No fixed list/guessing: whatever
+    the team's own CSV/roster says is exactly what shows up here."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "position", "team_id": f"eq.{_u['team_id']}"},
+                        headers=_scoped_headers(_u["team_id"]))
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    positions = sorted({(row.get("position") or "").strip() for row in r.json()} - {""})
+    return {"positions": positions}
+
+
+@app.post("/coach/playbook/notify")
+async def coach_pb_notify(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Manually-triggered notification (email + push) — a coach picks target
+    position(s) or All Team and fires it themselves; nothing here runs
+    automatically off an upload. No opt-in step: every matching roster member
+    gets the email (everyone has one on file); push reaches whichever of
+    their devices have an active subscription (granted via OS/browser
+    permission — the one part of this that can't be made fully automatic)."""
+    team_id = _u["team_id"]
+    positions = [p.strip() for p in (payload.get("positions") or []) if p and p.strip()]
+    all_team = bool(payload.get("all_team"))
+    folder_path = (payload.get("folder_path") or "").strip()
+    message = (payload.get("message") or "").strip()[:500]
+    if not all_team and not positions:
+        raise HTTPException(status_code=400, detail="Pick at least one position, or All Team.")
+
+    team = await _team_get(team_id=team_id)
+    team_name = (team or {}).get("name", "Your team")
+
+    async with httpx.AsyncClient() as c:
+        ur = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                         params={"select": "email,first_name,position", "team_id": f"eq.{team_id}"},
+                         headers=_scoped_headers(team_id))
+    if ur.status_code != 200:
+        raise HTTPException(status_code=500, detail=ur.text)
+    all_users = ur.json()
+    if all_team:
+        recipients = all_users
+    else:
+        wanted = {p.lower() for p in positions}
+        recipients = [u for u in all_users if (u.get("position") or "").strip().lower() in wanted]
+    if not recipients:
+        return {"ok": True, "recipients": 0, "emails_sent": 0, "push_sent": 0, "push_failed": 0}
+
+    title = f"{team_name} Playbook Updated"
+    body = (f"New content in {folder_path}." if folder_path else "The playbook has been updated.")
+    if message:
+        body += " " + message
+
+    emails_sent = 0
+    for u in recipients:
+        try:
+            _send_playbook_update_email(u["email"], u.get("first_name") or "", team_name, folder_path, message)
+            emails_sent += 1
+        except Exception:
+            pass   # best-effort — one bad address never blocks the rest
+
+    emails = {u["email"] for u in recipients}
+    async with httpx.AsyncClient() as c:
+        sr = await c.get(f"{SUPABASE_URL}/rest/v1/playbook_push_subscriptions",
+                         params={"select": "*", "team_id": f"eq.{team_id}"},
+                         headers=_scoped_headers(team_id))
+    subs = [s for s in (sr.json() if sr.status_code == 200 else []) if s.get("email") in emails]
+    push_sent = push_failed = 0
+    expired_ids = []
+    for sub in subs:
+        status = _send_push(sub, title, body)
+        if status == "ok":
+            push_sent += 1
+        elif status == "expired":
+            expired_ids.append(sub["id"])
+        else:
+            push_failed += 1
+    if expired_ids:
+        async with httpx.AsyncClient() as c:
+            for sid in expired_ids:
+                try:
+                    await c.delete(f"{SUPABASE_URL}/rest/v1/playbook_push_subscriptions",
+                                   params={"id": f"eq.{sid}"},
+                                   headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+                except Exception:
+                    pass
+
+    return {"ok": True, "recipients": len(recipients), "emails_sent": emails_sent,
+            "push_sent": push_sent, "push_failed": push_failed}
 
 
 @app.post("/playbook/worker/fail", dependencies=[Depends(_require_worker)])
