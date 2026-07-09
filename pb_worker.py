@@ -24,6 +24,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import socket
 import sys
 import tempfile
@@ -384,7 +385,120 @@ def _convert(ext: str, src: str, out: str) -> None:
         raise RuntimeError(f"unsupported extension: {ext}")
 
 
+def _label_for(base_label: str, j: int) -> str:
+    """Labels for a multi-page insert. A single play is the common case (j=0 →
+    the label as typed, e.g. '8-1'). If more than one page comes in, number them
+    from the label's trailing integer: '8-1' → 8-1, 8-2, 8-3."""
+    base_label = base_label or ""
+    if j == 0:
+        return base_label
+    m = re.search(r"(\d+)\s*$", base_label)
+    if m:
+        return base_label[:m.start(1)] + str(int(m.group(1)) + j)
+    return f"{base_label}-{j + 1}" if base_label else ""
+
+
+def _stamp_label(page, label: str) -> None:
+    """Draw one page-number label bottom-center in a small white pill — the SAME
+    style as the Visio Converter's booklet stamp (_stamp_page_numbers), so an
+    inserted play's number matches the numbers already printed on the section's
+    pages."""
+    if not label:
+        return
+    import fitz
+    r = page.rect
+    fs = 13
+    tw = fitz.get_text_length(label, fontname="helv", fontsize=fs)
+    cx = r.width / 2.0
+    baseline = r.height - 24
+    box = fitz.Rect(cx - tw / 2 - 6, baseline - fs - 1, cx + tw / 2 + 6, baseline + 4)
+    page.draw_rect(box, fill=(1, 1, 1), color=(0.7, 0.7, 0.7), width=0.4)
+    page.insert_text((cx - tw / 2, baseline), label,
+                     fontname="helv", fontsize=fs, color=(0, 0, 0))
+
+
+def _merge_insert(base_path, play_path, out_path, insert_after: int, label: str) -> None:
+    """Build base[0..P-1] + the play page(s) + base[P..end]. Each inserted page
+    is fit-centered onto the SECTION's page size (so it reads at the same
+    dimensions as the rest of the booklet) and stamped with its label."""
+    import fitz
+    base = fitz.open(base_path)
+    play = fitz.open(play_path)
+    try:
+        inserted = play.page_count
+        n = base.page_count
+        p = max(0, min(int(insert_after), n))
+        if n > 0:
+            br = base[min(p, n - 1)].rect
+            bw, bh = br.width, br.height
+        else:
+            pr = play[0].rect
+            bw, bh = pr.width, pr.height
+        out = fitz.open()
+        if p > 0:
+            out.insert_pdf(base, from_page=0, to_page=p - 1)
+        for j in range(play.page_count):
+            pg = out.new_page(width=bw, height=bh)
+            r = play[j].rect
+            scale = min(bw / r.width, bh / r.height) if r.width and r.height else 1.0
+            w, h = r.width * scale, r.height * scale
+            x, y = (bw - w) / 2.0, (bh - h) / 2.0
+            pg.show_pdf_page(fitz.Rect(x, y, x + w, y + h), play, j)
+            _stamp_label(pg, _label_for(label, j))
+        if p < n:
+            out.insert_pdf(base, from_page=p, to_page=n - 1)
+        out.save(out_path, deflate=True, garbage=3)
+        out.close()
+        return inserted
+    finally:
+        base.close()
+        play.close()
+
+
+def process_insert(claim: dict) -> None:
+    """An 'insert a play' job: convert the play (or pass a PDF straight through),
+    splice it into the target section at the chosen page, and repoint the section
+    at the merged PDF via /playbook/worker/insert-complete."""
+    job = claim["job"]
+    ext = (job.get("ext") or "").lower()
+    insert_after = int(job.get("insert_after") or 0)
+    label = job.get("label") or ""
+    base_url = claim.get("base_url")
+    if not base_url:
+        raise RuntimeError("insert job has no target section PDF")
+    log(f"  inserting a play into {job.get('folder_path','')}/{job.get('title','')} "
+        f"after page {insert_after} (label '{label}') ...")
+    with tempfile.TemporaryDirectory(prefix="pbinsert_") as tmp:
+        tmpp = pathlib.Path(tmp)
+        raw = tmpp / f"in.{ext or 'pdf'}"
+        http_get(claim["raw_url"], raw)
+        if ext == "pdf":
+            play = raw
+        else:
+            play = tmpp / "play.pdf"
+            try:
+                _convert(ext, str(raw), str(play))
+            except Exception as e:
+                log(f"  convert failed ({e}); retrying with a fresh Office instance...")
+                _reset_office()
+                _convert(ext, str(raw), str(play))
+            if not play.exists() or play.stat().st_size == 0:
+                raise RuntimeError("conversion produced no PDF")
+        base = tmpp / "base.pdf"
+        http_get(base_url, base)
+        out = tmpp / "out.pdf"
+        inserted = _merge_insert(base, play, out, insert_after, label)
+        http_put(claim["put_url"], out)
+        api("/playbook/worker/insert-complete",
+            {"job_id": job["id"], "pages": page_count(out),
+             "size": out.stat().st_size, "inserted": inserted})
+    log(f"  inserted: {job.get('title','')}")
+
+
 def process(claim: dict) -> None:
+    if (claim["job"].get("kind") or "convert") == "insert":
+        process_insert(claim)
+        return
     job = claim["job"]
     ext = (job.get("ext") or "").lower()
     title = job.get("title") or "untitled"

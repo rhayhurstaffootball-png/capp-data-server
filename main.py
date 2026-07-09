@@ -2930,13 +2930,33 @@ async def pb_worker_claim(payload: dict = Body(default={})):
     job = rows[0]
     out_key = f"{job['team_id']}/pdfs/{_uuid.uuid4().hex}.pdf"
     await _pb_job_patch(job["id"], {"out_key": out_key})
-    return {
-        "job": {"id": job["id"], "title": job.get("title"),
-                "folder_path": job.get("folder_path", ""), "ext": job.get("ext")},
+    kind = job.get("kind") or "convert"
+    job_out = {"id": job["id"], "title": job.get("title"),
+               "folder_path": job.get("folder_path", ""), "ext": job.get("ext"),
+               "kind": kind}
+    resp = {
+        "job": job_out,
         "raw_url": _r2_presign("GET", job["raw_key"], expires=1800),
         "out_key": out_key,
         "put_url": _r2_presign("PUT", out_key, expires=1800),
     }
+    if kind == "insert":
+        # An insert job also splices into an existing section: hand the worker a
+        # signed GET for that PDF plus where/what to stamp. (out_key/put_url is
+        # where the MERGED result goes; the doc is repointed at it on completion.)
+        job_out["insert_after"] = job.get("insert_after") or 0
+        job_out["label"] = job.get("label") or ""
+        job_out["target_doc_id"] = job.get("target_doc_id")
+        base_key = None
+        if job.get("target_doc_id"):
+            async with httpx.AsyncClient() as c:
+                gd = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                                 params={"select": "r2_key", "id": f"eq.{job['target_doc_id']}", "limit": "1"},
+                                 headers=_supa_headers_json())
+                if gd.status_code == 200 and gd.json():
+                    base_key = gd.json()[0].get("r2_key")
+        resp["base_url"] = _r2_presign("GET", base_key, expires=1800) if base_key else None
+    return resp
 
 
 @app.post("/playbook/worker/complete", dependencies=[Depends(_require_worker)])
@@ -2968,6 +2988,67 @@ async def pb_worker_complete(payload: dict = Body(...)):
     if d.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=d.text)
     doc_id = (d.json() or [{}])[0].get("id")
+    await _pb_job_patch(job_id, {"status": "done", "doc_id": doc_id,
+                                 "pages": payload.get("pages"),
+                                 "size_bytes": payload.get("size"), "error": None})
+    return {"ok": True, "doc_id": doc_id}
+
+
+@app.post("/playbook/worker/insert-complete", dependencies=[Depends(_require_worker)])
+async def pb_worker_insert_complete(payload: dict = Body(...)):
+    """Worker finished an 'insert' job: point the target section at the merged
+    PDF (SAME doc_id → the row keeps its tree spot, title, and player Touch
+    Notes) and shift those notes past the insert point so each note stays on
+    its play. This is Replace + a page-shift, not a new doc."""
+    job_id = (payload.get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id required.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "target_doc_id,out_key,insert_after,team_id",
+                                "id": f"eq.{job_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+        if g.status_code != 200 or not g.json():
+            raise HTTPException(status_code=404, detail="Job not found.")
+        job = g.json()[0]
+        doc_id = job.get("target_doc_id")
+        out_key = job.get("out_key")
+        insert_after = job.get("insert_after") or 0
+        if not doc_id or not out_key:
+            raise HTTPException(status_code=400, detail="Insert job missing target/output.")
+        gd = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                         params={"select": "r2_key,pages", "id": f"eq.{doc_id}", "limit": "1"},
+                         headers=_supa_headers_json())
+        if gd.status_code != 200 or not gd.json():
+            raise HTTPException(status_code=404, detail="Section not found.")
+        old = gd.json()[0]
+        old_key = old.get("r2_key")
+        new_pages = payload.get("pages")
+        # How many pages were spliced in — authoritative from the worker (the
+        # target's stored `pages` can be null for coach-uploaded PDFs, so don't
+        # derive it from new-minus-old). Fall back to that only if not sent.
+        inserted = payload.get("inserted")
+        if inserted is None:
+            old_pages = old.get("pages")
+            inserted = (new_pages - old_pages) if isinstance(new_pages, int) and isinstance(old_pages, int) else None
+        patch = {"r2_key": out_key, "size_bytes": payload.get("size"), "pages": new_pages}
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                          params={"id": f"eq.{doc_id}"}, json=patch,
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+        if inserted and inserted > 0:
+            try:
+                await c.post(f"{SUPABASE_URL}/rest/v1/rpc/shift_playbook_notes",
+                             json={"p_doc_id": doc_id, "p_after": insert_after, "p_shift": inserted},
+                             headers=_supa_headers_json())
+            except Exception:
+                pass    # notes shift is best-effort; the merged PDF is already live
+        if old_key and old_key != out_key:
+            try:
+                await c.delete(_r2_presign("DELETE", old_key, expires=300))
+            except Exception:
+                pass    # row already points at the merged PDF; orphaned object is harmless
     await _pb_job_patch(job_id, {"status": "done", "doc_id": doc_id,
                                  "pages": payload.get("pages"),
                                  "size_bytes": payload.get("size"), "error": None})
@@ -3483,6 +3564,70 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
     }
     if not row["title"] or not row["raw_key"]:
         raise HTTPException(status_code=400, detail="title and key are required.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}", json=row,
+                         headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.get("/coach/playbook/doc/{doc_id}/url")
+async def coach_pb_doc_url(doc_id: str, _u: dict = Depends(_require_coach)):
+    """Short-lived signed GET for one of THIS team's PDFs — used by the coach
+    page's Insert-Play thumbnail grid to render a section's pages. Team-scoped
+    (404s another team's doc); unlike the player doc-url this is a management
+    action, so it is deliberately NOT written to the player access log."""
+    if not await _doc_in_team(doc_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Not found.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "r2_key", "id": f"eq.{doc_id}", "limit": "1"},
+                        headers=_scoped_headers(_u["team_id"]))
+    if g.status_code != 200 or not g.json():
+        raise HTTPException(status_code=404, detail="Not found.")
+    return {"url": _r2_presign("GET", g.json()[0]["r2_key"], expires=600)}
+
+
+@app.post("/coach/playbook/insert")
+async def coach_pb_insert(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Queue an 'insert a play' job: splice a new play (PDF/PowerPoint/Visio,
+    already uploaded to R2) INTO an existing section at a chosen page, stamped
+    with a number like '8-1'. The worker converts (if needed), stamps, merges,
+    and repoints the section's PDF in place — same doc_id, so player Touch Notes
+    stay attached (notes past the insert point are shifted on completion).
+    team_id is always the coach's own; the section must be this team's."""
+    doc_id = (payload.get("doc_id") or "").strip()
+    if not doc_id or not await _doc_in_team(doc_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Section not found.")
+    ext = (payload.get("ext") or "").lower().lstrip(".")
+    if ext != "pdf" and ext not in _PB_CONVERT_EXTS:
+        raise HTTPException(status_code=400, detail="Only PDF, PowerPoint, or Visio files.")
+    raw_key = (payload.get("key") or "").strip()
+    if not raw_key:
+        raise HTTPException(status_code=400, detail="key is required.")
+    try:
+        insert_after = max(0, int(payload.get("insert_after")))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="insert_after must be a page number.")
+    label = (payload.get("label") or "").strip()[:40]
+    async with httpx.AsyncClient() as c:
+        gd = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                         params={"select": "folder_path,title", "id": f"eq.{doc_id}", "limit": "1"},
+                         headers=_scoped_headers(_u["team_id"]))
+    d = gd.json()[0] if gd.status_code == 200 and gd.json() else {}
+    row = {
+        "team_id":       _u["team_id"],
+        "raw_key":       raw_key,
+        "ext":           ext,
+        "kind":          "insert",
+        "target_doc_id": doc_id,
+        "insert_after":  insert_after,
+        "label":         label,
+        "folder_path":   d.get("folder_path") or "",
+        "title":         (d.get("title") or "section") + " ◀ insert" + (f" ({label})" if label else ""),
+        "status":        "queued",
+    }
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}", json=row,
                          headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=representation"})
