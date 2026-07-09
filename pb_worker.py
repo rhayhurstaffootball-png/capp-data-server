@@ -376,6 +376,24 @@ def normalize_pdf(pdf_path: pathlib.Path) -> None:
     log(f"  normalized {off_size} page(s) to {tw / 72:.1f} x {th / 72:.1f} in")
 
 
+def _number_pages(pdf_path) -> None:
+    """Stamp booklet page numbers 1..N bottom-center (white pill) on every page —
+    same style as _stamp_label / the Visio Converter's _stamp_page_numbers, so a
+    coach upload comes out numbered like the rest of the playbook. Each section
+    (this doc) is numbered on its own, starting at 1."""
+    import fitz
+    book = fitz.open(pdf_path)
+    try:
+        for i in range(book.page_count):
+            _stamp_label(book[i], str(i + 1))
+        tmp = str(pdf_path) + ".num"
+        book.save(tmp, deflate=True, garbage=3)
+    finally:
+        book.close()
+    os.replace(tmp, str(pdf_path))
+    log(f"  stamped page numbers 1-{page_count(pdf_path)}")
+
+
 def _convert(ext: str, src: str, out: str) -> None:
     if ext in ("vsd", "vsdx", "vsdm"):
         convert_visio(src, out)
@@ -501,21 +519,31 @@ def process(claim: dict) -> None:
         return
     job = claim["job"]
     ext = (job.get("ext") or "").lower()
+    number = bool(job.get("number"))
     title = job.get("title") or "untitled"
-    log(f"  converting [{ext}] {job.get('folder_path','')}/{title} ...")
+    log(f"  {'numbering' if ext == 'pdf' else 'converting'} [{ext}] "
+        f"{job.get('folder_path','')}/{title} ...")
     with tempfile.TemporaryDirectory(prefix="pbworker_") as tmp:
-        src = pathlib.Path(tmp) / f"in.{ext}"
         out = pathlib.Path(tmp) / "out.pdf"
-        http_get(claim["raw_url"], src)
-        try:
-            _convert(ext, str(src), str(out))
-        except Exception as e:
-            log(f"  convert failed ({e}); retrying with a fresh Office instance...")
-            _reset_office()
-            _convert(ext, str(src), str(out))
-        if not out.exists() or out.stat().st_size == 0:
-            raise RuntimeError("conversion produced no PDF")
+        if ext == "pdf":
+            # Already a PDF — no Office conversion, just (optionally) number it.
+            http_get(claim["raw_url"], out)
+            if not out.exists() or out.stat().st_size == 0:
+                raise RuntimeError("uploaded PDF was empty")
+        else:
+            src = pathlib.Path(tmp) / f"in.{ext}"
+            http_get(claim["raw_url"], src)
+            try:
+                _convert(ext, str(src), str(out))
+            except Exception as e:
+                log(f"  convert failed ({e}); retrying with a fresh Office instance...")
+                _reset_office()
+                _convert(ext, str(src), str(out))
+            if not out.exists() or out.stat().st_size == 0:
+                raise RuntimeError("conversion produced no PDF")
         normalize_pdf(out)
+        if number:
+            _number_pages(out)
         http_put(claim["put_url"], out)
         api("/playbook/worker/complete",
             {"job_id": job["id"], "pages": page_count(out), "size": out.stat().st_size})

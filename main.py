@@ -2933,7 +2933,7 @@ async def pb_worker_claim(payload: dict = Body(default={})):
     kind = job.get("kind") or "convert"
     job_out = {"id": job["id"], "title": job.get("title"),
                "folder_path": job.get("folder_path", ""), "ext": job.get("ext"),
-               "kind": kind}
+               "kind": kind, "number": bool(job.get("number"))}
     resp = {
         "job": job_out,
         "raw_url": _r2_presign("GET", job["raw_key"], expires=1800),
@@ -3549,15 +3549,19 @@ async def coach_pb_delete_doc(doc_id: str, _u: dict = Depends(_require_coach)):
 
 @app.post("/coach/playbook/jobs")
 async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
-    """Queue a coach-uploaded PowerPoint/Visio file for conversion, stamped with
-    the coach's own team_id (never client-supplied)."""
+    """Queue a coach upload for the worker — PowerPoint/Visio (converted to PDF)
+    or a PDF that needs page numbers stamped. Numbered 1..N by default (so the
+    playbook stays consistently numbered); the coach page's 'already numbered'
+    option sends number=false to skip the stamp. team_id is always the coach's
+    own (never client-supplied)."""
     ext = (payload.get("ext") or "").lower().lstrip(".")
-    if ext not in _PB_CONVERT_EXTS:
+    if ext != "pdf" and ext not in _PB_CONVERT_EXTS:
         raise HTTPException(status_code=400, detail="Not a convertible file.")
     row = {
         "team_id":     _u["team_id"],
         "raw_key":     (payload.get("key") or "").strip(),
         "ext":         ext,
+        "number":      bool(payload.get("number", True)),
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
         "title":       (payload.get("title") or "").strip(),
         "status":      "queued",
