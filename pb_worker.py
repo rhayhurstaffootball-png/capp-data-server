@@ -67,7 +67,66 @@ def _trim_log() -> None:
         pass
 
 
+# ── paired local worker (Jul 9 2026) ─────────────────────────────────────────
+# Each coach pairs THEIR OWN computer to THEIR OWN CAPP Binder login, once —
+# from then on the server only ever hands THIS worker jobs THAT coach uploaded
+# (never another coach's, even on the same team). See "BINDER LOCAL PLAN.txt".
+# The (future) one-click setup installer drops a one-time pairing_token.txt
+# next to this script before first launch; the worker exchanges it for its own
+# permanent device_token.json and never needs it again. A machine with neither
+# file falls back to the legacy shared PB_WORKER_TOKEN (.env) — that worker
+# only ever receives admin-panel-direct uploads (no coach to pair to), never a
+# coach's files.
+_DEVICE_TOKEN_PATH = _HERE / "device_token.json"
+_PAIRING_TOKEN_PATH = _HERE / "pairing_token.txt"
+
+
+def _load_device_token() -> str:
+    if not _DEVICE_TOKEN_PATH.exists():
+        return ""
+    try:
+        return json.loads(_DEVICE_TOKEN_PATH.read_text(encoding="utf-8")).get("worker_token", "")
+    except Exception:
+        return ""
+
+
+def _register_with_pairing_token() -> None:
+    """One-time: exchange the setup's pairing token for this machine's own
+    permanent device token. The pairing token is deleted either way (used or
+    invalid) so it can never be reused or copied onto a second machine."""
+    tok = _PAIRING_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    try:
+        req = urllib.request.Request(
+            SERVER + "/converter/register",
+            data=json.dumps({"pairing_token": tok, "device_name": WORKER_NAME}).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
+        device_token = data.get("worker_token")
+        if not device_token:
+            raise RuntimeError("server did not return a worker_token")
+        _DEVICE_TOKEN_PATH.write_text(json.dumps({"worker_token": device_token}), encoding="utf-8")
+        log("Paired this computer to your CAPP Binder login — it will only ever "
+            "convert YOUR OWN uploads.")
+    except Exception as e:
+        log(f"FATAL: pairing failed ({e}). Redo 'Complete Setup' from the Binder to try again.")
+        sys.exit(1)
+    finally:
+        try:
+            _PAIRING_TOKEN_PATH.unlink()
+        except Exception:
+            pass
+
+
 def _worker_token() -> str:
+    saved = _load_device_token()
+    if saved:
+        return saved
+    if _PAIRING_TOKEN_PATH.exists():
+        _register_with_pairing_token()
+        saved = _load_device_token()
+        if saved:
+            return saved
     tok = os.environ.get("PB_WORKER_TOKEN", "")
     if not tok and _ENV_PATH.exists():
         for line in _ENV_PATH.read_text().splitlines():
@@ -75,7 +134,9 @@ def _worker_token() -> str:
             if line.startswith("PB_WORKER_TOKEN") and "=" in line:
                 tok = line.split("=", 1)[1].strip().strip('"').strip("'")
     if not tok:
-        log("FATAL: PB_WORKER_TOKEN not set (env var or .env next to this script).")
+        log("FATAL: this computer isn't paired (no device_token.json / pairing_token.txt) "
+            "and no PB_WORKER_TOKEN is set. Run 'Complete Setup' from the Binder to pair "
+            "it to your login, or set PB_WORKER_TOKEN in .env for the legacy shared worker.")
         sys.exit(1)
     return tok
 

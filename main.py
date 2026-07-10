@@ -2814,13 +2814,53 @@ async def playbook_notes_put(doc_id: str, page: int, payload: dict = Body(...),
 # worker (or a LibreOffice fallback worker) claims it, converts to PDF, uploads
 # to R2, and the finished PDF is registered as a normal playbook_docs row.
 _PB_JOBS = "playbook_jobs"
+_PB_DEVICES = "playbook_converter_devices"
+_PB_PAIR_TOKENS = "playbook_converter_pairing_tokens"
 PB_WORKER_TOKEN = os.environ.get("PB_WORKER_TOKEN", "")
 _PB_CONVERT_EXTS = ("vsd", "vsdx", "vsdm", "ppt", "pptx")   # worker converts these to PDF
 
 
-def _require_worker(x_worker_token: str = Header("")):
-    if not PB_WORKER_TOKEN or x_worker_token != PB_WORKER_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized worker")
+async def _pb_device_by_token(token: str):
+    """Look up a paired local worker by its own device token (issued at pairing
+    time — see /converter/register). Returns the device row or None."""
+    if not token:
+        return None
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                        params={"select": "id,email,team_id", "token": f"eq.{token}", "limit": "1"},
+                        headers=_supa_headers_json())
+    return r.json()[0] if r.status_code == 200 and r.json() else None
+
+
+async def _worker_identity(x_worker_token: str = Header("")):
+    """Every worker call authenticates with EITHER the legacy shared
+    PB_WORKER_TOKEN (used only for admin-panel-direct uploads, which have no
+    coach identity to pair to) OR its own per-device token from pairing.
+    Returns which kind of worker this is and, for a paired worker, the login
+    it's scoped to — the claim endpoint uses this to make sure a worker only
+    ever picks up ITS OWN paired coach's jobs, never another coach's, even on
+    the same team."""
+    if PB_WORKER_TOKEN and x_worker_token == PB_WORKER_TOKEN:
+        return {"kind": "legacy", "email": None}
+    dev = await _pb_device_by_token(x_worker_token)
+    if dev:
+        try:
+            async with httpx.AsyncClient() as c:
+                await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                              params={"id": f"eq.{dev['id']}"},
+                              json={"last_seen_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
+                              headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        except Exception:
+            pass    # heartbeat is best-effort; never blocks the claim
+        return {"kind": "paired", "email": dev["email"], "team_id": dev["team_id"]}
+    raise HTTPException(status_code=401, detail="Unauthorized worker")
+
+
+async def _require_worker(x_worker_token: str = Header("")):
+    """Validity-only guard for the completion/error endpoints (they already
+    operate on a job_id the worker only knows because it claimed that job
+    itself) — accepts the legacy shared token or any paired device token."""
+    await _worker_identity(x_worker_token)
 
 
 @app.post("/admin/api/playbook/jobs/sign-upload", dependencies=[Depends(_require_admin)])
@@ -2913,15 +2953,20 @@ async def _pb_job_patch(job_id: str, fields: dict):
         raise HTTPException(status_code=500, detail=r.text)
 
 
-@app.post("/playbook/worker/claim", dependencies=[Depends(_require_worker)])
-async def pb_worker_claim(payload: dict = Body(default={})):
+@app.post("/playbook/worker/claim")
+async def pb_worker_claim(payload: dict = Body(default={}), _wid: dict = Depends(_worker_identity)):
     """Hand the next queued job to a worker: returns the job plus a signed GET for
-    the raw Visio file and a signed PUT for where to drop the converted PDF."""
+    the raw Visio file and a signed PUT for where to drop the converted PDF.
+    SCOPED (Jul 9 2026 — paired local workers): a legacy shared-token worker
+    only gets jobs with no coach uploader (admin-panel-direct uploads); a
+    paired worker only ever gets jobs uploaded by ITS OWN paired login — never
+    another coach's, even on the same team. See BINDER LOCAL PLAN.txt."""
     import uuid as _uuid
     worker = (payload.get("worker") or "worker").strip()[:64]
     async with httpx.AsyncClient() as c:
-        r = await c.post(f"{SUPABASE_URL}/rest/v1/rpc/claim_playbook_job",
-                         json={"p_worker": worker}, headers=_supa_headers_json())
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/rpc/claim_playbook_job_scoped",
+                         json={"p_worker": worker, "p_uploader_email": _wid.get("email")},
+                         headers=_supa_headers_json())
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
     rows = r.json() or []
@@ -3561,6 +3606,7 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
         "team_id":     _u["team_id"],
         "raw_key":     (payload.get("key") or "").strip(),
         "ext":         ext,
+        "uploader_email": _u["email"],   # scopes the claim to THIS coach's own paired worker
         "number":      bool(payload.get("number", True)),
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
         "title":       (payload.get("title") or "").strip(),
@@ -3624,6 +3670,7 @@ async def coach_pb_insert(payload: dict = Body(...), _u: dict = Depends(_require
         "team_id":       _u["team_id"],
         "raw_key":       raw_key,
         "ext":           ext,
+        "uploader_email": _u["email"],   # scopes the claim to THIS coach's own paired worker
         "kind":          "insert",
         "target_doc_id": doc_id,
         "insert_after":  insert_after,
@@ -3638,6 +3685,81 @@ async def coach_pb_insert(payload: dict = Body(...), _u: dict = Depends(_require
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
     return (r.json() or [{}])[0]
+
+
+@app.post("/coach/playbook/converter/pair-token")
+async def coach_pb_pair_token(_u: dict = Depends(_require_coach)):
+    """Mint a short-lived, single-use pairing token for THIS logged-in coach.
+    The downloaded local worker setup exchanges it once (via /converter/register)
+    for its own permanent device credential — the coach never re-enters
+    credentials. See BINDER LOCAL PLAN.txt."""
+    import secrets
+    tok = secrets.token_urlsafe(24)
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_PAIR_TOKENS}",
+                         json={"token": tok, "email": _u["email"], "team_id": _u["team_id"]},
+                         headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"pairing_token": tok}
+
+
+@app.get("/coach/playbook/converter/status")
+async def coach_pb_converter_status(_u: dict = Depends(_require_coach)):
+    """Is a local conversion worker paired to THIS coach's own login, and has
+    it checked in recently? Drives the one-time-setup prompt on a
+    PowerPoint/Visio upload (a coach who only ever uploads PDFs never needs it)."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                        params={"select": "device_name,last_seen_at", "email": f"eq.{_u['email']}",
+                                "order": "paired_at.desc", "limit": "1"},
+                        headers=_supa_headers_json())
+    rows = r.json() if r.status_code == 200 else []
+    if not rows:
+        return {"paired": False, "online": False}
+    last_seen = rows[0].get("last_seen_at")
+    online = False
+    if last_seen:
+        try:
+            dt = _dtmod.datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+            online = (_dtmod.datetime.now(_dtmod.timezone.utc) - dt).total_seconds() < 300
+        except Exception:
+            online = False
+    return {"paired": True, "online": online, "device_name": rows[0].get("device_name")}
+
+
+@app.post("/converter/register")
+async def converter_register(payload: dict = Body(...)):
+    """The local worker's one-time step: exchange a pairing token (minted by an
+    already-signed-in coach) for its own permanent device token. No login here
+    — the one-time token IS the proof of identity, and it's consumed on first
+    use so it can't be replayed onto a second machine."""
+    import secrets
+    tok = (payload.get("pairing_token") or "").strip()
+    device_name = (payload.get("device_name") or "")[:120]
+    if not tok:
+        raise HTTPException(status_code=400, detail="pairing_token is required.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_PAIR_TOKENS}",
+                        params={"select": "email,team_id,used_at", "token": f"eq.{tok}", "limit": "1"},
+                        headers=_supa_headers_json())
+        rows = g.json() if g.status_code == 200 else []
+        if not rows or rows[0].get("used_at"):
+            raise HTTPException(status_code=401, detail="This setup link is invalid or already used.")
+        claim = rows[0]
+        device_token = secrets.token_urlsafe(32)
+        d = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                         json={"email": claim["email"], "team_id": claim["team_id"],
+                               "device_name": device_name, "token": device_token,
+                               "last_seen_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
+                         headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if d.status_code not in (200, 201, 204):
+            raise HTTPException(status_code=500, detail=d.text)
+        await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_PAIR_TOKENS}",
+                     params={"token": f"eq.{tok}"},
+                     json={"used_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
+                     headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    return {"worker_token": device_token}
 
 
 @app.get("/coach/playbook/positions")
