@@ -665,6 +665,18 @@ def main() -> None:
                 f"({_VTP_DIR}\\Fonts)")
         except Exception as e:
             log(f"(session font load failed: {e})")
+    # Prime Visio once, quietly, before the first real job ever reaches it.
+    # The very first Visio.Application launch in this process's lifetime can
+    # lose a one-time COM marshaling race ("Property 'Visio.Application.
+    # Visible' can not be set") no matter how long _get_visio() retries —
+    # but that race only ever happens once per process, pass or fail. Eating
+    # that failure here means the first real upload never sees it, instead
+    # of it landing on whichever file happens to be queued first.
+    try:
+        _get_visio()
+        log("Visio primed and ready.")
+    except Exception as e:
+        log(f"(Visio priming hit the known first-launch hiccup, as expected: {e} — now warmed up for real jobs)")
     while True:
         try:
             claim = api("/playbook/worker/claim", {"worker": WORKER_NAME})
