@@ -330,8 +330,28 @@ def _get_visio():
         import win32com.client
         log("starting Visio (kept warm for later jobs)...")
         _VISIO = win32com.client.Dispatch("Visio.Application")
-        _VISIO.Visible = False
-        _VISIO.AlertResponse = 1          # auto-answer any modal prompt with OK
+        # Visio's automation endpoint isn't always fully up the instant
+        # Dispatch() returns (worse on a cold machine where Visio.exe is
+        # still spinning up) — setting a property right away can throw
+        # "Property 'Visio.Application.Visible' can not be set." Retry
+        # briefly instead of failing the whole job on a timing race.
+        last_err = None
+        for _attempt in range(10):
+            try:
+                _VISIO.Visible = False
+                _VISIO.AlertResponse = 1  # auto-answer any modal prompt with OK
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5)
+        if last_err is not None:
+            try:
+                _VISIO.Quit()
+            except Exception:
+                pass
+            _VISIO = None
+            raise RuntimeError(f"Visio did not become ready in time ({last_err})")
     return _VISIO
 
 
