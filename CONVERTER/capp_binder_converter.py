@@ -478,19 +478,22 @@ _VISIO = None
 _PP = None
 
 
+_VISIO_FAIL_STREAK = 0
+
+
 def _get_visio():
-    global _VISIO
+    global _VISIO, _VISIO_FAIL_STREAK
     if _VISIO is None:
         import win32com.client
         log("starting Visio (kept warm for later jobs)...")
         _VISIO = win32com.client.Dispatch("Visio.Application")
         # Visio's automation endpoint isn't always fully up the instant
-        # Dispatch() returns (worse on a cold machine where Visio.exe is
-        # still spinning up) — setting a property right away can throw
-        # "Property 'Visio.Application.Visible' can not be set." Retry
-        # briefly instead of failing the whole job on a timing race.
+        # Dispatch() returns — worse right after a previous instance was
+        # just quit, since a rapid relaunch can briefly trip up Office's own
+        # licensing/activation check. Retry for up to ~20s before giving up
+        # (was ~5s — too short for that check to clear on a busy machine).
         last_err = None
-        for _attempt in range(10):
+        for _attempt in range(40):
             try:
                 _VISIO.Visible = False
                 _VISIO.AlertResponse = 1
@@ -505,7 +508,14 @@ def _get_visio():
             except Exception:
                 pass
             _VISIO = None
-            raise RuntimeError(f"Visio did not become ready in time ({last_err})")
+            _VISIO_FAIL_STREAK += 1
+            hint = ""
+            if _VISIO_FAIL_STREAK >= 3:
+                hint = (" — this has failed 3+ times in a row now; if it keeps "
+                        "happening, open Visio directly on this PC and check "
+                        "File > Account for its activation status.")
+            raise RuntimeError(f"Visio did not become ready in time ({last_err}){hint}")
+        _VISIO_FAIL_STREAK = 0
     return _VISIO
 
 
@@ -688,6 +698,23 @@ def _convert(ext: str, src: str, out: str) -> None:
         raise RuntimeError(f"unsupported extension: {ext}")
 
 
+def _convert_with_retry(ext: str, src: str, out: str) -> None:
+    """One retry with a fresh Office instance on failure — paced with a short
+    pause first. Several files landing at once used to cause back-to-back
+    instant Visio kill+relaunch cycles (this retry stacked on top of
+    _get_visio()'s own retry-then-relaunch), which made a transient
+    licensing-check hiccup on the machine worse, not better. A few seconds'
+    breathing room before tearing down and relaunching gives that check a
+    chance to actually clear instead of getting hit again immediately."""
+    try:
+        _convert(ext, src, out)
+    except Exception as e:
+        log(f"  convert failed ({e}); pausing before retrying with a fresh Office instance...")
+        time.sleep(3)
+        _reset_office()
+        _convert(ext, src, out)
+
+
 def process_insert(claim: dict) -> None:
     job = claim["job"]
     ext = (job.get("ext") or "").lower()
@@ -706,12 +733,7 @@ def process_insert(claim: dict) -> None:
             play = raw
         else:
             play = tmpp / "play.pdf"
-            try:
-                _convert(ext, str(raw), str(play))
-            except Exception as e:
-                log(f"  convert failed ({e}); retrying with a fresh Office instance...")
-                _reset_office()
-                _convert(ext, str(raw), str(play))
+            _convert_with_retry(ext, str(raw), str(play))
             if not play.exists() or play.stat().st_size == 0:
                 raise RuntimeError("conversion produced no PDF")
         base = tmpp / "base.pdf"
@@ -744,12 +766,7 @@ def process(claim: dict) -> None:
         else:
             src = pathlib.Path(tmp) / f"in.{ext}"
             http_get(claim["raw_url"], src)
-            try:
-                _convert(ext, str(src), str(out))
-            except Exception as e:
-                log(f"  convert failed ({e}); retrying with a fresh Office instance...")
-                _reset_office()
-                _convert(ext, str(src), str(out))
+            _convert_with_retry(ext, str(src), str(out))
             if not out.exists() or out.stat().st_size == 0:
                 raise RuntimeError("conversion produced no PDF")
         normalize_pdf(out)
