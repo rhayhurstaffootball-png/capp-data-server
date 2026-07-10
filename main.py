@@ -3771,9 +3771,21 @@ async def converter_register(payload: dict = Body(...)):
                          json={"email": claim["email"], "team_id": claim["team_id"],
                                "device_name": device_name, "token": device_token,
                                "last_seen_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
-                         headers={**_supa_headers_json(), "Prefer": "return=minimal"})
-        if d.status_code not in (200, 201, 204):
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+        if d.status_code not in (200, 201):
             raise HTTPException(status_code=500, detail=d.text)
+        new_id = (d.json() or [{}])[0].get("id")
+        # Enforce ONE active device per coach — pairing a new computer
+        # replaces any previous one. Jobs are scoped by coach email, not by
+        # device, so a coach with two live paired devices had jobs split
+        # unpredictably between them (real incident, Jul 10 2026 — see
+        # MEMORY.md "Binder Converter — paired local worker architecture").
+        # The stale device's local worker will just start getting rejected
+        # on its next claim attempt; it isn't reachable from here to notify.
+        if new_id:
+            await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                           params={"email": f"eq.{claim['email']}", "id": f"neq.{new_id}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
         await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_PAIR_TOKENS}",
                      params={"token": f"eq.{tok}"},
                      json={"used_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
