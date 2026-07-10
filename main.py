@@ -852,6 +852,22 @@ async def agent_download():
     """Public signed URL for CAPPNodes_Agent.exe — no auth required."""
     return {"download_url": await _signed_url("shared/CAPPNodes_Agent.exe")}
 
+
+@app.get("/converter/download")
+async def converter_download():
+    """Public signed URL for CAPP_Binder_Converter.exe — the per-coach local
+    conversion worker (see BINDER LOCAL PLAN.txt). No auth required — the
+    Binder's 'Complete Setup' screen downloads this alongside a one-time
+    pairing token for the currently-signed-in coach."""
+    return {"download_url": await _signed_url("shared/CAPP_Binder_Converter.exe")}
+
+
+@app.get("/converter/version")
+def converter_version():
+    """Public — current CAPP Binder Converter version. Bump CONVERTER_VERSION
+    on Render when a new CAPP_Binder_Converter.exe is uploaded."""
+    return {"version": os.environ.get("CONVERTER_VERSION", "1.0.0")}
+
 @app.post("/db/update", dependencies=[Depends(verify_api_key)])
 def db_force_update():
     """
