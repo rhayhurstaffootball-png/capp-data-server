@@ -226,11 +226,34 @@ def _register_autostart(exe_path: pathlib.Path) -> None:
 _self_install_if_needed()
 
 # ── single instance guard (second launch exits quietly) ─────────────────────
-_guard = socket.socket()
+# A named Windows mutex, not a loopback socket bind — real-world testing
+# showed two copies (a coach re-running "Complete Setup" while an older
+# instance was still alive) BOTH ending up alive and BOTH polling for jobs,
+# each with its own separate never-primed Visio state — which is what was
+# actually causing seemingly-random single-file failures in a batch (the job
+# claimed by the "invisible" second instance hit its own cold-start race).
+# A named mutex is the standard, reliable Windows single-instance primitive:
+# the OS itself guarantees only one process can hold it, and releases it
+# automatically even if a process is killed rather than exiting cleanly —
+# a loopback socket can also do this, but is more exposed to interference
+# from VPN/EDR/security software intercepting or virtualizing localhost,
+# which is a real concern on a managed/military machine.
 try:
-    _guard.bind(("127.0.0.1", 47654))   # different port than pb_worker.py's 47653 — both can run on the same PC
-except OSError:
-    sys.exit(0)
+    import win32api
+    import win32event
+    import winerror
+    _guard = win32event.CreateMutex(None, False, "Global\\CAPPBinderConverterSingleton")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        sys.exit(0)
+except ImportError:
+    # pywin32 not available (dev/source run only, never in the frozen EXE) —
+    # fall back to the old loopback-socket guard so `python capp_binder_
+    # converter.py` still behaves sanely for local testing.
+    _guard = socket.socket()
+    try:
+        _guard.bind(("127.0.0.1", 47654))
+    except OSError:
+        sys.exit(0)
 
 
 # ── paired identity ───────────────────────────────────────────────────────────

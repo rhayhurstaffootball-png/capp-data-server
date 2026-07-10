@@ -41,11 +41,24 @@ _ENV_PATH = _HERE / ".env"
 _LOG_PATH = _HERE / "pb_worker.log"
 
 # ── single instance guard (second launch exits quietly) ─────────────────────
-_guard = socket.socket()
+# Named Windows mutex instead of a loopback socket bind — see the matching
+# comment in CONVERTER/capp_binder_converter.py for why: a socket bind
+# didn't reliably stop two copies from ending up alive at once, and two
+# copies each with their own separate, never-primed Visio state was the
+# real cause behind seemingly-random single-file failures in a batch.
 try:
-    _guard.bind(("127.0.0.1", 47653))
-except OSError:
-    sys.exit(0)
+    import win32api
+    import win32event
+    import winerror
+    _guard = win32event.CreateMutex(None, False, "Global\\CAPPBinderPBWorkerSingleton")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        sys.exit(0)
+except ImportError:
+    _guard = socket.socket()
+    try:
+        _guard.bind(("127.0.0.1", 47653))
+    except OSError:
+        sys.exit(0)
 
 
 def log(msg: str) -> None:
