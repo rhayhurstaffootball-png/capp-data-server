@@ -74,12 +74,38 @@ def _trim_log() -> None:
 
 # ── one-time self-install (frozen only) ──────────────────────────────────────
 # A coach double-clicks the downloaded EXE from wherever their browser put it
-# (usually Downloads). First launch: copy itself into the stable per-user
-# folder, pick up a pairing_token.txt sitting next to the downloaded EXE (the
-# Complete Setup screen downloads both files to the same place), register to
-# auto-start with Windows (HKCU Run key — no admin rights needed), relaunch
-# the installed copy, and exit this one. Every launch after that is already
-# running from _APP_DIR, so this is a no-op.
+# (usually Downloads/Desktop). The "Complete Setup" screen embeds the coach's
+# one-time pairing token INTO the downloaded EXE's own bytes (see the relay's
+# /converter/download?t=... route) — there is no separate pairing_token.txt
+# download anymore. First launch: pull the token out of this file's own
+# trailing bytes, copy the CLEAN (token-stripped) bytes into the stable
+# per-user folder so the permanent install never carries the secret, relaunch
+# that installed copy passing the token as a one-time startup argument,
+# register to auto-start with Windows (HKCU Run key — no admin rights
+# needed), and exit this one — which then gets deleted from Downloads a
+# couple seconds later. Every launch after that is already running from
+# _APP_DIR, so this whole function is a no-op.
+#
+# A pairing_token.txt file next to the EXE (the OLD flow) is still honored as
+# a fallback for manual/admin use, so nothing breaks if someone drops one in
+# by hand.
+_PAIR_MARKER = b"\n<<CAPP_PAIR_TOKEN>>"
+
+
+def _extract_embedded_token(exe_path: pathlib.Path) -> str | None:
+    """Read this EXE's own trailing bytes for an embedded pairing token.
+    Returns (token, marker_offset) via a 2-tuple, or (None, None) if absent."""
+    try:
+        data = exe_path.read_bytes()
+    except OSError:
+        return None, None
+    idx = data.rfind(_PAIR_MARKER)
+    if idx == -1:
+        return None, None
+    tok = data[idx + len(_PAIR_MARKER):].decode("utf-8", errors="ignore").strip()
+    return (tok, idx) if tok else (None, None)
+
+
 def _find_downloaded_token(folder: pathlib.Path) -> pathlib.Path | None:
     """A pairing_token.txt downloaded alongside the EXE lands in the same
     folder as the EXE itself (browser default download location). If the
@@ -119,11 +145,28 @@ def _self_install_if_needed() -> None:
     if exe_path == installed_path:
         return   # already running from the installed location
     log(f"First launch from {exe_path} — installing to {installed_path} ...")
+    embedded_token, marker_offset = _extract_embedded_token(exe_path)
     try:
-        shutil.copy2(exe_path, installed_path)
+        if marker_offset is not None:
+            # Copy only the clean EXE bytes (drop the embedded token) so the
+            # permanent installed copy never carries the secret on disk.
+            with open(exe_path, "rb") as src, open(installed_path, "wb") as dst:
+                remaining = marker_offset
+                while remaining > 0:
+                    chunk = src.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    remaining -= len(chunk)
+            shutil.copystat(exe_path, installed_path)
+        else:
+            shutil.copy2(exe_path, installed_path)
     except Exception as e:
         log(f"FATAL: could not install to {installed_path}: {e}")
         sys.exit(1)
+    # Legacy fallback: a pairing_token.txt dropped next to the EXE by hand
+    # (or by an older build of the Binder setup screen). Glob for any
+    # variant since a repeat download gets suffixed "pairing_token (1).txt".
     stray_tokens = []
     try:
         stray_tokens = list(exe_path.parent.glob("pairing_token*.txt"))
@@ -135,8 +178,6 @@ def _self_install_if_needed() -> None:
             shutil.move(str(newest_token), str(_PAIRING_TOKEN_PATH))
         except Exception as e:
             log(f"(couldn't move {newest_token.name} into place: {e})")
-    # Sweep any other leftover token copies (older re-download attempts) out
-    # of the coach's Downloads folder — they're either stale or superseded.
     for t in stray_tokens:
         if t.exists():
             try:
@@ -146,7 +187,20 @@ def _self_install_if_needed() -> None:
     _register_autostart(installed_path)
     log("Installed. Launching the installed copy and exiting this one...")
     try:
-        os.startfile(str(installed_path))   # detached — survives this process exiting
+        if embedded_token:
+            # Hand the token to the fresh process as a startup argument
+            # instead of a file — it's consumed by a single HTTP call within
+            # a second of launch and never touches disk. (The only residual
+            # exposure is that the token is briefly visible in this
+            # process's command line, e.g. to Task Manager, for that same
+            # second — an acceptable trade against a file that would
+            # otherwise sit in Downloads indefinitely.)
+            import subprocess
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen([str(installed_path), "--pair-token", embedded_token],
+                             creationflags=CREATE_NO_WINDOW, close_fds=True)
+        else:
+            os.startfile(str(installed_path))   # detached — survives this process exiting
     except Exception as e:
         log(f"FATAL: could not launch installed copy: {e}")
         sys.exit(1)
@@ -192,8 +246,7 @@ def _load_device_token() -> str:
         return ""
 
 
-def _register_with_pairing_token() -> None:
-    tok = _PAIRING_TOKEN_PATH.read_text(encoding="utf-8").strip()
+def _register_with_token(tok: str) -> None:
     try:
         req = urllib.request.Request(
             SERVER + "/converter/register",
@@ -210,6 +263,15 @@ def _register_with_pairing_token() -> None:
     except Exception as e:
         log(f"FATAL: pairing failed ({e}). Redo 'Complete Setup' from the Binder to try again.")
         sys.exit(1)
+
+
+def _register_with_pairing_token_file() -> None:
+    """Legacy/fallback path: a pairing_token.txt was dropped next to this
+    install by hand (or by an older Binder build). Not used by the normal
+    coach flow anymore — that hands the token in via --pair-token instead."""
+    tok = _PAIRING_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    try:
+        _register_with_token(tok)
     finally:
         try:
             _PAIRING_TOKEN_PATH.unlink()
@@ -221,12 +283,20 @@ def _worker_token() -> str:
     saved = _load_device_token()
     if saved:
         return saved
+    if "--pair-token" in sys.argv:
+        i = sys.argv.index("--pair-token")
+        tok = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        if tok:
+            _register_with_token(tok)
+            saved = _load_device_token()
+            if saved:
+                return saved
     if _PAIRING_TOKEN_PATH.exists():
-        _register_with_pairing_token()
+        _register_with_pairing_token_file()
         saved = _load_device_token()
         if saved:
             return saved
-    log("FATAL: not paired (no device_token.json / pairing_token.txt next to this install). "
+    log("FATAL: not paired (no device_token.json / --pair-token / pairing_token.txt). "
         "Run 'Complete Setup' from the Binder to pair this computer.")
     sys.exit(1)
 
