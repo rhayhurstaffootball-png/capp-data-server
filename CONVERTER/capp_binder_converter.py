@@ -80,6 +80,37 @@ def _trim_log() -> None:
 # auto-start with Windows (HKCU Run key — no admin rights needed), relaunch
 # the installed copy, and exit this one. Every launch after that is already
 # running from _APP_DIR, so this is a no-op.
+def _find_downloaded_token(folder: pathlib.Path) -> pathlib.Path | None:
+    """A pairing_token.txt downloaded alongside the EXE lands in the same
+    folder as the EXE itself (browser default download location). If the
+    coach re-ran 'Complete Setup' before (or the browser already had a file
+    by that name), the browser saves it as 'pairing_token (1).txt' etc — an
+    exact-name match would miss it and leave the real token sitting in
+    Downloads forever. Glob for any variant and take the newest."""
+    try:
+        candidates = sorted(folder.glob("pairing_token*.txt"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    return candidates[0] if candidates else None
+
+
+def _self_delete_downloaded_exe(exe_path: pathlib.Path) -> None:
+    """Best-effort cleanup so the coach's Downloads folder doesn't keep a
+    stray copy of the installer sitting around after setup — Windows won't
+    let a running process delete its own file, so this hands it off to a
+    hidden, detached shell that waits for us to exit first."""
+    try:
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        subprocess.Popen(
+            ["cmd", "/c", "ping", "127.0.0.1", "-n", "2", ">", "nul",
+             "&", "del", "/f", "/q", str(exe_path)],
+            creationflags=CREATE_NO_WINDOW, close_fds=True)
+    except Exception as e:
+        log(f"(couldn't schedule cleanup of downloaded exe: {e})")
+
+
 def _self_install_if_needed() -> None:
     if not _FROZEN:
         return
@@ -93,14 +124,25 @@ def _self_install_if_needed() -> None:
     except Exception as e:
         log(f"FATAL: could not install to {installed_path}: {e}")
         sys.exit(1)
-    # A pairing_token.txt downloaded alongside the EXE lands in the same
-    # folder as the EXE itself (browser default download location).
-    sibling_token = exe_path.parent / "pairing_token.txt"
-    if sibling_token.exists() and not _PAIRING_TOKEN_PATH.exists():
+    stray_tokens = []
+    try:
+        stray_tokens = list(exe_path.parent.glob("pairing_token*.txt"))
+    except OSError:
+        pass
+    newest_token = _find_downloaded_token(exe_path.parent)
+    if newest_token and not _PAIRING_TOKEN_PATH.exists():
         try:
-            shutil.move(str(sibling_token), str(_PAIRING_TOKEN_PATH))
+            shutil.move(str(newest_token), str(_PAIRING_TOKEN_PATH))
         except Exception as e:
-            log(f"(couldn't move pairing_token.txt into place: {e})")
+            log(f"(couldn't move {newest_token.name} into place: {e})")
+    # Sweep any other leftover token copies (older re-download attempts) out
+    # of the coach's Downloads folder — they're either stale or superseded.
+    for t in stray_tokens:
+        if t.exists():
+            try:
+                t.unlink()
+            except Exception:
+                pass
     _register_autostart(installed_path)
     log("Installed. Launching the installed copy and exiting this one...")
     try:
@@ -108,6 +150,7 @@ def _self_install_if_needed() -> None:
     except Exception as e:
         log(f"FATAL: could not launch installed copy: {e}")
         sys.exit(1)
+    _self_delete_downloaded_exe(exe_path)
     sys.exit(0)
 
 
