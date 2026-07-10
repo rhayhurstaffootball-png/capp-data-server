@@ -855,11 +855,14 @@ async def agent_download():
 
 @app.get("/converter/download")
 async def converter_download():
-    """Public signed URL for CAPP_Binder_Converter.exe — the per-coach local
-    conversion worker (see BINDER LOCAL PLAN.txt). No auth required — the
+    """CAPP_Binder_Converter.exe — the per-coach local conversion worker (see
+    BINDER LOCAL PLAN.txt). Served from the DO relay, NOT Supabase — the
+    signed exe is ~128MB and Supabase's project-wide Storage upload limit
+    rejects it on the free plan (same reason the >300MB installer lives on
+    the relay too; same pattern as /app/download). No auth required — the
     Binder's 'Complete Setup' screen downloads this alongside a one-time
     pairing token for the currently-signed-in coach."""
-    return {"download_url": await _signed_url("shared/CAPP_Binder_Converter.exe")}
+    return {"download_url": "https://relay.cappvcs.com/converter/download"}
 
 
 @app.get("/converter/version")
