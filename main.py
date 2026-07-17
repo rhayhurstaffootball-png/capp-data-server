@@ -1629,6 +1629,7 @@ async def self_register(
     row = {
         "client_id":      client_id,
         "username":       assigned_username,
+        "email":          email,
         "password_hash":  pw_hash,
         "salt":           salt,
         "api_key":        api_key,
@@ -1657,6 +1658,175 @@ async def self_register(
         "username": assigned_username,
         "message":  "Account created. Check your email for your login username.",
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-service password reset (cappvcs.com/reset)
+# Token is stored HASHED in capp_clients (reset_token_hash) with a 60-min
+# expiry; the raw token only ever exists inside the emailed link. Single-use.
+# ─────────────────────────────────────────────────────────────────────────────
+RESET_PAGE_URL = "https://cappvcs.com/reset"
+_RESET_TOKEN_TTL_MIN = 60
+_reset_last_sent: dict = {}   # username -> epoch seconds (throttle repeat emails)
+
+
+def _send_password_reset_email(to_email: str, username: str, reset_url: str) -> None:
+    """Same SMTP pattern as _send_registration_email."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host = os.environ.get("SMTP_HOST", "")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    from_addr = os.environ.get("FROM_EMAIL", smtp_user)
+    if not smtp_host or not smtp_user or not smtp_pass:
+        raise RuntimeError("SMTP not configured")
+
+    body_html = f"""
+    <div style="font-family:'Segoe UI',Arial,sans-serif;background:#070a0f;color:#e8edf5;padding:40px 0;">
+      <div style="max-width:480px;margin:0 auto;background:#111825;border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:36px;">
+        <div style="text-align:center;margin-bottom:24px;">
+          <img src="https://cappvcs.com/capplogo.png" alt="CAPP" style="height:40px;" />
+        </div>
+        <h2 style="color:#e8edf5;font-size:1.25rem;font-weight:700;margin:0 0 8px;">Reset your CAPP password</h2>
+        <p style="color:#8b96a8;font-size:0.9rem;margin:0 0 24px;">
+          A password reset was requested for the account
+          <strong style="color:#3a7ebf;">{username}</strong>. Click the button below to
+          choose a new password. This link works once and expires in {_RESET_TOKEN_TTL_MIN} minutes.
+        </p>
+        <div style="text-align:center;margin-bottom:24px;">
+          <a href="{reset_url}" style="display:inline-block;background:#3a7ebf;color:#ffffff;text-decoration:none;font-weight:700;font-size:0.95rem;padding:12px 28px;border-radius:8px;">Choose a New Password</a>
+        </div>
+        <p style="color:#8b96a8;font-size:0.8rem;margin:0;">
+          Didn't request this? You can ignore this email — your password is unchanged.
+          Questions? Contact <a href="mailto:roger@cappvcs.com" style="color:#3a7ebf;">roger@cappvcs.com</a>.
+        </p>
+      </div>
+    </div>
+    """
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Reset your CAPP password ({username})"
+    msg["From"]    = f"CAPP Video Coordinator Suite <{from_addr}>"
+    msg["To"]      = to_email
+    msg.attach(MIMEText(body_html, "html"))
+
+    with smtplib.SMTP(smtp_host, smtp_port) as s:
+        s.starttls()
+        s.login(smtp_user, smtp_pass)
+        s.sendmail(from_addr, [to_email], msg.as_string())
+
+
+async def _issue_reset_token(username: str, email: str) -> None:
+    """Generate a fresh token for this account, store its hash + expiry, and
+    email the reset link. Raises on SMTP/storage failure."""
+    token   = _secrets.token_urlsafe(32)
+    th      = hashlib.sha256(token.encode()).hexdigest()
+    expires = (_dt.now(_tz.utc) + _timedelta(minutes=_RESET_TOKEN_TTL_MIN)).isoformat()
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={"reset_token_hash": th, "reset_token_expires": expires},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise RuntimeError(f"token store failed: {r.text}")
+    _send_password_reset_email(email, username, f"{RESET_PAGE_URL}?token={token}")
+
+
+@app.post("/auth/reset-request")
+async def auth_reset_request(account: str = Body(..., embed=True)):
+    """Start a password reset. `account` is a username OR the email used at
+    registration. Response is intentionally the same whether or not the
+    account exists (no account probing)."""
+    acct = (account or "").strip()
+    generic = {"ok": True, "message": "If that account has an email on file, a reset link is on its way."}
+    if not acct:
+        raise HTTPException(status_code=400, detail="Enter your username or email.")
+
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{acct}", "select": "username,email"},
+            headers=_supa_headers_json(),
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if not rows and "@" in acct:
+            # Both seats of a school can share an email — reset every match.
+            r2 = await c.get(
+                f"{SUPABASE_URL}/rest/v1/capp_clients",
+                params={"email": f"eq.{acct.lower()}", "select": "username,email"},
+                headers=_supa_headers_json(),
+            )
+            rows = r2.json() if r2.status_code == 200 else []
+
+    now = _time.time()
+    for row in rows[:5]:
+        uname, email = row.get("username"), (row.get("email") or "").strip()
+        if not email:
+            print(f"[RESET] {uname}: no email on file — cannot send link", flush=True)
+            continue
+        if now - _reset_last_sent.get(uname, 0) < 60:
+            continue   # throttle: one email per account per minute
+        try:
+            await _issue_reset_token(uname, email)
+            _reset_last_sent[uname] = now
+            print(f"[RESET] Link sent to {email} for {uname}", flush=True)
+        except Exception as e:
+            print(f"[RESET] FAILED for {uname}: {e}", flush=True)
+    return generic
+
+
+@app.post("/auth/reset-confirm")
+async def auth_reset_confirm(
+    token:    str = Body(..., embed=True),
+    password: str = Body(..., embed=True),
+):
+    """Finish a password reset: validate the emailed token, set the new
+    password. api_key is untouched, so CAPP Node agents keep working."""
+    if len(password or "") < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    th = hashlib.sha256((token or "").strip().encode()).hexdigest()
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"reset_token_hash": f"eq.{th}", "select": "username,reset_token_expires"},
+            headers=_supa_headers_json(),
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if not rows:
+            raise HTTPException(status_code=400, detail="This reset link is invalid or was already used. Request a new one.")
+        row     = rows[0]
+        uname   = row["username"]
+        expired = True
+        try:
+            exp = _dt.fromisoformat((row.get("reset_token_expires") or "").replace("Z", "+00:00"))
+            expired = _dt.now(_tz.utc) > exp
+        except ValueError:
+            pass
+        clear = {"reset_token_hash": None, "reset_token_expires": None}
+        if expired:
+            await c.patch(
+                f"{SUPABASE_URL}/rest/v1/capp_clients",
+                params={"username": f"eq.{uname}"},
+                json=clear,
+                headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+            )
+            raise HTTPException(status_code=400, detail="This reset link has expired. Request a new one.")
+        salt = _secrets.token_hex(16)
+        r2 = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{uname}"},
+            json={"password_hash": _hash_pw(password, salt), "salt": salt, **clear},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+        if r2.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail="Could not update the password. Try again.")
+    print(f"[RESET] Password updated for {uname}", flush=True)
+    return {"ok": True, "username": uname}
 
 
 @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
@@ -1794,7 +1964,7 @@ async def admin_list_clients():
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"select": "username,client_id,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date,created_at,trial_extension_days",
+            params={"select": "username,client_id,email,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date,created_at,trial_extension_days",
                     "order": "username.asc"},
             headers=_supa_headers_json(),
         )
@@ -1811,10 +1981,15 @@ def admin_gameday_status():
 
 @app.patch("/admin/api/clients/{username}", dependencies=[Depends(_require_admin)])
 async def admin_update_client(username: str, payload: dict = Body(...)):
-    """Update editable fields: notes, next_invoice_date."""
-    allowed = {k: v for k, v in payload.items() if k in ("notes", "next_invoice_date")}
+    """Update editable fields: notes, next_invoice_date, email."""
+    allowed = {k: v for k, v in payload.items() if k in ("notes", "next_invoice_date", "email")}
     if not allowed:
         raise HTTPException(status_code=400, detail="No editable fields provided.")
+    if "email" in allowed:
+        em = (allowed["email"] or "").strip().lower()
+        if em and "@" not in em:
+            raise HTTPException(status_code=400, detail="That doesn't look like an email address.")
+        allowed["email"] = em or None
     async with httpx.AsyncClient() as c:
         r = await c.patch(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
@@ -1825,6 +2000,28 @@ async def admin_update_client(username: str, payload: dict = Body(...)):
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
+
+
+@app.post("/admin/api/clients/{username}/send-reset", dependencies=[Depends(_require_admin)])
+async def admin_send_reset(username: str):
+    """Manually email a password-reset link to the address on file."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}", "select": "username,email"},
+            headers=_supa_headers_json(),
+        )
+    rows = r.json() if r.status_code == 200 else []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No such account.")
+    email = (rows[0].get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="No email on file — add one and save first.")
+    try:
+        await _issue_reset_token(username, email)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not send: {e}")
+    return {"ok": True, "email": email}
 
 
 @app.patch("/admin/api/clients/{username}/reset-seat", dependencies=[Depends(_require_admin)])
@@ -3898,7 +4095,7 @@ async def pb_worker_fail(payload: dict = Body(...)):
 # ─────────────────────────────────────────────────────────────────────────────
 # CAPP Friends
 # ─────────────────────────────────────────────────────────────────────────────
-from datetime import datetime as _dt, timezone as _tz
+from datetime import datetime as _dt, timezone as _tz, timedelta as _timedelta
 
 
 @app.get("/friends/directory", dependencies=[Depends(verify_api_key)])
@@ -4486,6 +4683,11 @@ _ADMIN_HTML = """<!DOCTYPE html>
       <div class="so-field"><label>Username</label><div class="so-val" id="so-username">—</div></div>
       <div class="so-field"><label>Client ID</label><div class="so-val" id="so-clientid">—</div></div>
       <div class="so-field"><label>Status</label><div id="so-status">—</div></div>
+      <div class="so-field">
+        <label>Email (for password resets)</label>
+        <div class="form-group"><input type="text" id="so-email" placeholder="No email on file"></div>
+      </div>
+      <button class="btn btn-warning btn-sm" onclick="sendResetEmail()">Send Password Reset Email</button>
     </div>
 
     <div class="so-section">
@@ -4876,6 +5078,7 @@ function openSlideout(username) {
   document.getElementById("so-seat2").textContent = c.seat_2_machine
     ? c.seat_2_machine.substring(0, 24) + "…" : "Open";
 
+  document.getElementById("so-email").value = c.email || "";
   document.getElementById("so-invoice-date").value = c.next_invoice_date || "";
   document.getElementById("so-notes").value = c.notes || "";
   document.getElementById("so-save-msg").style.display = "none";
@@ -5073,13 +5276,33 @@ function resetSeat(seat) {
     });
 }
 
+function sendResetEmail() {
+  if (!_currentUser) return;
+  const email = document.getElementById("so-email").value.trim();
+  if (!email) { alert("No email on file for " + _currentUser.username + ". Enter one and Save first."); return; }
+  if (email.toLowerCase() !== (_currentUser.email || "")) {
+    alert("The email box has unsaved changes — click Save Notes & Date first so the link goes to the right address.");
+    return;
+  }
+  if (!confirm("Email a password-reset link to " + email + " for " + _currentUser.username + "?")) return;
+  api("POST", "/clients/" + _currentUser.username + "/send-reset")
+    .then(d => {
+      if (d.ok) alert("Reset link sent to " + d.email + " (valid 60 minutes).");
+      else alert("Error: " + (d.detail || JSON.stringify(d)));
+    });
+}
+
 function saveDetails() {
   if (!_currentUser) return;
   const notes   = document.getElementById("so-notes").value;
   const invDate = document.getElementById("so-invoice-date").value || null;
-  api("PATCH", "/clients/" + _currentUser.username, { notes, next_invoice_date: invDate })
+  const email   = document.getElementById("so-email").value.trim();
+  api("PATCH", "/clients/" + _currentUser.username, { notes, next_invoice_date: invDate, email })
     .then(d => {
       if (d.ok) {
+        _currentUser.notes = notes;
+        _currentUser.next_invoice_date = invDate;
+        _currentUser.email = email.toLowerCase() || null;
         const msg = document.getElementById("so-save-msg");
         msg.style.display = "block";
         setTimeout(() => msg.style.display = "none", 2000);
