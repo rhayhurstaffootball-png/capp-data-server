@@ -1829,6 +1829,233 @@ async def auth_reset_confirm(
     return {"ok": True, "username": uname}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Strict payments (cappvcs.com/pay)
+# A payment REQUIRES a valid Invoice/Quote number from capp_sales_docs (rows
+# pushed by the Sales Docs tool on Generate, or added manually in the admin
+# panel). Checkout is a Stripe Checkout Session for the EXACT amount on the
+# document — no fixed-price buy buttons.
+# ─────────────────────────────────────────────────────────────────────────────
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+PAY_PAGE_URL = "https://cappvcs.com/pay"
+
+
+def _norm_doc_number(number: str) -> str:
+    return (number or "").strip().upper()
+
+
+async def _fetch_sales_doc(c: httpx.AsyncClient, number: str):
+    r = await c.get(
+        f"{SUPABASE_URL}/rest/v1/capp_sales_docs",
+        params={"number": f"eq.{number}", "select": "*"},
+        headers=_supa_headers_json(),
+    )
+    rows = r.json() if r.status_code == 200 else []
+    return rows[0] if rows else None
+
+
+def _public_doc(doc: dict) -> dict:
+    return {
+        "number":       doc["number"],
+        "doc_type":     doc.get("doc_type", "invoice"),
+        "school":       doc.get("school", ""),
+        "description":  doc.get("description", ""),
+        "amount_cents": doc.get("amount_cents", 0),
+        "status":       doc.get("status", "unpaid"),
+    }
+
+
+@app.post("/pay/lookup")
+async def pay_lookup(number: str = Body(..., embed=True)):
+    """Validate an Invoice/Quote number and return what's owed."""
+    num = _norm_doc_number(number)
+    if not num:
+        raise HTTPException(status_code=400, detail="Enter your Invoice or Quote number.")
+    async with httpx.AsyncClient() as c:
+        doc = await _fetch_sales_doc(c, num)
+    if not doc or doc.get("status") == "void":
+        raise HTTPException(
+            status_code=404,
+            detail="That number wasn't found. Check it against your invoice or quote, "
+                   "or email roger@cappvcs.com.")
+    return _public_doc(doc)
+
+
+@app.post("/pay/checkout")
+async def pay_checkout(number: str = Body(..., embed=True)):
+    """Create a Stripe Checkout Session for the exact amount on the document."""
+    num = _norm_doc_number(number)
+    async with httpx.AsyncClient() as c:
+        doc = await _fetch_sales_doc(c, num)
+        if not doc or doc.get("status") == "void":
+            raise HTTPException(status_code=404, detail="That number wasn't found.")
+        if doc.get("status") == "paid":
+            raise HTTPException(status_code=409, detail="This document is already paid — thank you!")
+        if not STRIPE_SECRET_KEY:
+            raise HTTPException(
+                status_code=503,
+                detail="Online card payment is temporarily unavailable — "
+                       "email roger@cappvcs.com for a payment link.")
+        label = f"{doc['number']} — CAPP Video Coordinator Suite ({doc.get('school','')})"
+        sr = await c.post(
+            "https://api.stripe.com/v1/checkout/sessions",
+            headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}"},
+            data={
+                "mode": "payment",
+                "client_reference_id": doc["number"],
+                "metadata[number]": doc["number"],
+                "success_url": f"{PAY_PAGE_URL}?session_id={{CHECKOUT_SESSION_ID}}",
+                "cancel_url":  f"{PAY_PAGE_URL}?canceled=1",
+                "line_items[0][quantity]": "1",
+                "line_items[0][price_data][currency]": "usd",
+                "line_items[0][price_data][unit_amount]": str(int(doc["amount_cents"])),
+                "line_items[0][price_data][product_data][name]": label,
+            },
+        )
+        if sr.status_code != 200:
+            print(f"[PAY] Stripe session create FAILED for {num}: {sr.text[:300]}", flush=True)
+            raise HTTPException(status_code=502, detail="Could not start checkout. Try again in a minute.")
+        session = sr.json()
+        await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_sales_docs",
+            params={"number": f"eq.{num}"},
+            json={"stripe_session_id": session["id"]},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    print(f"[PAY] Checkout started for {num} (${doc['amount_cents']/100:.2f})", flush=True)
+    return {"url": session["url"]}
+
+
+@app.post("/pay/confirm")
+async def pay_confirm(session_id: str = Body(..., embed=True)):
+    """Landing check after Stripe redirects back: verify the session really
+    paid, then mark the document paid + advance the CRM prospect."""
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="Missing session id.")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Payment verification unavailable.")
+    async with httpx.AsyncClient() as c:
+        sr = await c.get(
+            f"https://api.stripe.com/v1/checkout/sessions/{sid}",
+            headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}"},
+        )
+        if sr.status_code != 200:
+            raise HTTPException(status_code=404, detail="Payment session not found.")
+        session = sr.json()
+        num = _norm_doc_number((session.get("metadata") or {}).get("number", ""))
+        if session.get("payment_status") != "paid":
+            raise HTTPException(status_code=402, detail="This payment hasn't completed.")
+        doc = await _fetch_sales_doc(c, num) if num else None
+        if not doc:
+            raise HTTPException(status_code=404, detail="Paid session has no matching document — email roger@cappvcs.com.")
+        if doc.get("status") != "paid":
+            await c.patch(
+                f"{SUPABASE_URL}/rest/v1/capp_sales_docs",
+                params={"number": f"eq.{num}"},
+                json={"status": "paid", "paid_at": _dt.now(_tz.utc).isoformat(),
+                      "stripe_session_id": sid},
+                headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+            )
+            # Advance the CRM prospect to Paid (best-effort; never blocks the receipt)
+            try:
+                school = (doc.get("school") or "").strip()
+                if school:
+                    pr = await c.get(
+                        f"{SUPABASE_URL}/rest/v1/capp_prospects",
+                        params={"school": f"ilike.{school}", "select": "id,status"},
+                        headers=_supa_headers_json(),
+                    )
+                    for p in (pr.json() if pr.status_code == 200 else []):
+                        await c.patch(
+                            f"{SUPABASE_URL}/rest/v1/capp_prospects",
+                            params={"id": f"eq.{p['id']}"},
+                            json={"status": "Paid", "updated_at": _dt.now(_tz.utc).isoformat()},
+                            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+                        )
+            except Exception as e:
+                print(f"[PAY] CRM advance failed for {num}: {e}", flush=True)
+            print(f"[PAY] ✓ PAID {num} (${doc['amount_cents']/100:.2f}) — {doc.get('school','')}", flush=True)
+    return {"ok": True, **_public_doc({**doc, "status": "paid"})}
+
+
+# ── Admin: sales-doc records behind the pay page ─────────────────────────────
+_SALES_DOC_TYPES = ("quote", "agreement", "invoice")
+
+
+@app.get("/admin/api/salesdocs", dependencies=[Depends(_require_admin)])
+async def admin_list_salesdocs():
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_sales_docs",
+            params={"select": "*", "order": "created_at.desc"},
+            headers=_supa_headers_json(),
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.post("/admin/api/salesdocs", dependencies=[Depends(_require_admin)])
+async def admin_upsert_salesdoc(payload: dict = Body(...)):
+    """Create or update a payable document record (upsert by number).
+    Used by the Sales Docs tool on Generate AND the admin panel manual form."""
+    num = _norm_doc_number(payload.get("number", ""))
+    if not num:
+        raise HTTPException(status_code=400, detail="Document number is required.")
+    school = (payload.get("school") or "").strip()
+    if not school:
+        raise HTTPException(status_code=400, detail="School is required.")
+    try:
+        cents = int(round(float(payload.get("amount_cents", 0))))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Bad amount.")
+    if cents <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
+    doc_type = (payload.get("doc_type") or "invoice").strip().lower()
+    if doc_type not in _SALES_DOC_TYPES:
+        raise HTTPException(status_code=400, detail="doc_type must be quote, agreement, or invoice.")
+    row = {
+        "number": num, "doc_type": doc_type, "school": school,
+        "description": (payload.get("description") or "").strip(),
+        "amount_cents": cents,
+    }
+    async with httpx.AsyncClient() as c:
+        existing = await _fetch_sales_doc(c, num)
+        if existing and existing.get("status") == "paid":
+            raise HTTPException(status_code=409, detail=f"{num} is already PAID — not changing it.")
+        if existing:
+            r = await c.patch(
+                f"{SUPABASE_URL}/rest/v1/capp_sales_docs",
+                params={"number": f"eq.{num}"},
+                json=row,
+                headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+            )
+        else:
+            row["status"] = "unpaid"
+            r = await c.post(
+                f"{SUPABASE_URL}/rest/v1/capp_sales_docs",
+                json=row,
+                headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+            )
+    if r.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True, "number": num, "updated": bool(existing)}
+
+
+@app.delete("/admin/api/salesdocs/{number}", dependencies=[Depends(_require_admin)])
+async def admin_delete_salesdoc(number: str):
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(
+            f"{SUPABASE_URL}/rest/v1/capp_sales_docs",
+            params={"number": f"eq.{_norm_doc_number(number)}"},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
 @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
 def admin_page():
     return HTMLResponse(_ADMIN_HTML)
@@ -4474,6 +4701,47 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">Click any row to edit status, dates, and notes.</p>
         <div id="prospects-table"><div class="loading">Loading...</div></div>
       </div>
+      <div class="card">
+        <h2>Payments — payable Invoice / Quote numbers
+          <button class="btn btn-primary" onclick="loadSalesDocs()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p style="color:#8b95a1;font-size:12px;margin-bottom:14px;">
+          cappvcs.com/pay only accepts numbers listed here. The Sales Docs tool registers new
+          docs automatically on Generate — use this form for docs issued before Jul 2026
+          (matching the number printed on the customer's PDF exactly).
+        </p>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Number *</label>
+            <input type="text" id="sd-number" placeholder="e.g. INV-20260601-001">
+          </div>
+          <div class="form-group">
+            <label>School *</label>
+            <input type="text" id="sd-school" placeholder="e.g. SMU">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Type</label>
+            <select id="sd-type">
+              <option value="invoice">Invoice</option>
+              <option value="quote">Quote</option>
+              <option value="agreement">Agreement</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Amount (USD) *</label>
+            <input type="text" id="sd-amount" placeholder="e.g. 3500 or 3500.00">
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom:12px;">
+          <label>Description (shown to the customer)</label>
+          <input type="text" id="sd-desc" placeholder="e.g. Group of 6 — Year 1">
+        </div>
+        <button class="btn btn-primary" onclick="addSalesDoc()">Add / Update Number</button>
+        <div class="result" id="sd-result"></div>
+        <div id="salesdocs-table" style="margin-top:16px;"><div class="loading">Loading...</div></div>
+      </div>
     </div>
 
     <div class="panel" id="gameday-tab">
@@ -4831,7 +5099,7 @@ function showTab(id, btn) {
    stopGameDayRefresh();
   if (id === "clients-tab") loadClients();
   if (id === "create-tab") loadTeams();
-  if (id === "crm-tab") loadProspects();
+  if (id === "crm-tab") { loadProspects(); loadSalesDocs(); }
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
   if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); loadPbAccessLog(); }
@@ -5181,6 +5449,83 @@ function loadProspects() {
         <thead><tr><th>School</th><th>Contact</th><th>Status</th><th>Quote Sent</th><th>Updated</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
+  });
+}
+
+function loadSalesDocs() {
+  document.getElementById("salesdocs-table").innerHTML = '<div class="loading">Loading...</div>';
+  api("GET", "/salesdocs").then(data => {
+    if (!Array.isArray(data)) {
+      document.getElementById("salesdocs-table").innerHTML =
+        '<div class="loading">Error loading payment numbers (has sales_docs_table.sql been run?).</div>';
+      return;
+    }
+    if (data.length === 0) {
+      document.getElementById("salesdocs-table").innerHTML = '<div class="loading">No payable numbers yet.</div>';
+      return;
+    }
+    const rows = data.map(d => {
+      const amt  = "$" + (d.amount_cents / 100).toLocaleString("en-US", {minimumFractionDigits: 2});
+      const st   = d.status === "paid"
+        ? '<span class="badge badge-green">Paid</span>'
+        : (d.status === "void" ? '<span class="badge badge-red">Void</span>'
+                               : '<span class="badge badge-blue">Unpaid</span>');
+      const when = d.paid_at ? new Date(d.paid_at).toLocaleDateString()
+                 : (d.created_at ? new Date(d.created_at).toLocaleDateString() : "—");
+      const del  = d.status === "paid" ? ""
+        : `<button class="btn btn-danger btn-sm" onclick="deleteSalesDoc('${crmEsc(d.number)}')">Remove</button>`;
+      return `<tr>
+        <td>${crmEsc(d.number)}</td>
+        <td>${crmEsc(d.school)}</td>
+        <td>${crmEsc(d.doc_type)}</td>
+        <td>${amt}</td>
+        <td>${st}</td>
+        <td>${when}</td>
+        <td>${del}</td>
+      </tr>`;
+    }).join("");
+    document.getElementById("salesdocs-table").innerHTML = `
+      <table>
+        <thead><tr><th>Number</th><th>School</th><th>Type</th><th>Amount</th><th>Status</th><th>Date</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  });
+}
+
+function addSalesDoc() {
+  const res = document.getElementById("sd-result");
+  const number = document.getElementById("sd-number").value.trim().toUpperCase();
+  const school = document.getElementById("sd-school").value.trim();
+  const amount = parseFloat(document.getElementById("sd-amount").value.replace(/[$,]/g, ""));
+  if (!number || !school || !(amount > 0)) {
+    res.className = "result err"; res.style.display = "block";
+    res.textContent = "Number, school, and a positive amount are required.";
+    return;
+  }
+  const body = {
+    number, school,
+    doc_type: document.getElementById("sd-type").value,
+    description: document.getElementById("sd-desc").value.trim(),
+    amount_cents: Math.round(amount * 100),
+  };
+  api("POST", "/salesdocs", body).then(r => {
+    if (r && r.detail) {
+      res.className = "result err"; res.style.display = "block";
+      res.textContent = "Error: " + r.detail;
+      return;
+    }
+    res.className = "result"; res.style.display = "block";
+    res.textContent = (r.updated ? "Updated " : "Added ") + number + " — payable at cappvcs.com/pay.";
+    ["sd-number","sd-school","sd-amount","sd-desc"].forEach(id => document.getElementById(id).value = "");
+    loadSalesDocs();
+  });
+}
+
+function deleteSalesDoc(number) {
+  if (!confirm("Remove " + number + "? The customer will no longer be able to pay it online.")) return;
+  api("DELETE", "/salesdocs/" + encodeURIComponent(number)).then(r => {
+    if (r && r.detail) { alert("Error: " + r.detail); return; }
+    loadSalesDocs();
   });
 }
 
