@@ -1146,7 +1146,25 @@ def _events_to_games(events, league):
         })
     return games
 
+# In-memory cache for week/date-range scoreboard lookups (year+week given to
+# get_live_games). This was a raw, uncached ESPN pass-through — every client
+# request re-hit ESPN directly, defeating the whole point of this server
+# existing as a shared cache layer (surfaced Jul 20 2026 when a client-side
+# fix started calling this 16x per "load full schedule" click). 5 min TTL:
+# short enough that gameday status/scores still refresh promptly for anyone
+# actively browsing, long enough to collapse repeated hits across users
+# within the same window into one real ESPN call.
+_historical_games_cache: dict = {}
+_historical_games_ts: dict = {}
+_HISTORICAL_GAMES_CACHE_SECONDS = 300
+
 def _fetch_historical_games(league, year, week, seasontype=2):
+    cache_key = f"{league}_{year}_{week}_{seasontype}"
+    now = time.time()
+    if cache_key in _historical_games_cache and \
+            now - _historical_games_ts.get(cache_key, 0) < _HISTORICAL_GAMES_CACHE_SECONDS:
+        return _historical_games_cache[cache_key]
+
     results = []
     leagues = ["cfb", "nfl"] if league == "all" else [league]
     for lg in leagues:
@@ -1157,6 +1175,9 @@ def _fetch_historical_games(league, year, week, seasontype=2):
             params = {"dates": date_range} if date_range else {}
         events = _fetch_scoreboard(lg, params)
         results.extend(_events_to_games(events, lg))
+
+    _historical_games_cache[cache_key] = results
+    _historical_games_ts[cache_key] = now
     return results
 
 # ============================================================
