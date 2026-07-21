@@ -17,6 +17,7 @@ import time
 import os
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CFBD_KEY      = "vbfhFBcMYIky2ixPSJqCVrmdBYe0Fr4y3ei4kVHypGf1FiQBvoCyGr8vMpduRKOI"
@@ -38,6 +39,46 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s"
 )
 log = logging.getLogger("db_updater")
+
+# ── Kickoff date helpers ──────────────────────────────────────────────────────
+_ET = ZoneInfo("America/New_York")
+
+def _venue_timezones():
+    """venueId -> IANA timezone from CFBD /venues. Missing/failed -> {} (callers
+    fall back to Eastern). Used to compute each game's date in the timezone where
+    it is actually played."""
+    try:
+        rows = cfbd("/venues")
+        return {v.get("id"): v.get("timezone") for v in rows if v.get("id") and v.get("timezone")}
+    except Exception as e:
+        log.error(f"_venue_timezones: /venues pull failed ({e}); kickoff dates fall back to Eastern")
+        return {}
+
+def _kickoff_local_date(start_date_utc, venue_tz):
+    """Correct calendar date for a game from its UTC kickoff.
+
+    CFBD `startDate` is UTC. The old code sliced it (`startDate[:10]`), which put
+    every night game on the FOLLOWING day (an 8pm Saturday kickoff is Sunday in
+    UTC) — and because dates were also the dedup key, each date shift spawned a
+    duplicate row. Rules:
+      * A time of exactly midnight Eastern is CFBD's "kickoff time not set yet"
+        placeholder — for those the intended date IS the Eastern date (don't shift
+        it into the venue timezone or it rolls back a day).
+      * A real kickoff uses the VENUE timezone, so the date reflects where the
+        game is played (e.g. a late Hawaii or Pacific game stays on its local day).
+    """
+    s = start_date_utc or ""
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return s[:10]
+    et = dt.astimezone(_ET)
+    if et.hour == 0 and et.minute == 0:          # midnight ET == time TBD -> date only
+        return et.date().isoformat()
+    tz = ZoneInfo(venue_tz) if venue_tz else _ET
+    return dt.astimezone(tz).date().isoformat()
 
 # ── CFBD helpers ──────────────────────────────────────────────────────────────
 class CFBDError(Exception):
@@ -119,6 +160,7 @@ def insert_new_games(conn):
     """
     cur = conn.cursor()
     amap = _load_alias_map(conn)
+    vtz = _venue_timezones()          # venueId -> IANA tz (for venue-local dates)
     games_added = 0
     schedules_added = 0
 
@@ -139,7 +181,8 @@ def insert_new_games(conn):
             game_id    = g.get("id")
             home_cfbd  = _canon(g.get("homeTeam", ""), amap)
             away_cfbd  = _canon(g.get("awayTeam", ""), amap)
-            date_str   = (g.get("startDate", "") or "")[:10]
+            # Venue-local kickoff date (NOT the raw UTC slice — see _kickoff_local_date).
+            date_str   = _kickoff_local_date(g.get("startDate", ""), vtz.get(g.get("venueId")))
             week       = str(g.get("week", ""))
             venue      = g.get("venue", "") or ""
             neutral    = g.get("neutralSite", False)
@@ -155,11 +198,27 @@ def insert_new_games(conn):
                 home_result = "W" if home_pts > away_pts else ("L" if home_pts < away_pts else "T")
                 away_result = "W" if away_pts > home_pts else ("L" if away_pts < home_pts else "T")
 
-            # Insert into games table — one row per team
+            # Insert into games table — one row per team. Keyed on (team, game_id):
+            # update the existing row in place (incl. a corrected date) so a shifted
+            # kickoff date can never spawn a duplicate row. Only genuinely-new games
+            # are inserted. (game_id is unique per team per season.)
             for team, opp, tscore, oscore, result in [
                 (home_cfbd, away_cfbd, home_pts, away_pts, home_result),
                 (away_cfbd, home_cfbd, away_pts, home_pts, away_result),
             ]:
+                if game_id is not None:
+                    cur.execute("""
+                        UPDATE games SET
+                            opponent=?, date=?, home_team=?, away_team=?, venue=?,
+                            neutral_site=?, conference_game=?, week=?,
+                            result=?, team_score=?, opponent_score=?
+                        WHERE team=? AND game_id=? AND season=?
+                    """, (opp, date_str, home_cfbd, away_cfbd, venue,
+                          neutral, conf_game, week, result, tscore, oscore,
+                          team, game_id, str(CURRENT_SEASON)))
+                    if cur.rowcount:
+                        games_added += 1
+                        continue
                 cur.execute("""
                     INSERT INTO games
                         (team, opponent, date, home_team, away_team, venue,
@@ -177,17 +236,26 @@ def insert_new_games(conn):
                 if cur.rowcount:
                     games_added += 1
 
-            # Insert into schedules — one row per team (only if not already there)
+            # Insert into schedules — one row per team. Also keyed on (team, game_id)
+            # so a corrected date updates the existing row instead of adding a dup.
             for team, opp, loc in [
                 (home_cfbd, away_cfbd, "vs"),
                 (away_cfbd, home_cfbd, "at"),
             ]:
-                exists = cur.execute("""
-                    SELECT 1 FROM schedules
-                    WHERE team=? AND opponent=? AND date=? AND season=?
-                """, (team, opp, date_str, str(CURRENT_SEASON))).fetchone()
+                existing = None
+                if game_id is not None:
+                    existing = cur.execute("""
+                        SELECT id FROM schedules
+                        WHERE team=? AND game_id=? AND season=?
+                    """, (team, game_id, str(CURRENT_SEASON))).fetchone()
 
-                if not exists:
+                if existing:
+                    cur.execute("""
+                        UPDATE schedules SET
+                            opponent=?, date=?, location=?, home_team=?, away_team=?, week=?
+                        WHERE id=?
+                    """, (opp, date_str, loc, home_cfbd, away_cfbd, week, existing[0]))
+                else:
                     cur.execute("""
                         INSERT INTO schedules
                             (team, opponent, date, location, home_team, away_team,
