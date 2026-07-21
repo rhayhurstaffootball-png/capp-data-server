@@ -125,9 +125,19 @@ def _load_alias_map(conn):
     return amap
 
 
+# CFBD uppercases accented letters (é -> É), but the teams table stores
+# "San José State" with a LOWERCASE é. SQLite compares é and É as unequal, so an
+# É-spelled schedule row never matches the selector's team list and the game
+# selector shows no games. Force the teams-table spelling for these names.
+_CANON_OVERRIDES = {
+    "SAN JOSÉ STATE": "SAN JOSé STATE",   # É -> é
+    "SAN JOSE STATE":      "SAN JOSé STATE",   # plain ASCII -> é
+}
+
 def _canon(name, amap):
     up = (name or "").strip().upper()
-    return amap.get(up, up)
+    up = amap.get(up, up)
+    return _CANON_OVERRIDES.get(up, up)
 
 # ── Supabase upload ───────────────────────────────────────────────────────────
 def upload_to_supabase(db_path):
