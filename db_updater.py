@@ -40,17 +40,53 @@ logging.basicConfig(
 log = logging.getLogger("db_updater")
 
 # ── CFBD helpers ──────────────────────────────────────────────────────────────
-def cfbd(path, params=None):
-    for attempt in range(3):
+class CFBDError(Exception):
+    """Raised when a CFBD call fails every retry — so callers can tell a real
+    failure apart from a genuinely-empty result and NOT silently drop data
+    (this is exactly how FCS schedules/results were vanishing: cfbd() returned
+    [] on failure, the FCS loop processed 0 rows, and the run reported success)."""
+
+
+def cfbd(path, params=None, allow_empty=True):
+    """Call CFBD with retries + exponential backoff. Larger classification
+    pulls (FCS ~850 games) can be slow/rate-limited on the server, so timeout
+    is generous and backoff spreads retries. On TOTAL failure, raises CFBDError
+    instead of returning [] — callers decide whether an empty pull is
+    acceptable (see insert_new_games / update_game_results)."""
+    last_err = None
+    for attempt in range(5):
         try:
             r = requests.get(CFBD_BASE + path, params=params or {},
-                             headers=CFBD_HEADERS, timeout=30)
+                             headers=CFBD_HEADERS, timeout=60)
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            log.warning(f"CFBD {path} attempt {attempt+1}: {e}")
-            time.sleep(2)
-    return []
+            last_err = e
+            log.warning(f"CFBD {path} {params} attempt {attempt+1}/5: {e}")
+            time.sleep(min(2 ** attempt, 16))   # 1,2,4,8,16s
+    raise CFBDError(f"CFBD {path} {params} failed after 5 attempts: {last_err}")
+
+
+def _load_alias_map(conn):
+    """CFBD name (UPPER) -> canonical teams-table name (UPPER), from the
+    existing name_aliases table. Applied on insert/match so e.g. CFBD
+    'McNeese' is stored/matched as 'MCNEESE STATE' to align with the teams
+    table (previously db_updater stored the raw CFBD name, so aliased FCS
+    teams never matched)."""
+    cur = conn.cursor()
+    amap = {}
+    try:
+        for alias, team in cur.execute("SELECT alias, team FROM name_aliases"):
+            if alias and team:
+                amap[alias.strip().upper()] = team.strip().upper()
+    except Exception as e:
+        log.warning(f"Could not load name_aliases: {e}")
+    return amap
+
+
+def _canon(name, amap):
+    up = (name or "").strip().upper()
+    return amap.get(up, up)
 
 # ── Supabase upload ───────────────────────────────────────────────────────────
 def upload_to_supabase(db_path):
@@ -82,18 +118,27 @@ def insert_new_games(conn):
     Team names stored UPPERCASE to match existing data convention.
     """
     cur = conn.cursor()
+    amap = _load_alias_map(conn)
     games_added = 0
     schedules_added = 0
 
     for classification in ["fbs", "fcs"]:
       for stype in ["regular", "postseason"]:
-        games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype, "classification": classification})
+        try:
+            games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype, "classification": classification})
+        except CFBDError as e:
+            # Loud, but non-fatal per-classification: a failed FCS pull must
+            # not block FBS or halt the whole run. Existing rows are retained
+            # (inserts are if-not-exists), so nothing is lost — just not
+            # refreshed this cycle. This is the fix for FCS silently vanishing.
+            log.error(f"insert_new_games: {classification}/{stype} pull FAILED — skipping this run: {e}")
+            continue
         time.sleep(0.5)
 
         for g in games:
             game_id    = g.get("id")
-            home_cfbd  = g.get("homeTeam", "").strip().upper()
-            away_cfbd  = g.get("awayTeam", "").strip().upper()
+            home_cfbd  = _canon(g.get("homeTeam", ""), amap)
+            away_cfbd  = _canon(g.get("awayTeam", ""), amap)
             date_str   = (g.get("startDate", "") or "")[:10]
             week       = str(g.get("week", ""))
             venue      = g.get("venue", "") or ""
@@ -165,11 +210,16 @@ def update_game_results(conn):
     uppercase (older toolkit rows) team names.
     """
     cur = conn.cursor()
+    amap = _load_alias_map(conn)
     updated = 0
 
     for classification in ["fbs", "fcs"]:
       for stype in ["regular", "postseason"]:
-        games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype, "classification": classification})
+        try:
+            games = cfbd("/games", {"year": CURRENT_SEASON, "seasonType": stype, "classification": classification})
+        except CFBDError as e:
+            log.error(f"update_game_results: {classification}/{stype} pull FAILED — skipping this run: {e}")
+            continue
         time.sleep(0.5)
 
         for g in games:
@@ -181,8 +231,10 @@ def update_game_results(conn):
                 continue
 
             game_id   = g.get("id")
-            home_cfbd = g.get("homeTeam", "").strip()
-            away_cfbd = g.get("awayTeam", "").strip()
+            # Canonicalize via name_aliases so results match the rows
+            # insert_new_games created (which now use aliased UPPER names).
+            home_cfbd = _canon(g.get("homeTeam", ""), amap)
+            away_cfbd = _canon(g.get("awayTeam", ""), amap)
             date_str  = (g.get("startDate", "") or "")[:10]
 
             home_result = "W" if home_pts > away_pts else ("L" if home_pts < away_pts else "T")
@@ -226,10 +278,18 @@ def update_conference_memberships(conn):
     Team names stored UPPERCASE to match the rest of the DB.
     """
     cur = conn.cursor()
-    fbs = cfbd("/teams/fbs", {"year": CURRENT_SEASON})
-    time.sleep(0.5)
-    fcs = cfbd("/teams", {"year": CURRENT_SEASON, "classification": "fcs"})
-    time.sleep(0.5)
+    try:
+        fbs = cfbd("/teams/fbs", {"year": CURRENT_SEASON})
+        time.sleep(0.5)
+    except CFBDError as e:
+        log.error(f"update_conference_memberships: FBS teams pull FAILED — skipping: {e}")
+        fbs = []
+    try:
+        fcs = cfbd("/teams", {"year": CURRENT_SEASON, "classification": "fcs"})
+        time.sleep(0.5)
+    except CFBDError as e:
+        log.error(f"update_conference_memberships: FCS teams pull FAILED — skipping: {e}")
+        fcs = []
 
     for classification, teams in [("fbs", fbs), ("fcs", fcs)]:
         for t in teams:
