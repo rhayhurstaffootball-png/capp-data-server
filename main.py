@@ -852,6 +852,13 @@ async def agent_download():
     """Public signed URL for CAPPNodes_Agent.exe — no auth required."""
     return {"download_url": await _signed_url("shared/CAPPNodes_Agent.exe")}
 
+@app.get("/helper/download")
+async def helper_download():
+    """Public signed URL for CAPPNodesHelper.exe — the Ctrl+Alt+Delete helper the
+    agent installs on first run. Delivered separately (not embedded in the agent)
+    to avoid the exe-in-exe antivirus/onefile-extraction problems."""
+    return {"download_url": await _signed_url("shared/CAPPNodesHelper.exe")}
+
 
 @app.get("/converter/download")
 async def converter_download():
