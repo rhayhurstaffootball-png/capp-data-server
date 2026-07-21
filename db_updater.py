@@ -16,6 +16,7 @@ import requests
 import time
 import os
 import logging
+import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -119,25 +120,26 @@ def _load_alias_map(conn):
     try:
         for alias, team in cur.execute("SELECT alias, team FROM name_aliases"):
             if alias and team:
-                amap[alias.strip().upper()] = team.strip().upper()
+                amap[_strip_accents(alias).strip().upper()] = _strip_accents(team).strip().upper()
     except Exception as e:
         log.warning(f"Could not load name_aliases: {e}")
     return amap
 
 
-# CFBD uppercases accented letters (é -> É), but the teams table stores
-# "San José State" with a LOWERCASE é. SQLite compares é and É as unequal, so an
-# É-spelled schedule row never matches the selector's team list and the game
-# selector shows no games. Force the teams-table spelling for these names.
-_CANON_OVERRIDES = {
-    "SAN JOSÉ STATE": "SAN JOSé STATE",   # É -> é
-    "SAN JOSE STATE":      "SAN JOSé STATE",   # plain ASCII -> é
-}
+def _strip_accents(s):
+    """Fold accented letters to plain ASCII (é->e, É->E, ñ->n, …) so a team name
+    is byte-identical everywhere. The DB, the client's hardcoded team maps, the
+    game-selector dropdown, and the schedule query all use plain ASCII; SQLite's
+    UPPER()/casefold only fold ASCII, so an accented name ("San José State") never
+    matches its ASCII twin and the selector shows no games. Canonicalizing to
+    ASCII at the source (here) fixes it for every accented team, present and future
+    (e.g. San José State), without per-name special cases."""
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "")
+                   if not unicodedata.combining(c))
 
 def _canon(name, amap):
-    up = (name or "").strip().upper()
-    up = amap.get(up, up)
-    return _CANON_OVERRIDES.get(up, up)
+    up = _strip_accents(name).strip().upper()
+    return amap.get(up, up)
 
 # ── Supabase upload ───────────────────────────────────────────────────────────
 def upload_to_supabase(db_path):
