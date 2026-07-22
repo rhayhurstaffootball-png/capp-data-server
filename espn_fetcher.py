@@ -802,19 +802,27 @@ def _parse_play(play, drive_team_id, home_team_id, away_team_id):
     _skip = type_text.lower()
 
     # Filter pure administrative entries with no football content
-    if _skip in ("end period", "end of half", "end of game", "coin toss", "two-minute warning"):
+    if _skip in ("end period", "end of half", "end of game", "coin toss"):
         return None
 
-    # Detect officials timeout vs team timeout.
+    # Detect officials timeout / two-minute warning vs team timeout.
     # Team timeouts (type_text="Timeout" or type_id=21) must NOT be treated as OTO —
     # ESPN sometimes labels them "Official Timeout #1 by Air Force at 2:45" in the
     # description, which would otherwise be caught by the text-based OTO check.
+    # Authoritative ESPN play-type ids: 74 = Official Timeout, 75 = Two-minute warning.
+    # Both are emitted as OTO rows (yellow tree row + red scoreboard background).
     _is_team_timeout = (_skip == "timeout" or type_id == 21)
     _text_lower = play.get("text", "").lower()
     _is_oto = (not _is_team_timeout and
-               (_skip == "officials time out" or
+               (type_id in (74, 75) or
+                "official timeout" in _skip or
+                "officials time out" in _skip or
+                "two-minute warning" in _skip or
+                "two minute warning" in _skip or
                 "official timeout" in _text_lower or
-                "officials time out" in _text_lower))
+                "officials time out" in _text_lower or
+                "two-minute warning" in _text_lower or
+                "two minute warning" in _text_lower))
 
     clock_obj = play.get("clock", {})
     clock_display = clock_obj.get("displayValue", "0:00")
