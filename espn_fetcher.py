@@ -811,10 +811,21 @@ def _parse_play(play, drive_team_id, home_team_id, away_team_id):
     # description, which would otherwise be caught by the text-based OTO check.
     # Authoritative ESPN play-type ids: 74 = Official Timeout, 75 = Two-minute warning.
     # Both are emitted as OTO rows (yellow tree row + red scoreboard background).
-    _is_team_timeout = (_skip == "timeout" or type_id == 21)
     _text_lower = play.get("text", "").lower()
+    # ESPN's college-football feed delivers the two-minute warning as a type-21
+    # "Timeout" with an EMPTY team name ("Timeout , clock 02:00") — NOT as type 75.
+    # A real team timeout always names the team ("Timeout SMU, clock 08:46"). Treat
+    # a blank-team timeout as an officials/administrative stoppage (OTO): it burns no
+    # team timeout and turns the scoreboard red.
+    _stripped = _text_lower.strip()
+    _blank_team_to = (
+        (type_id == 21 or _skip == "timeout")
+        and _stripped.startswith("timeout")
+        and _stripped[len("timeout"):].split(",")[0].strip() == ""
+    )
+    _is_team_timeout = (_skip == "timeout" or type_id == 21) and not _blank_team_to
     _is_oto = (not _is_team_timeout and
-               (type_id in (74, 75) or
+               (type_id in (74, 75) or _blank_team_to or
                 "official timeout" in _skip or
                 "officials time out" in _skip or
                 "two-minute warning" in _skip or
