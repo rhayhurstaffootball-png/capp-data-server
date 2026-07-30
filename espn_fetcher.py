@@ -26,7 +26,21 @@ CFB_SUMMARY_URL    = "https://site.api.espn.com/apis/site/v2/sports/football/col
 NFL_SUMMARY_URL    = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
 
 REQUEST_TIMEOUT = 15
-POLL_INTERVAL   = 30
+POLL_INTERVAL   = 30     # legacy full-sweep interval — no longer used by _poll_loop
+
+# ── Demand-driven polling (Jul 30 2026) ──────────────────────────────────────
+# ESPN is called ONLY for games a client actually has open, and only as often as
+# that game's state warrants. With nobody watching, the poller makes ZERO
+# requests — it does not sweep the scoreboard and does not care what day it is.
+# Rationale + full design: see _poll_loop() and ROADMAP "Demand-driven ESPN polling".
+ACTIVE_GAME_TTL       = 180   # drop a game this long after the last client heartbeat
+POLL_LIVE_SECONDS     = 10    # status "in"  — full speed
+POLL_PRE_SECONDS      = 60    # status "pre" — watching for kickoff
+POLL_PRE_SLOW_SECONDS = 300   # a "pre" game that clearly isn't imminent
+PRE_FAST_WINDOW       = 900   # poll "pre" at 60s for this long, then back off to slow
+POST_GRACE_SECONDS    = 300   # hold a final game briefly for stat corrections, then stop
+POLLER_TICK           = 2     # loop wake-up; real work is scheduled per game
+LIVE_LIST_TTL         = 30    # /games scoreboard: fetched on demand, cached this long
 
 _session = requests.Session()
 
@@ -296,6 +310,11 @@ _last_poll_completed_at = 0.0
 _last_poll_duration_ms = 0.0
 _last_poll_error = ""
 _initial_poll_done = threading.Event()
+# game_id -> {league, last_seen, next_poll, final_since, pre_since}
+# Populated by mark_game_active() from client traffic; the ONLY thing the
+# poller will ever fetch. Empty dict == zero ESPN calls.
+_active_games = {}
+_games_cache_at = 0.0   # when the on-demand scoreboard list was last refreshed
 
 # ============================================================
 # Team Name Utilities
@@ -1326,59 +1345,157 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
 # Live Polling
 # ============================================================
 
+def mark_game_active(game_id, league="cfb"):
+    """Client heartbeat — 'a user has this game open right now'.
+
+    Called from the /game/{id}/plays and /game/{id}/version endpoints, which
+    clients ALREADY poll on a timer while a game window is open. That means no
+    client change and no new protocol: ordinary traffic is the signal. The game
+    ages out of the active set ACTIVE_GAME_TTL seconds after the last heartbeat,
+    so closing the window (or closing CAPP) stops the polling on its own.
+    """
+    if not game_id:
+        return
+    now = time.time()
+    with _lock:
+        entry = _active_games.get(game_id)
+        if entry:
+            entry["last_seen"] = now
+            if league:
+                entry["league"] = league
+        else:
+            _active_games[game_id] = {
+                "league":      league or "cfb",
+                "last_seen":   now,
+                "next_poll":   now,    # someone just asked — poll promptly
+                "final_since": 0.0,
+                "pre_since":   0.0,
+                "done":        False,   # set once a final game has settled
+            }
+
+
+def _schedule_next_poll(game_id, status):
+    """Set when this game should next be fetched, based on its own state."""
+    now = time.time()
+    with _lock:
+        entry = _active_games.get(game_id)
+        if not entry:
+            return
+        if status == "in":
+            entry["final_since"] = 0.0
+            entry["done"] = False
+            entry["next_poll"] = now + POLL_LIVE_SECONDS
+        elif status == "post":
+            # Final: hold briefly in case ESPN posts stat corrections, then stop
+            # polling it entirely even if the user leaves the window open.
+            if not entry["final_since"]:
+                entry["final_since"] = now
+            if now - entry["final_since"] >= POST_GRACE_SECONDS:
+                # Do NOT delete the entry here. The client is still heartbeating,
+                # so a delete just gets re-created as a fresh entry on the next
+                # request and re-polled immediately — a finished game would be
+                # re-fetched forever at heartbeat rate. Park it instead and let
+                # it age out normally when the user closes the window.
+                entry["done"] = True
+                entry["next_poll"] = now + 10 ** 9
+            else:
+                entry["next_poll"] = now + POLL_PRE_SECONDS
+        else:
+            # "pre" (or an errored fetch). Watch for kickoff at 60s while it's
+            # plausibly imminent, then back off — so a game opened days early,
+            # or a window left open, settles down instead of polling forever.
+            if not entry["pre_since"]:
+                entry["pre_since"] = now
+            imminent = (now - entry["pre_since"]) < PRE_FAST_WINDOW
+            entry["next_poll"] = now + (POLL_PRE_SECONDS if imminent
+                                        else POLL_PRE_SLOW_SECONDS)
+
+
+def _evict_caches(now=None):
+    """Cache housekeeping. Used to live inside the sweep loop, so with the poller
+    dead it never ran and _plays_cache could only grow."""
+    now = now or time.time()
+    with _lock:
+        _post_cutoff = now - 6 * 3600      # completed games older than 6 h
+        _any_cutoff = now - 24 * 3600      # any non-live game older than 24 h
+        stale = [
+            gid for gid, v in _plays_cache.items()
+            if (v.get("status") == "post" and v.get("fetched_at", 0) < _post_cutoff)
+            or (v.get("status") != "in" and v.get("fetched_at", 0) < _any_cutoff)
+        ]
+        for gid in stale:
+            del _plays_cache[gid]
+        # Schedule cache entries are TTL-checked on read, but ones never
+        # re-requested would otherwise sit in memory forever.
+        _sched_cutoff = now - _SCHEDULE_CACHE_SECONDS
+        stale_sched = [k for k, ts in _schedule_ts.items() if ts < _sched_cutoff]
+        for k in stale_sched:
+            _schedule_cache.pop(k, None)
+            _schedule_ts.pop(k, None)
+
+
 def _poll_loop():
+    """Demand-driven poller.
+
+    Polls ONLY games a client currently has open (registered by
+    mark_game_active from ordinary client traffic), at a rate set by each
+    game's own status:
+
+        "in"   -> every POLL_LIVE_SECONDS (10s)   — full speed
+        "pre"  -> every POLL_PRE_SECONDS (60s) while kickoff looks imminent,
+                  then POLL_PRE_SLOW_SECONDS
+        "post" -> briefly, for stat corrections, then the game is dropped
+
+    With no active games this makes NO ESPN requests at all — it only wakes to
+    expire heartbeats and run cache housekeeping. It does not sweep the
+    scoreboard and has no notion of "game day"; a real user opening a real game
+    is the only thing that ever triggers a fetch.
+
+    (Replaced a loop that hit the ENTIRE CFB+NFL scoreboard every 30s forever,
+    plus a per-game play fetch for every live game in the country — ~6,200
+    calls/hour at Saturday peak, and 5,760/day even in the off-season.)
+    """
+    last_housekeeping = 0.0
     while True:
-        poll_started = time.time()
-        new_games = []
-        poll_errors = []
-        for league in ["cfb", "nfl"]:
-            try:
-                events = _fetch_scoreboard(league, {})
-                games = _events_to_games(events, league)
-                new_games.extend(games)
-                for g in games:
-                    if g["status"] == "in":
-                        try:
-                            mapped = _fetch_game_plays_mapped(g["game_id"], league)
-                            with _lock:
-                                _plays_cache[g["game_id"]] = mapped
-                        except Exception as e:
-                            print(f"Live plays error ({g['game_id']}): {e}")
-                            poll_errors.append(f"Live plays error ({g['game_id']}): {e}")
-            except Exception as e:
-                print(f"Poll error ({league}): {e}")
-                poll_errors.append(f"Poll error ({league}): {e}")
-
+        now = time.time()
+        due = []
         with _lock:
-            _games_cache.clear()
-            _games_cache.extend(new_games)
-            now = time.time()
-            # Evict completed games older than 6 hours
-            _post_cutoff = now - 6 * 3600
-            # Evict any non-live game (pre/unknown status) older than 24 hours
-            _any_cutoff = now - 24 * 3600
-            stale = [
-                gid for gid, v in _plays_cache.items()
-                if (v.get("status") == "post" and v.get("fetched_at", 0) < _post_cutoff)
-                or (v.get("status") != "in" and v.get("fetched_at", 0) < _any_cutoff)
-            ]
-            for gid in stale:
-                del _plays_cache[gid]
-            # Evict schedule cache entries older than their TTL — they get replaced on
-            # next request, but entries never re-requested would otherwise stay forever
-            _sched_cutoff = now - _SCHEDULE_CACHE_SECONDS
-            stale_sched = [k for k, ts in _schedule_ts.items() if ts < _sched_cutoff]
-            for k in stale_sched:
-                _schedule_cache.pop(k, None)
-                _schedule_ts.pop(k, None)
-            global _last_poll_started_at, _last_poll_completed_at, _last_poll_duration_ms, _last_poll_error
-            _last_poll_started_at = poll_started
-            _last_poll_completed_at = time.time()
-            _last_poll_duration_ms = max(0.0, (_last_poll_completed_at - poll_started) * 1000)
-            _last_poll_error = " | ".join(poll_errors[:3])
-        _initial_poll_done.set()
+            for gid in [g for g, e in _active_games.items()
+                        if now - e["last_seen"] > ACTIVE_GAME_TTL]:
+                del _active_games[gid]          # nobody is watching this any more
+            for gid, entry in _active_games.items():
+                if entry["next_poll"] <= now:
+                    due.append((gid, entry["league"]))
 
-        time.sleep(POLL_INTERVAL)
+        if due:
+            poll_started = time.time()
+            poll_errors = []
+            for gid, league in due:
+                try:
+                    mapped = _fetch_game_plays_mapped(gid, league)
+                    with _lock:
+                        _plays_cache[gid] = mapped
+                    _schedule_next_poll(gid, mapped.get("status", ""))
+                except Exception as e:
+                    print(f"Live plays error ({gid}): {e}")
+                    poll_errors.append(f"Live plays error ({gid}): {e}")
+                    _schedule_next_poll(gid, "")   # back off; never hot-loop on errors
+            with _lock:
+                global _last_poll_started_at, _last_poll_completed_at
+                global _last_poll_duration_ms, _last_poll_error
+                _last_poll_started_at = poll_started
+                _last_poll_completed_at = time.time()
+                _last_poll_duration_ms = max(0.0, (_last_poll_completed_at - poll_started) * 1000)
+                _last_poll_error = " | ".join(poll_errors[:3])
+
+        if now - last_housekeeping >= 60:
+            _evict_caches(now)
+            last_housekeeping = now
+
+        # Set once the loop is running. Idle is a HEALTHY state here, so this no
+        # longer means "we have polled ESPN" — it means the poller is up.
+        _initial_poll_done.set()
+        time.sleep(POLLER_TICK)
 
 def start_poller():
     global _poller_thread, _poller_started_at
@@ -1401,7 +1518,9 @@ def get_fetcher_metrics() -> dict:
         last_duration_ms = _last_poll_duration_ms
         last_error = _last_poll_error
         poller_started_at = _poller_started_at
+        active_games = {gid: dict(e) for gid, e in _active_games.items()}
 
+    pending_games = [gid for gid, e in active_games.items() if not e.get("done")]
     live_games = [g for g in games_cache if g.get("status") == "in"]
     final_cached = sum(1 for value in plays_cache.values() if value.get("status") == "post")
     live_cached = sum(1 for value in plays_cache.values() if value.get("status") == "in")
@@ -1420,6 +1539,15 @@ def get_fetcher_metrics() -> dict:
         "plays_cache_count": len(plays_cache),
         "plays_cache_live_count": live_cached,
         "plays_cache_post_count": final_cached,
+        # Demand-driven polling: "idle" means nobody has a game open, which is
+        # the CORRECT state most of the year — not an outage. Health checks must
+        # not alarm on it.
+        # "pending" = games still being polled. A finished game the user hasn't
+        # closed yet is tracked but parked, so it must not count as active work.
+        "idle": len(pending_games) == 0,
+        "active_games_count": len(pending_games),
+        "active_game_ids": sorted(pending_games)[:20],
+        "tracked_games_count": len(active_games),
     }
 
 
@@ -1475,9 +1603,31 @@ def get_game_monitor_rows() -> list:
 # Public API
 # ============================================================
 
+def _refresh_live_list_if_stale():
+    """The scoreboard is no longer swept in the background, so the live-games
+    list is fetched when something actually asks for it and cached briefly.
+    Nobody calls /games -> the scoreboard is never hit."""
+    global _games_cache_at
+    with _lock:
+        if (time.time() - _games_cache_at) < LIVE_LIST_TTL:
+            return
+    new_games = []
+    for lg in ("cfb", "nfl"):
+        try:
+            new_games.extend(_events_to_games(_fetch_scoreboard(lg, {}), lg))
+        except Exception as e:
+            print(f"Live list error ({lg}): {e}")
+    with _lock:
+        _games_cache.clear()
+        _games_cache.extend(new_games)
+        # Stamped even on failure so an outage can't turn this into a hot retry loop.
+        _games_cache_at = time.time()
+
+
 def get_live_games(league="all", year=None, week=None, seasontype=2):
     if year is not None and week is not None:
         return _fetch_historical_games(league=league, year=year, week=week, seasontype=seasontype)
+    _refresh_live_list_if_stale()
     with _lock:
         games = list(_games_cache)
     if league != "all":

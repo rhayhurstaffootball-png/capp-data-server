@@ -18,6 +18,7 @@ from espn_fetcher import (
     get_game_plays,
     get_game_version,
     start_poller,
+    mark_game_active,
     get_team_list,
     get_team_schedule,
     get_fetcher_metrics,
@@ -379,6 +380,11 @@ async def lifespan(app: FastAPI):
                       id="evict_poll_buffers", replace_existing=True)
     scheduler.start()
     SCHEDULER_STARTED_AT = time.time()
+    # MUST live here, not in @app.on_event("startup") — FastAPI IGNORES on_event
+    # handlers entirely when a lifespan is supplied, which silently killed the
+    # poller from Mar 10 2026 (commit ef8d443, the commit that added lifespan)
+    # until Jul 30 2026. Anything that needs to run at startup goes in here.
+    start_poller()
     yield
     scheduler.shutdown()
 
@@ -468,10 +474,6 @@ async def get_client_id(x_api_key: str = Header(..., description="CAPP API key")
     if not row["active"]:
         raise HTTPException(status_code=401, detail="Account is not active")
     return row["client_id"]
-
-@app.on_event("startup")
-def startup():
-    start_poller()
 
 @app.get("/health")
 def health():
@@ -606,6 +608,9 @@ def plays(
     force_refresh: bool = Query(False, description="Bypass cache and re-fetch from API"),
 ):
     started = time.perf_counter()
+    # Heartbeat: a client asking for plays means a user has this game open, which
+    # is what registers it for background polling. No client change needed.
+    mark_game_active(game_id, league)
     try:
         payload = get_game_plays(game_id, league=league, force_refresh=force_refresh)
         latency_ms = (time.perf_counter() - started) * 1000
@@ -626,6 +631,7 @@ def game_version(game_id: str):
     cached entry.  Clients poll this every 60 s to detect retroactive data
     corrections without re-downloading the full play list each time."""
     started = time.perf_counter()
+    mark_game_active(game_id)          # heartbeat — see /plays above
     payload = {"game_id": game_id, "fetched_at": get_game_version(game_id)}
     latency_ms = (time.perf_counter() - started) * 1000
     _record_game_request(game_id, "version", latency_ms, 200, payload_bytes=len(json.dumps(payload).encode("utf-8")))
