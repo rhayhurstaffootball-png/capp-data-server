@@ -1573,6 +1573,22 @@ def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> 
     data = r.json()
 
     all_events = list(data.get("events", []))
+    # Preseason (NFL only — college has no preseason). The default fetch above
+    # returns the REGULAR season, so preseason games are invisible unless asked
+    # for explicitly. Prepended so the schedule reads pre -> reg -> post.
+    preseason_ids: set = set()
+    if league == "nfl":
+        try:
+            pre_params = dict(params)
+            pre_params["seasontype"] = 1
+            pre_r = _session.get(url, params=pre_params, timeout=REQUEST_TIMEOUT)
+            if pre_r.ok:
+                pre_events = pre_r.json().get("events", [])
+                preseason_ids = {e.get("id") for e in pre_events}
+                all_events = pre_events + all_events
+        except Exception:
+            pass
+
     postseason_ids: set = set()
     try:
         post_params = dict(params)
@@ -1586,7 +1602,16 @@ def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> 
         pass
 
     games = []
+    _seen_event_ids: set = set()
     for event in all_events:
+        # The default (no-seasontype) fetch follows ESPN's CURRENT phase, so once
+        # the preseason window opens it can return the same events as the
+        # seasontype=1 fetch above. Keep the first occurrence only.
+        _eid = event.get("id")
+        if _eid in _seen_event_ids:
+            continue
+        _seen_event_ids.add(_eid)
+
         competition = event.get("competitions", [{}])[0]
         status_obj  = competition.get("status", {})
         state  = status_obj.get("type", {}).get("state", "pre")
@@ -1634,7 +1659,8 @@ def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> 
             "conference":    conf_name,
             "date":          event.get("date", ""),
             "week":          event.get("week", {}).get("number", ""),
-            "season_type":   3 if event.get("id") in postseason_ids else 2,
+            "season_type":   1 if event.get("id") in preseason_ids
+                             else 3 if event.get("id") in postseason_ids else 2,
         })
 
     _schedule_cache[cache_key] = games
