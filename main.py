@@ -2916,6 +2916,190 @@ async def _require_player(x_pb_token: str = Header("")):
     return u
 
 
+# ── Binder password reset ────────────────────────────────────────────────────
+# Stateless, single-use, 60-min links — no reset_token columns on
+# playbook_users and no migration to run. The signing key mixes in the row's
+# CURRENT pw_hash/pw_salt, so the moment the password changes the key changes
+# and every previously-issued link stops verifying. That buys single-use for
+# free, and it also means a second "send reset" silently invalidates the first
+# only after one of them is USED (both remain valid until then — deliberate:
+# an admin re-sending because the player "didn't get it" must not kill the
+# copy that was actually delivered).
+#
+# The player's existing password keeps working until the link is used, so a
+# reset can never lock anyone out. That matters here: roster emails at a
+# service academy are formulaic (c30first.last@...), so any flow that blanks
+# the password would leave a guessable, claimable account sitting open.
+_PB_RESET_TTL_MIN = 60
+BINDER_URL = os.environ.get("BINDER_URL", "https://www.cappvcs.com/binder/")
+_pb_reset_last_sent: dict = {}      # email -> epoch seconds (throttle)
+
+
+def _pb_reset_secret(u: dict) -> str:
+    """Per-user signing key. Binding the current password material in is what
+    makes an issued link die the instant the password is changed."""
+    return f"{_PB_TOKEN_SECRET}|pbreset|{u.get('pw_hash') or 'nopw'}|{u.get('pw_salt') or ''}"
+
+
+def _pb_make_reset_token(u: dict) -> str:
+    exp = int(_time.time()) + _PB_RESET_TTL_MIN * 60
+    msg = f"{u['email']}|{exp}"
+    sig = _hmac.new(_pb_reset_secret(u).encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return _b64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+
+
+async def _pb_read_reset_token(token: str):
+    """Returns the full user row for a valid, unexpired, unused reset token —
+    otherwise None. The row is re-read from the DB every time, so a deleted
+    player's link stops working immediately."""
+    try:
+        raw = _b64.urlsafe_b64decode((token or "").encode()).decode()
+        email, exp, sig = raw.rsplit("|", 2)
+        if int(exp) < _time.time():
+            return None
+    except Exception:
+        return None
+    u = await _pb_get(_norm_email(email))
+    if not u:
+        return None
+    good = _hmac.new(_pb_reset_secret(u).encode(), f"{email}|{exp}".encode(),
+                     hashlib.sha256).hexdigest()
+    return u if _hmac.compare_digest(good, sig) else None
+
+
+def _send_pb_reset_email(to_email: str, first_name: str, team_name: str, reset_url: str) -> None:
+    """Binder-branded reset email. RAISES if SMTP isn't configured or the send
+    fails — unlike the notify email, an admin pressing this button needs to be
+    told it didn't go out rather than getting a silent success."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host = os.environ.get("SMTP_HOST", "")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    from_addr = os.environ.get("FROM_EMAIL", smtp_user)
+    if not smtp_host or not smtp_user or not smtp_pass:
+        raise RuntimeError("SMTP not configured")
+
+    first = (first_name or "").strip() or "there"
+    body_html = f"""
+    <div style="font-family:'Segoe UI',Arial,sans-serif;background:#070a0f;color:#e8edf5;padding:40px 0;">
+      <div style="max-width:480px;margin:0 auto;background:#111825;border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:36px;">
+        <div style="text-align:center;margin-bottom:24px;">
+          <img src="https://cappvcs.com/capplogo.png" alt="CAPP" style="height:36px;" />
+        </div>
+        <h2 style="color:#e8edf5;font-size:1.15rem;font-weight:700;margin:0 0 10px;">Reset your {team_name} playbook password</h2>
+        <p style="color:#8b96a8;font-size:0.9rem;margin:0 0 22px;">
+          Hey {first} — use the button below to choose a new password. This link
+          works once and expires in {_PB_RESET_TTL_MIN} minutes. Until you use it,
+          your current password still works.
+        </p>
+        <div style="text-align:center;margin-bottom:22px;">
+          <a href="{reset_url}" style="display:inline-block;background:#0873EC;color:#fff;text-decoration:none;padding:12px 28px;border-radius:8px;font-size:0.9rem;font-weight:700;">Choose a New Password</a>
+        </div>
+        <p style="color:#8b96a8;font-size:0.78rem;margin:0;">
+          Didn't ask for this? Ignore this email — nothing has changed.
+        </p>
+      </div>
+    </div>
+    """
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Reset your {team_name} playbook password"
+    msg["From"]    = f"CAPP Binder <{from_addr}>"
+    msg["To"]      = to_email
+    msg.attach(MIMEText(body_html, "html"))
+    with smtplib.SMTP(smtp_host, smtp_port) as s:
+        s.starttls()
+        s.login(smtp_user, smtp_pass)
+        s.sendmail(from_addr, [to_email], msg.as_string())
+
+
+async def _pb_send_reset(u: dict) -> str:
+    """Mint a link for this roster row and email it. Returns the address used.
+    Raises on SMTP failure so callers can surface it."""
+    team = await _team_get(team_id=u["team_id"])
+    team_name = (team or {}).get("name", "your team")
+    sep = "&" if "?" in BINDER_URL else "?"
+    url = f"{BINDER_URL}{sep}rt={_pb_make_reset_token(u)}"
+    _send_pb_reset_email(u["email"], u.get("first_name", ""), team_name, url)
+    return u["email"]
+
+
+@app.post("/playbook/reset-request")
+async def playbook_reset_request(email: str = Body(..., embed=True)):
+    """Self-service 'Forgot password?' from the Binder login. The response is
+    identical whether or not the email is on a roster — otherwise this endpoint
+    would confirm who is on a team to anyone who asked."""
+    generic = {"ok": True, "message": "If that email is on a roster, a reset link is on its way."}
+    email = _norm_email(email)
+    if not email or "@" not in email:
+        return generic
+    u = await _pb_get(email)
+    if not u or not await _team_is_active(u["team_id"]):
+        return generic
+    now = _time.time()
+    if now - _pb_reset_last_sent.get(email, 0) < 60:
+        return generic                      # throttle repeats, still generic
+    try:
+        await _pb_send_reset(u)
+        _pb_reset_last_sent[email] = now
+        print(f"[PBRESET] link sent to {email}", flush=True)
+    except Exception as e:
+        print(f"[PBRESET] FAILED for {email}: {e}", flush=True)
+    return generic
+
+
+@app.post("/playbook/reset-confirm")
+async def playbook_reset_confirm(token: str = Body(..., embed=True),
+                                 password: str = Body(..., embed=True)):
+    """Finish a reset: validate the emailed token and set the new password.
+    Signs them straight in, same as first-time setup, so there's no bounce back
+    to a login screen right after choosing a password."""
+    if len(password or "") < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    u = await _pb_read_reset_token(token)
+    if not u:
+        raise HTTPException(status_code=400,
+                            detail="This reset link is invalid, expired, or was already used. Request a new one.")
+    if not await _team_is_active(u["team_id"]):
+        raise HTTPException(status_code=403, detail="This team's account is currently deactivated.")
+    salt = _secrets.token_hex(8)
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+            params={"id": f"eq.{u['id']}"},
+            json={"pw_salt": salt, "pw_hash": _hash_pw(password, salt),
+                  "password_set_at": _dt.now(_tz.utc).isoformat()},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    print(f"[PBRESET] password updated for {u['email']}", flush=True)
+    return {"status": "ok", "token": _pb_make_token(u["email"]),
+            "email": u["email"],
+            "first_name": u.get("first_name", ""),
+            "last_name": u.get("last_name", ""), "position": u.get("position", "")}
+
+
+@app.post("/admin/api/playbook/users/{uid}/send-reset", dependencies=[Depends(_require_admin)])
+async def admin_playbook_send_reset(uid: str):
+    """Owner admin panel — email a reset link to one roster member."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "*", "id": f"eq.{uid}", "limit": "1"},
+                        headers=_supa_headers_json())
+    rows = g.json() if g.status_code == 200 else []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No such roster member.")
+    try:
+        email = await _pb_send_reset(rows[0])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not send: {e}")
+    return {"ok": True, "email": email, "minutes": _PB_RESET_TTL_MIN}
+
+
 @app.post("/playbook/push/subscribe")
 async def playbook_push_subscribe(payload: dict = Body(...), _u: dict = Depends(_require_player)):
     """Register (or refresh) this browser/device's push subscription. Upserts
@@ -3715,6 +3899,29 @@ async def team_admin_roster_delete(uid: str, _u: dict = Depends(_require_team_ad
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
+
+
+@app.post("/team-admin/roster/{uid}/send-reset")
+async def team_admin_send_reset(uid: str, _u: dict = Depends(_require_team_admin)):
+    """Team Admin — email a reset link to someone on THEIR OWN roster. 404s on a
+    row from another team (same guard as the delete/promote endpoints) so an id
+    from outside the team can't be used to trigger mail to a stranger.
+    Defined down here, not with the other reset endpoints, because
+    _require_team_admin is declared below them and Depends() resolves at
+    decoration time — see the import-check note in MEMORY.md."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "*", "id": f"eq.{uid}",
+                                "team_id": f"eq.{_u['team_id']}", "limit": "1"},
+                        headers=_scoped_headers(_u["team_id"]))
+    rows = g.json() if g.status_code == 200 else []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Not found.")
+    try:
+        email = await _pb_send_reset(rows[0])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not send: {e}")
+    return {"ok": True, "email": email, "minutes": _PB_RESET_TTL_MIN}
 
 
 @app.post("/team-admin/admins/{uid}")
@@ -5919,7 +6126,10 @@ function renderPlaybookUsers(){
       "<td>"+(pbEsc(u.position)||"—")+"</td>"+
       "<td>"+pbEsc(u.email)+"</td>"+
       "<td>"+(u.active?'<span style="color:#22c55e;">Set up</span>':'<span style="color:#8b95a1;">Pending</span>')+"</td>"+
-      '<td><button class="btn btn-danger btn-sm" onclick="deletePlaybookUser(\\''+u.id+'\\',\\''+pbEsc(u.email)+'\\')">Delete</button></td>'+
+      '<td style="white-space:nowrap">'+
+        '<button class="btn btn-warning btn-sm" onclick="sendPlaybookReset(\\''+u.id+'\\',\\''+pbEsc(u.email)+'\\')">Send Password Reset</button> '+
+        '<button class="btn btn-danger btn-sm" onclick="deletePlaybookUser(\\''+u.id+'\\',\\''+pbEsc(u.email)+'\\')">Delete</button>'+
+      '</td>'+
     "</tr>";
   }).join("");
   var setup=data.filter(function(u){return u.active;}).length;
@@ -5930,6 +6140,14 @@ function renderPlaybookUsers(){
 function deletePlaybookUser(id,email){
   if(!confirm("Remove "+email+"? They will lose access to the playbook.")) return;
   api("DELETE","/playbook/users/"+id).then(function(){ loadPlaybookUsers(); });
+}
+
+function sendPlaybookReset(id,email){
+  if(!confirm("Email a password-reset link to "+email+"?\\nTheir current password keeps working until they use it.")) return;
+  api("POST","/playbook/users/"+id+"/send-reset").then(function(d){
+    if(d&&d.ok) alert("Reset link sent to "+d.email+" (valid "+(d.minutes||60)+" minutes).");
+    else alert("Could not send: "+((d&&d.detail)||"unknown error"));
+  }).catch(function(e){ alert("Could not send: "+e); });
 }
 
 function exportPlaybookUsers(){
