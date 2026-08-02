@@ -4089,6 +4089,131 @@ async def coach_pb_delete_folder(folder_id: str, _u: dict = Depends(_require_coa
     return {"ok": True}
 
 
+def _pb_norm_path(p) -> str:
+    """'/a//b/ ' -> 'a/b'. Collapses blanks so a stray slash can't create a
+    folder row that no tree path will ever match."""
+    return "/".join(s.strip() for s in str(p or "").split("/") if s.strip())
+
+
+def _pb_under(path: str, folder: str) -> bool:
+    """True if `folder` IS `path` or sits underneath it. Deliberately a plain
+    prefix test rather than a PostgREST `like` filter — folder names here
+    contain characters LIKE treats as wildcards ('_' matches any single char),
+    so a name like '01 - OFFENSE' would silently over-match."""
+    return folder == path or folder.startswith(path + "/")
+
+
+@app.post("/coach/playbook/folders/rename")
+async def coach_pb_rename_folder(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Rename/move a folder and everything under it, for THIS coach's team.
+
+    Rewrites folder_path on every doc and every registered folder row at or
+    below `from`. There is no single-statement way to do a prefix rewrite
+    through PostgREST, so rows are fetched, filtered in Python, and patched
+    individually — the counts involved are small (hundreds at most)."""
+    team_id = _u["team_id"]
+    src = _pb_norm_path(payload.get("from"))
+    dst = _pb_norm_path(payload.get("to"))
+    if not src or not dst:
+        raise HTTPException(status_code=400, detail="Both a source and a new name are required.")
+    if src == dst:
+        return {"ok": True, "docs": 0, "folders": 0, "to": dst}
+    # Moving a folder inside itself would orphan the whole subtree.
+    if _pb_under(src, dst):
+        raise HTTPException(status_code=400, detail="A folder can't be moved inside itself.")
+
+    async with httpx.AsyncClient() as c:
+        d = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "id,folder_path", "team_id": f"eq.{team_id}"},
+                        headers=_scoped_headers(team_id))
+        f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "id,folder_path", "team_id": f"eq.{team_id}"},
+                        headers=_scoped_headers(team_id))
+        if d.status_code != 200:
+            raise HTTPException(status_code=500, detail=d.text)
+        docs = [x for x in d.json() if _pb_under(src, (x.get("folder_path") or ""))]
+        folders = [x for x in (f.json() if f.status_code == 200 else [])
+                   if _pb_under(src, (x.get("folder_path") or ""))]
+        if not docs and not folders:
+            raise HTTPException(status_code=404, detail="That folder no longer exists.")
+
+        def moved(old: str) -> str:
+            return dst + old[len(src):]
+
+        for row in docs:
+            r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                              params={"id": f"eq.{row['id']}"},
+                              json={"folder_path": moved(row.get("folder_path") or "")},
+                              headers={**_scoped_headers(team_id), "Prefer": "return=minimal"})
+            if r.status_code not in (200, 204):
+                raise HTTPException(status_code=500, detail=r.text)
+        for row in folders:
+            # A row may already exist at the destination path (unique on
+            # team_id,folder_path) — drop this one instead of failing the rename.
+            r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                              params={"id": f"eq.{row['id']}"},
+                              json={"folder_path": moved(row.get("folder_path") or "")},
+                              headers={**_scoped_headers(team_id), "Prefer": "return=minimal"})
+            if r.status_code == 409:
+                await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                               params={"id": f"eq.{row['id']}"},
+                               headers={**_scoped_headers(team_id), "Prefer": "return=minimal"})
+            elif r.status_code not in (200, 204):
+                raise HTTPException(status_code=500, detail=r.text)
+
+    print(f"[PBFOLDER] {team_id} rename {src!r} -> {dst!r} "
+          f"({len(docs)} docs, {len(folders)} folders)", flush=True)
+    return {"ok": True, "docs": len(docs), "folders": len(folders), "to": dst}
+
+
+@app.post("/coach/playbook/folders/delete")
+async def coach_pb_delete_folder_by_path(payload: dict = Body(...),
+                                         _u: dict = Depends(_require_coach)):
+    """Delete a folder (and its empty descendants) BY PATH, for this coach's team.
+
+    Refuses if any document sits at or under it and says what's in the way —
+    a coach clicking Delete on a game folder in the tree should never be one
+    click away from wiping a season of content. Deleting the files first is a
+    deliberate, separate act. (The by-id sibling endpoint above only removes a
+    single empty-folder registration row.)"""
+    team_id = _u["team_id"]
+    path = _pb_norm_path(payload.get("path"))
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+
+    async with httpx.AsyncClient() as c:
+        d = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "id,title,folder_path", "team_id": f"eq.{team_id}"},
+                        headers=_scoped_headers(team_id))
+        if d.status_code != 200:
+            raise HTTPException(status_code=500, detail=d.text)
+        inside = [x for x in d.json() if _pb_under(path, (x.get("folder_path") or ""))]
+        if inside:
+            sample = ", ".join((x.get("title") or "?") for x in inside[:3])
+            more = f" and {len(inside) - 3} more" if len(inside) > 3 else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(f'"{path}" still holds {len(inside)} file(s): {sample}{more}. '
+                        f"Delete or move those first."))
+
+        f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "id,folder_path", "team_id": f"eq.{team_id}"},
+                        headers=_scoped_headers(team_id))
+        rows = [x for x in (f.json() if f.status_code == 200 else [])
+                if _pb_under(path, (x.get("folder_path") or ""))]
+        if not rows:
+            raise HTTPException(status_code=404, detail="That folder no longer exists.")
+        for row in rows:
+            r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                               params={"id": f"eq.{row['id']}"},
+                               headers={**_scoped_headers(team_id), "Prefer": "return=minimal"})
+            if r.status_code not in (200, 204):
+                raise HTTPException(status_code=500, detail=r.text)
+
+    print(f"[PBFOLDER] {team_id} delete {path!r} ({len(rows)} folder rows)", flush=True)
+    return {"ok": True, "folders": len(rows)}
+
+
 @app.post("/coach/playbook/sign-upload")
 async def coach_pb_sign_upload(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
     """Presigned PUT for a coach upload. PDFs go straight to the content area;
