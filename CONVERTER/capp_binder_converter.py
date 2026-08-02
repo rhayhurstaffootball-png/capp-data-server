@@ -36,6 +36,13 @@ POLL_SECONDS = 5
 WORKER_NAME = socket.gethostname()[:64]
 APP_NAME = "CAPP Binder Converter"
 
+# This build's version. Stamped by build_converter.ps1 -Version at build time,
+# exactly like AGENT_VERSION in capp_agent.py. An installed converter compares
+# this against GET /converter/version (the CONVERTER_VERSION env var on Render)
+# and silently updates itself when Render reports a higher one — so BOTH have to
+# move for a release to reach anybody: upload the new exe AND bump the env var.
+CONVERTER_VERSION = "1.0.0"
+
 _FROZEN = bool(getattr(sys, "frozen", False))
 
 # ── where this install lives ─────────────────────────────────────────────────
@@ -300,6 +307,125 @@ def _register_with_pairing_token_file() -> None:
             _PAIRING_TOKEN_PATH.unlink()
         except Exception:
             pass
+
+
+# ── silent self-update ───────────────────────────────────────────────────────
+# Same shape as the CAPP Nodes Agent's check (GET the server's current version,
+# compare tuples, download, swap the exe via a script that waits for this
+# process to exit, relaunch) with one deliberate difference: the Agent shows an
+# "Update Available" window with Update Now / Later. This converter is designed
+# to be completely invisible — no window, no console, no tray — so there is
+# nobody to click "Later" and prompting would break that contract. It updates
+# itself quietly and only says so in converter.log.
+#
+# Two rules keep it from being disruptive:
+#   - frozen only. A source/dev run has no exe to replace.
+#   - IDLE only. The check is made from the "no job claimed" branch of the main
+#     loop, so an update can never interrupt a conversion halfway through and
+#     lose a coach's upload.
+_UPDATE_EVERY_SECONDS = 6 * 60 * 60      # this thing runs for weeks between reboots
+_MIN_SANE_EXE_BYTES = 20_000_000         # real build is ~128MB; guards a partial download
+
+
+def _vtuple(v):
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except Exception:
+        return (0,)
+
+
+def _http_json(url: str, timeout: int = 15) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8") or "{}")
+
+
+def _check_for_update():
+    """Server's converter version if it's newer than this build, else None."""
+    try:
+        server_v = str(_http_json(f"{SERVER}/converter/version").get("version", "")).strip()
+        if server_v and _vtuple(server_v) > _vtuple(CONVERTER_VERSION):
+            return server_v
+    except Exception as e:
+        log(f"(update check failed: {e})")
+    return None
+
+
+def _self_update(new_version: str) -> bool:
+    """Replace this exe with the current build and relaunch. On success the
+    process exits and never returns."""
+    if not _FROZEN:
+        return False
+    try:
+        running_exe = pathlib.Path(sys.executable).resolve()
+        log(f"update available: v{new_version} (running v{CONVERTER_VERSION}) — downloading ...")
+        url = _http_json(f"{SERVER}/converter/download").get("download_url", "")
+        if not url:
+            log("  update aborted: server returned no download link")
+            return False
+
+        # NOTE: no ?t= pairing token on this URL. The relay only appends the
+        # token trailer when one is requested, so this comes down as a CLEAN
+        # exe — which is exactly right. This machine is already paired and its
+        # device_token.json is untouched by the swap.
+        # Streamed, not http_get() — that buffers the whole body in memory, and
+        # this payload is ~128MB on a machine that is also running Office.
+        new_path = running_exe.with_suffix(running_exe.suffix + ".new")
+        with urllib.request.urlopen(url, timeout=600) as r, open(new_path, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 512)
+                if not chunk:
+                    break
+                f.write(chunk)
+        size = new_path.stat().st_size if new_path.exists() else 0
+        if size < _MIN_SANE_EXE_BYTES:
+            log(f"  update aborted: download looked incomplete ({size} bytes)")
+            try:
+                new_path.unlink()
+            except Exception:
+                pass
+            return False
+
+        # Office has to be let go before the exe is replaced, or the COM
+        # servers outlive the swap and the relaunched copy fights them.
+        try:
+            _reset_office()
+        except Exception:
+            pass
+
+        pid = os.getpid()
+        bat = pathlib.Path(tempfile.gettempdir()) / "capp_binder_converter_swap.bat"
+        bat.write_text(
+            "@echo off\r\n"
+            ":loop\r\n"
+            f'tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL\r\n'
+            "if not errorlevel 1 ( timeout /t 1 /nobreak >NUL & goto loop )\r\n"
+            f'copy /Y "{new_path}" "{running_exe}" >NUL\r\n'
+            f'del /Q "{new_path}" >NUL\r\n'
+            f'start "" "{running_exe}"\r\n'
+            'del /Q "%~f0" >NUL\r\n',
+            encoding="utf-8")
+        log(f"  downloaded v{new_version}; swapping and restarting ...")
+        import subprocess
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)  # CREATE_NO_WINDOW
+        os._exit(0)
+    except Exception as e:
+        log(f"  update failed: {e}")
+        return False
+
+
+def _maybe_update(state: dict) -> None:
+    """Called from the idle branch of the main loop. Rate-limited so a converter
+    sitting idle for a week isn't hitting the server constantly."""
+    if not _FROZEN:
+        return
+    now = time.time()
+    if now - state.get("last_update_check", 0) < _UPDATE_EVERY_SECONDS:
+        return
+    state["last_update_check"] = now
+    newer = _check_for_update()
+    if newer:
+        _self_update(newer)
 
 
 def _worker_token() -> str:
@@ -846,8 +972,13 @@ def main() -> None:
     import pythoncom
     pythoncom.CoInitialize()
     _trim_log()
-    log(f"{APP_NAME} '{WORKER_NAME}' polling {SERVER} every {POLL_SECONDS}s "
-        f"(paired mode; installed at {_APP_DIR}).")
+    log(f"{APP_NAME} v{CONVERTER_VERSION} '{WORKER_NAME}' polling {SERVER} every "
+        f"{POLL_SECONDS}s (paired mode; installed at {_APP_DIR}).")
+    # Check once at startup, before any job is claimed — a converter that has
+    # been off for a month should come back current rather than run a stale
+    # build until the first 6-hour tick.
+    _upd_state = {"last_update_check": 0.0}
+    _maybe_update(_upd_state)
     if vtp is None:
         log(f"converter toolkit NOT loaded ({globals().get('_VTP_IMPORT_ERR', 'missing')}) — "
             f"font protections off, plain export only")
@@ -878,6 +1009,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
         if not claim.get("job"):
+            _maybe_update(_upd_state)   # idle only — never mid-conversion
             time.sleep(POLL_SECONDS)
             continue
         job_id = claim["job"]["id"]
