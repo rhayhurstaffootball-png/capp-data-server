@@ -1,9 +1,9 @@
 """CAPP Binder conversion worker.
 
-Runs on a Windows PC that has Microsoft Visio and PowerPoint installed
+Runs on a Windows PC that has Microsoft Word, Visio and PowerPoint installed
 (Roger's machine). Polls the CAPP server for queued playbook conversion jobs
-(uploaded .vsd/.vsdx/.vsdm/.ppt/.pptx files), converts each to PDF via Office
-COM, normalizes page sizes, uploads the PDF to R2 through the server's
+(uploaded .doc/.docx/.docm/.vsd/.vsdx/.vsdm/.ppt/.pptx files), converts each to
+PDF via Office COM, normalizes page sizes, uploads the PDF to R2 through the server's
 presigned URL, and marks the job done. PDFs then appear in the Binder portal
 automatically.
 
@@ -335,6 +335,7 @@ def http_put(url: str, src: pathlib.Path) -> None:
 # ── warm Office instances (launched on first use, reused across jobs) ────────
 _VISIO = None
 _PP = None
+_WORD = None
 
 
 _VISIO_FAIL_STREAK = 0
@@ -387,15 +388,37 @@ def _get_powerpoint():
     return _PP
 
 
+def _get_word():
+    global _WORD
+    if _WORD is None:
+        import win32com.client
+        log("starting Word (kept warm for later jobs)...")
+        _WORD = win32com.client.Dispatch("Word.Application")
+        try:
+            _WORD.Visible = False
+            # Word is far more dialog-happy than PowerPoint: "convert this .doc
+            # format?", "recover this file?", "open read-only?" all block on a
+            # modal that nobody can see on a headless worker, hanging the job
+            # until it times out.
+            _WORD.DisplayAlerts = 0
+            # msoAutomationSecurityForceDisable — a .doc/.docm can carry an
+            # AutoOpen macro that would otherwise run the moment we open it.
+            # Same intent as the "macros off" flag on the Visio OpenEx call.
+            _WORD.AutomationSecurity = 3
+        except Exception:
+            pass
+    return _WORD
+
+
 def _reset_office() -> None:
-    global _VISIO, _PP
-    for app in (_VISIO, _PP):
+    global _VISIO, _PP, _WORD
+    for app in (_VISIO, _PP, _WORD):
         if app is not None:
             try:
                 app.Quit()
             except Exception:
                 pass
-    _VISIO = _PP = None
+    _VISIO = _PP = _WORD = None
 
 
 atexit.register(_reset_office)
@@ -426,6 +449,20 @@ def convert_powerpoint(src: str, out: str) -> None:
         pres.SaveAs(os.path.normpath(out), 32)
     finally:
         pres.Close()
+
+
+def convert_word(src: str, out: str) -> None:
+    """Word COM ExportAsFixedFormat (wdExportFormatPDF=17) — native vector PDF,
+    same as the Visio/PowerPoint paths rather than a print-to-PDF raster."""
+    word = _get_word()
+    # ConfirmConversions=False stops the legacy-format prompt on old .doc files;
+    # AddToRecentFiles=False keeps a coach's Word MRU list clean.
+    doc = word.Documents.Open(os.path.normpath(src), ConfirmConversions=False,
+                              ReadOnly=True, AddToRecentFiles=False, Visible=False)
+    try:
+        doc.ExportAsFixedFormat(os.path.normpath(out), 17)
+    finally:
+        doc.Close(0)   # wdDoNotSaveChanges — never leave a "save?" modal behind
 
 
 def page_count(pdf: pathlib.Path):
@@ -499,10 +536,14 @@ def _number_pages(pdf_path) -> None:
 
 
 def _convert(ext: str, src: str, out: str) -> None:
+    # Keep in step with _PB_CONVERT_EXTS in main.py — a format the server accepts
+    # but this doesn't handle uploads fine and then dies here.
     if ext in ("vsd", "vsdx", "vsdm"):
         convert_visio(src, out)
     elif ext in ("ppt", "pptx"):
         convert_powerpoint(src, out)
+    elif ext in ("doc", "docx", "docm"):
+        convert_word(src, out)
     else:
         raise RuntimeError(f"unsupported extension: {ext}")
 

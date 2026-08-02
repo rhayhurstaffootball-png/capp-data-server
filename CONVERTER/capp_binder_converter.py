@@ -499,6 +499,7 @@ def http_put(url: str, src: pathlib.Path) -> None:
 # ── warm Office instances (launched on first use, reused across jobs) ────────
 _VISIO = None
 _PP = None
+_WORD = None
 
 
 _VISIO_FAIL_STREAK = 0
@@ -551,15 +552,36 @@ def _get_powerpoint():
     return _PP
 
 
+def _get_word():
+    global _WORD
+    if _WORD is None:
+        import win32com.client
+        log("starting Word (kept warm for later jobs)...")
+        _WORD = win32com.client.Dispatch("Word.Application")
+        try:
+            _WORD.Visible = False
+            # Word is far more dialog-happy than PowerPoint: "convert this .doc
+            # format?", "recover this file?", "open read-only?" all block on a
+            # modal nobody can see on a headless worker, hanging the job.
+            _WORD.DisplayAlerts = 0
+            # msoAutomationSecurityForceDisable — a .doc/.docm can carry an
+            # AutoOpen macro that would otherwise run the moment we open it.
+            # Same intent as the "macros off" flag on the Visio OpenEx call.
+            _WORD.AutomationSecurity = 3
+        except Exception:
+            pass
+    return _WORD
+
+
 def _reset_office() -> None:
-    global _VISIO, _PP
-    for app in (_VISIO, _PP):
+    global _VISIO, _PP, _WORD
+    for app in (_VISIO, _PP, _WORD):
         if app is not None:
             try:
                 app.Quit()
             except Exception:
                 pass
-    _VISIO = _PP = None
+    _VISIO = _PP = _WORD = None
 
 
 atexit.register(_reset_office)
@@ -586,6 +608,20 @@ def convert_powerpoint(src: str, out: str) -> None:
         pres.SaveAs(os.path.normpath(out), 32)
     finally:
         pres.Close()
+
+
+def convert_word(src: str, out: str) -> None:
+    """Word COM ExportAsFixedFormat (wdExportFormatPDF=17) — native vector PDF,
+    same as the Visio/PowerPoint paths rather than a print-to-PDF raster."""
+    word = _get_word()
+    # ConfirmConversions=False stops the legacy-format prompt on old .doc files;
+    # AddToRecentFiles=False keeps a coach's Word MRU list clean.
+    doc = word.Documents.Open(os.path.normpath(src), ConfirmConversions=False,
+                              ReadOnly=True, AddToRecentFiles=False, Visible=False)
+    try:
+        doc.ExportAsFixedFormat(os.path.normpath(out), 17)
+    finally:
+        doc.Close(0)   # wdDoNotSaveChanges — never leave a "save?" modal behind
 
 
 def page_count(pdf: pathlib.Path):
@@ -713,10 +749,15 @@ def _merge_insert(base_path, play_path, out_path, insert_after: int, label: str)
 
 
 def _convert(ext: str, src: str, out: str) -> None:
+    # Keep in step with _PB_CONVERT_EXTS in main.py and _convert in pb_worker.py —
+    # a format the server accepts but this doesn't handle uploads fine and then
+    # dies here, which reads to a coach as a broken app.
     if ext in ("vsd", "vsdx", "vsdm"):
         convert_visio(src, out)
     elif ext in ("ppt", "pptx"):
         convert_powerpoint(src, out)
+    elif ext in ("doc", "docx", "docm"):
+        convert_word(src, out)
     else:
         raise RuntimeError(f"unsupported extension: {ext}")
 
