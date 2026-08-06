@@ -1718,14 +1718,25 @@ def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> 
     if season:
         params["season"] = season
 
-    r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    # ⚠ The REGULAR season must be requested EXPLICITLY with seasontype=2.
+    # Do NOT go back to the bare default response: ESPN's no-seasontype reply
+    # follows the CURRENT phase of the season, so it only *looks* like the
+    # regular season during the regular season. Measured Aug 6 2026:
+    #   NFL default -> season.type=1, 3 events (the preseason, identical to the
+    #                  seasontype=1 fetch below, so dedup dropped it and the
+    #                  17 regular-season games vanished entirely)
+    #   CFB default -> 0 events (college has no preseason phase at all)
+    # Explicit seasontype=2 returns 17 (NFL) and 12 (CFB) as expected, and is
+    # phase-independent all year round.
+    reg_params = dict(params)
+    reg_params["seasontype"] = 2
+    r = _session.get(url, params=reg_params, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     data = r.json()
 
     all_events = list(data.get("events", []))
-    # Preseason (NFL only — college has no preseason). The default fetch above
-    # returns the REGULAR season, so preseason games are invisible unless asked
-    # for explicitly. Prepended so the schedule reads pre -> reg -> post.
+    # Preseason (NFL only — college has no preseason). Prepended so the
+    # schedule reads pre -> reg -> post.
     preseason_ids: set = set()
     if league == "nfl":
         try:
@@ -1754,9 +1765,10 @@ def get_team_schedule(team_id: str, season: int = None, league: str = "cfb") -> 
     games = []
     _seen_event_ids: set = set()
     for event in all_events:
-        # The default (no-seasontype) fetch follows ESPN's CURRENT phase, so once
-        # the preseason window opens it can return the same events as the
-        # seasontype=1 fetch above. Keep the first occurrence only.
+        # Belt-and-braces dedup. The three fetches are now explicitly scoped to
+        # seasontype 1/2/3 so they should not overlap, but ESPN has repeated
+        # events across phases before (it is what hid the regular season in
+        # Aug 2026). Keep the first occurrence only.
         _eid = event.get("id")
         if _eid in _seen_event_ids:
             continue
