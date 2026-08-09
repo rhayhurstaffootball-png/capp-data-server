@@ -603,9 +603,16 @@ def _hybrid_fix_variable_fonts(fg_pages, pdf_path):
 
 
 def api(path: str, body: dict) -> dict:
+    # x-converter-version rides on every call so the server can record which
+    # build each paired machine is actually running. It costs nothing (the
+    # worker already calls in constantly to claim jobs) and it's the only way
+    # a coach can be told their converter is stale — the exe is invisible, so
+    # there is nothing to look at on the machine itself.
     req = urllib.request.Request(
         SERVER + path, data=json.dumps(body).encode(), method="POST",
-        headers={"x-worker-token": TOKEN, "Content-Type": "application/json"})
+        headers={"x-worker-token": TOKEN,
+                 "x-converter-version": CONVERTER_VERSION,
+                 "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)
 

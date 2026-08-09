@@ -3463,6 +3463,16 @@ PB_WORKER_TOKEN = os.environ.get("PB_WORKER_TOKEN", "")
 _PB_CONVERT_EXTS = ("vsd", "vsdx", "vsdm", "ppt", "pptx", "doc", "docx", "docm")
 
 
+def _vtuple_pb(v: str) -> tuple:
+    """Version compare for converter builds. NUMERIC, not lexical, so 1.10.0
+    beats 1.9.0; anything unparseable sorts below every real version rather
+    than winning by accident."""
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except Exception:
+        return (0,)
+
+
 async def _pb_device_by_token(token: str):
     """Look up a paired local worker by its own device token (issued at pairing
     time — see /converter/register). Returns the device row or None."""
@@ -3475,7 +3485,8 @@ async def _pb_device_by_token(token: str):
     return r.json()[0] if r.status_code == 200 and r.json() else None
 
 
-async def _worker_identity(x_worker_token: str = Header("")):
+async def _worker_identity(x_worker_token: str = Header(""),
+                           x_converter_version: str = Header("")):
     """Every worker call authenticates with EITHER the legacy shared
     PB_WORKER_TOKEN (used only for admin-panel-direct uploads, which have no
     coach identity to pair to) OR its own per-device token from pairing.
@@ -3487,12 +3498,24 @@ async def _worker_identity(x_worker_token: str = Header("")):
         return {"kind": "legacy", "email": None}
     dev = await _pb_device_by_token(x_worker_token)
     if dev:
+        # Heartbeat, plus the version the worker reported in its header so a
+        # coach can be told their converter is stale.
+        beat = {"last_seen_at": _dtmod.datetime.utcnow().isoformat() + "Z"}
+        ver = (x_converter_version or "").strip()[:20]
         try:
             async with httpx.AsyncClient() as c:
-                await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
-                              params={"id": f"eq.{dev['id']}"},
-                              json={"last_seen_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
-                              headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+                url = f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}"
+                params = {"id": f"eq.{dev['id']}"}
+                hdrs = {**_supa_headers_json(), "Prefer": "return=minimal"}
+                r = await c.patch(url, params=params,
+                                  json={**beat, "converter_version": ver} if ver else beat,
+                                  headers=hdrs)
+                # ⚠ Falls back to a bare heartbeat if converter_version doesn't
+                # exist yet. Without this, a server deployed before the column
+                # is added would fail the PATCH and stop updating last_seen_at
+                # too — every paired converter would show as OFFLINE.
+                if ver and r.status_code >= 400:
+                    await c.patch(url, params=params, json=beat, headers=hdrs)
         except Exception:
             pass    # heartbeat is best-effort; never blocks the claim
         return {"kind": "paired", "email": dev["email"], "team_id": dev["team_id"]}
@@ -4500,14 +4523,23 @@ async def coach_pb_converter_status(_u: dict = Depends(_require_coach)):
     """Is a local conversion worker paired to THIS coach's own login, and has
     it checked in recently? Drives the one-time-setup prompt on a
     PowerPoint/Visio upload (a coach who only ever uploads PDFs never needs it)."""
+    latest = os.environ.get("CONVERTER_VERSION", "1.0.0")
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
-                        params={"select": "device_name,last_seen_at", "email": f"eq.{_u['email']}",
+                        params={"select": "device_name,last_seen_at,converter_version",
+                                "email": f"eq.{_u['email']}",
                                 "order": "paired_at.desc", "limit": "1"},
                         headers=_supa_headers_json())
+        # Tolerate the column not existing yet (see _worker_identity).
+        if r.status_code >= 400:
+            r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                            params={"select": "device_name,last_seen_at",
+                                    "email": f"eq.{_u['email']}",
+                                    "order": "paired_at.desc", "limit": "1"},
+                            headers=_supa_headers_json())
     rows = r.json() if r.status_code == 200 else []
     if not rows:
-        return {"paired": False, "online": False}
+        return {"paired": False, "online": False, "latest_version": latest}
     last_seen = rows[0].get("last_seen_at")
     online = False
     if last_seen:
@@ -4516,7 +4548,14 @@ async def coach_pb_converter_status(_u: dict = Depends(_require_coach)):
             online = (_dtmod.datetime.now(_dtmod.timezone.utc) - dt).total_seconds() < 300
         except Exception:
             online = False
-    return {"paired": True, "online": online, "device_name": rows[0].get("device_name")}
+    # A version is only known once the machine has run a build that reports it.
+    # Older builds report nothing, which is itself the signal that it's stale.
+    running = (rows[0].get("converter_version") or "").strip()
+    return {"paired": True, "online": online,
+            "device_name": rows[0].get("device_name"),
+            "version": running or None,
+            "latest_version": latest,
+            "up_to_date": bool(running) and _vtuple_pb(running) >= _vtuple_pb(latest)}
 
 
 @app.post("/converter/register")
