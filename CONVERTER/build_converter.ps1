@@ -94,12 +94,41 @@ Write-Host "  $((Get-Item $outFile).FullName)" -ForegroundColor Cyan
 Write-Host "  $sizeMB MB" -ForegroundColor Cyan
 Write-Host ""
 $built = ([regex]::Match((Get-Content $SRC -Raw), '(?m)^CONVERTER_VERSION\s*=\s*"([^"]+)"')).Groups[1].Value
-Write-Host "Next steps (BOTH required, or nobody gets this build):" -ForegroundColor Yellow
-Write-Host "  1. Upload $outFile to the DO relay so" -ForegroundColor White
-Write-Host "     https://relay.cappvcs.com/converter/download serves it." -ForegroundColor White
-Write-Host "  2. Set CONVERTER_VERSION = $built on Render." -ForegroundColor White
+
+# Publish the version to Render automatically. This used to be a manual step
+# printed in yellow, and it was never once done - CONVERTER_VERSION was not
+# even set on the service, so /converter/version served the hardcoded default
+# and no installed converter ever saw an update. The Build Manager already does
+# this for APP_VERSION and AGENT_VERSION; same idea, same credentials file.
+$bump = Join-Path $PSScriptRoot "..\..\CAPP_FINAL\_dev_tools\bump_render_env.py"
+$bumped = $false
+if (Test-Path $bump) {
+    Write-Host "Publishing CONVERTER_VERSION = $built to Render ..." -ForegroundColor Yellow
+    python $bump CONVERTER_VERSION $built
+    if ($LASTEXITCODE -eq 0) {
+        $bumped = $true
+    } else {
+        Write-Host "WARNING: could not set CONVERTER_VERSION on Render." -ForegroundColor Red
+    }
+} else {
+    Write-Host "WARNING: bump_render_env.py not found at $bump" -ForegroundColor Red
+}
+
 Write-Host ""
-Write-Host "  Installed converters compare their own version against" -ForegroundColor Gray
-Write-Host "  /converter/version and self-update within 6 hours of idle time." -ForegroundColor Gray
-Write-Host "  Skip step 2 and every coach silently stays on the old build." -ForegroundColor Gray
+if ($bumped) {
+    Write-Host "Remaining step:" -ForegroundColor Yellow
+    Write-Host "  Upload $outFile to the DO relay so" -ForegroundColor White
+    Write-Host "  https://relay.cappvcs.com/converter/download serves it." -ForegroundColor White
+    Write-Host ""
+    Write-Host "  CONVERTER_VERSION = $built is already live on Render, so upload the" -ForegroundColor Gray
+    Write-Host "  exe promptly - converters will ask for it within 6 hours of idle time." -ForegroundColor Gray
+} else {
+    Write-Host "Next steps (BOTH required, or nobody gets this build):" -ForegroundColor Yellow
+    Write-Host "  1. Upload $outFile to the DO relay so" -ForegroundColor White
+    Write-Host "     https://relay.cappvcs.com/converter/download serves it." -ForegroundColor White
+    Write-Host "  2. Set CONVERTER_VERSION = $built on Render, or run:" -ForegroundColor White
+    Write-Host "     python ..\..\CAPP_FINAL\_dev_tools\bump_render_env.py CONVERTER_VERSION $built" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Skip step 2 and every coach silently stays on the old build." -ForegroundColor Gray
+}
 Write-Host ""
