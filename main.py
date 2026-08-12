@@ -301,6 +301,9 @@ def _build_health_payload() -> dict:
         "memory": {
             "rss_bytes": _process_memory_bytes(),
         },
+        # Empty list == Supabase wired up correctly. Non-empty means the storage
+        # routes are down and WHY — check this first when nodes/downloads fail.
+        "config_errors": supabase_config_errors(),
         "requests": {
             "total": REQUEST_TOTAL,
             "errors": REQUEST_ERRORS,
@@ -423,6 +426,93 @@ async def _metrics_middleware(request: Request, call_next):
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = "capp-workflow"
+
+
+def supabase_config_errors() -> list:
+    """Which Supabase settings are missing/unusable. Empty list == healthy.
+
+    Exists because of the Aug 12 2026 outage: SUPABASE_URL went missing from the
+    Render environment and every storage-backed route (the CAPP Nodes list, all
+    four download endpoints) answered a BARE 500 — httpx raising UnsupportedProtocol
+    on a URL with no scheme, unhandled. Nothing said "misconfigured", so it read as
+    a code fault and cost an unnecessary agent rebuild before the real cause was
+    found. Now it is named, loudly, everywhere it matters.
+    """
+    errs = []
+    if not SUPABASE_URL:
+        errs.append("SUPABASE_URL is not set")
+    elif not SUPABASE_URL.startswith(("http://", "https://")):
+        errs.append(f"SUPABASE_URL has no http(s):// scheme: {SUPABASE_URL[:40]!r}")
+    if not SUPABASE_KEY:
+        errs.append("SUPABASE_SERVICE_KEY is not set")
+    return errs
+
+
+def _require_supabase():
+    """Guard every storage call. Turns a bare 500 into a 503 that says the cause.
+
+    Deliberately NOT a hard startup crash: a missing storage variable must not take
+    down live-game polling, licensing, or the play feed on a Saturday. The server
+    stays up and keeps serving everything it still can; only the routes that truly
+    need Supabase fail, and they fail legibly.
+    """
+    errs = supabase_config_errors()
+    if errs:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase is not configured on this server: "
+                   + "; ".join(errs)
+                   + ". Set it in the Render dashboard (Environment) — storage routes "
+                     "stay down until then.",
+        )
+
+
+# Loud, unmissable banner in the Render logs at boot.
+_SB_ERRS = supabase_config_errors()
+if _SB_ERRS:
+    print("=" * 72, flush=True)
+    print("*** SUPABASE MISCONFIGURED - storage routes WILL fail with 503 ***", flush=True)
+    for _e in _SB_ERRS:
+        print(f"  - {_e}", flush=True)
+    print("  Affected: /nodes, /nodes/register, /agent/download, /helper/download,", flush=True)
+    print("            /db/download, /contacts/download", flush=True)
+    print("  Fix: Render dashboard -> capp-data-server -> Environment", flush=True)
+    print("=" * 72, flush=True)
+else:
+    print(f"Supabase configured OK -> {SUPABASE_URL}", flush=True)
+
+
+async def _bad_supabase_url_handler(request: Request, exc: Exception):
+    """Catch-all so a broken SUPABASE_URL can never again masquerade as a 500.
+
+    SUPABASE_URL is interpolated into ~180 request URLs across this file (auth,
+    CAPP Nodes, Binder, CRM, messages) — guarding each call site individually would
+    be worse than the disease. But every one of them fails the same way when the
+    variable is missing or malformed: httpx rejects the URL string before any
+    network call. Handling it in one place turns that entire class of failure into
+    a 503 that names the cause, whatever route it came from.
+
+    ⚠ Registered for UnsupportedProtocol and InvalidURL ONLY — the two "this URL
+    string is wrong" errors. Do NOT widen this to their parents: UnsupportedProtocol
+    descends from TransportError, so catching that would also swallow real timeouts
+    and connection failures and mislabel a Supabase outage as a config problem.
+    (Verified by MRO: UnsupportedProtocol -> TransportError -> RequestError; it is
+    NOT a subclass of InvalidURL, which is why registering only InvalidURL silently
+    missed every auth-dependent route.)
+    """
+    errs = supabase_config_errors()
+    print(f"InvalidURL on {request.url.path}: {exc} | config_errors={errs}", flush=True)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Supabase is not configured on this server: "
+                           + ("; ".join(errs) if errs else str(exc))
+                           + ". Check the Render dashboard (Environment)."},
+    )
+
+
+app.add_exception_handler(httpx.UnsupportedProtocol, _bad_supabase_url_handler)
+app.add_exception_handler(httpx.InvalidURL, _bad_supabase_url_handler)
+
 
 def _supabase_headers():
     return {
@@ -820,6 +910,7 @@ def db_version():
 
 async def _signed_url(storage_path: str) -> str:
     """Generate a 1-hour Supabase signed download URL for any object in the bucket."""
+    _require_supabase()
     url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{storage_path}"
     async with httpx.AsyncClient() as client:
         r = await client.post(url, json={"expiresIn": 3600},
@@ -1009,6 +1100,7 @@ async def storage_list(client_id: str = Query(...)):
 NODES_FILE = "capp_nodes.json"
 
 async def _load_nodes(client_id: str) -> list:
+    _require_supabase()
     path = _storage_path(client_id, NODES_FILE)
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     async with httpx.AsyncClient() as client:
@@ -1018,6 +1110,7 @@ async def _load_nodes(client_id: str) -> list:
     return []
 
 async def _save_nodes(client_id: str, nodes: list):
+    _require_supabase()
     path = _storage_path(client_id, NODES_FILE)
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     data = json.dumps({"nodes": nodes}).encode()
