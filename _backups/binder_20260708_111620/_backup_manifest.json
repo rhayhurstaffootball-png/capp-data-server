@@ -1,0 +1,12 @@
+{
+  "taken": "20260708_111620",
+  "source": "https://ftyfxwsiihljrugzvcry.supabase.co",
+  "tables": {
+    "playbook_users": "144 rows",
+    "playbook_docs": "65 rows",
+    "playbook_folders": "91 rows",
+    "playbook_jobs": "0 rows",
+    "playbook_notes": "16 rows",
+    "playbook_teams": "SKIP (HTTP 404: {\"code\":\"PGRST205\",\"details\":null,\"hint\":\"Perhaps you meant the table 'public.playbook_jobs'\",\"message\":\"Could not find )"
+  }
+}

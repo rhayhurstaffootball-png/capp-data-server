@@ -1,0 +1,652 @@
+[
+  {
+    "id": "8acaacba-e229-4f5d-8e08-14eb195f2d19",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/03 END OF GAME",
+    "title": "03 END OF GAME",
+    "r2_key": "pdfs/8836ee4533d1420797364370046cc868.pdf",
+    "pages": null,
+    "size_bytes": 16053751,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:21.23328+00:00"
+  },
+  {
+    "id": "8251380b-7a51-4dd9-a558-72518cd98736",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/02 UC OPTION/04 EAGLE FRONT WITH COVER 0",
+    "title": "04 EAGLE FRONT WITH COVER 0",
+    "r2_key": "pdfs/3f779a940dc442fb8aac0e5bd0121724.pdf",
+    "pages": null,
+    "size_bytes": 12940978,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:22.776617+00:00"
+  },
+  {
+    "id": "16fa358b-47d5-4388-bb2b-106ec03351c0",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/02 UC OPTION/03 EAGLE FRONT WITH HOT COVERAGE",
+    "title": "03 EAGLE FRONT WITH HOT COVERAGE",
+    "r2_key": "pdfs/a8cc7217eb824647abe1cc00c38cfef3.pdf",
+    "pages": null,
+    "size_bytes": 2823669,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:23.946668+00:00"
+  },
+  {
+    "id": "02d6a635-0f7e-456c-ba0c-5c0462b45ce1",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/02 UC OPTION/01 COVER 0 PRESSURES",
+    "title": "01 COVER 0 PRESSURES",
+    "r2_key": "pdfs/53aede2b26bc41edafc2763e49661c2e.pdf",
+    "pages": null,
+    "size_bytes": 8418632,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:27.235868+00:00"
+  },
+  {
+    "id": "a42ab8f9-50e5-4e37-afb2-a0695f73269e",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/02 UC OPTION/00 COVER PAGES",
+    "title": "00 COVER PAGES",
+    "r2_key": "pdfs/458df122bd3a4ea48bd3f60bf582b437.pdf",
+    "pages": null,
+    "size_bytes": 814616,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:28.39386+00:00"
+  },
+  {
+    "id": "27dcbf9d-0448-4045-896c-74923aa0b431",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/01 GUN OPTION/04 HYBRID QUARTERS COVERAGE",
+    "title": "04 HYBRID QUARTERS COVERAGE",
+    "r2_key": "pdfs/450388b402134c5781289270cda543aa.pdf",
+    "pages": null,
+    "size_bytes": 10119312,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:29.753027+00:00"
+  },
+  {
+    "id": "5203319f-32c1-428c-995d-d2bc6049f5f2",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/01 GUN OPTION/03 HOT COVERAGE PRESSURES (WEATHER)",
+    "title": "03 HOT COVERAGE PRESSURES (WEATHER)",
+    "r2_key": "pdfs/645b55b9d64c4cb286abaeb654c9d74c.pdf",
+    "pages": null,
+    "size_bytes": 18509101,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:31.21983+00:00"
+  },
+  {
+    "id": "761e34d6-f877-43db-a4a9-9bcc530a7c9d",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/01 GUN OPTION/02 HOT COVERAGE PRESSURES (SPACE)",
+    "title": "02 HOT COVERAGE PRESSURES (SPACE)",
+    "r2_key": "pdfs/33a3b10ac21445b390cfa5ffc8106c85.pdf",
+    "pages": null,
+    "size_bytes": 5627305,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:32.352887+00:00"
+  },
+  {
+    "id": "1dd8537d-6885-4f1c-9a05-43c7bd44a3bf",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/01 GUN OPTION/00 COVER PAGES",
+    "title": "00 COVER PAGES",
+    "r2_key": "pdfs/9ba079399ae04fd1820bae846113b3f3.pdf",
+    "pages": null,
+    "size_bytes": 1298490,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:34.724395+00:00"
+  },
+  {
+    "id": "5932ca28-33e7-4e9d-b4fa-1e37335667e7",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/02 UC OPTION/02 HOT COVERAGE PRESSURES (SPACE)",
+    "title": "02 HOT COVERAGE PRESSURES (SPACE)",
+    "r2_key": "pdfs/c273c29d40724141b50be929e3248e60.pdf",
+    "pages": null,
+    "size_bytes": 16820161,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:39.884366+00:00"
+  },
+  {
+    "id": "752eb4a0-851b-4d07-8827-e117997c5d8d",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/02 TRIPLE OPTION/01 GUN OPTION/01 COVER 0 PRESSURES",
+    "title": "01 COVER 0 PRESSURES",
+    "r2_key": "pdfs/b0106218601e4b76b31bdc307d206132.pdf",
+    "pages": null,
+    "size_bytes": 15378790,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:47.430956+00:00"
+  },
+  {
+    "id": "992fc3ac-959b-4329-802d-ae9419031175",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/09 COVER 0 PRESSURES",
+    "title": "09 COVER 0 PRESSURES",
+    "r2_key": "pdfs/2e7c2ba85c704d6594beafbe548aeb6c.pdf",
+    "pages": null,
+    "size_bytes": 13815268,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:39.058953+00:00"
+  },
+  {
+    "id": "27477887-b624-4d98-a4d5-16ffc529450b",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/03 RED ZONE",
+    "title": "03 RED ZONE",
+    "r2_key": "pdfs/4dbd4a6a46c8458ba2eb95a8ecefa47e.pdf",
+    "pages": null,
+    "size_bytes": 3386234,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:37.596604+00:00"
+  },
+  {
+    "id": "2b843b11-616d-4f9a-a2cf-7634f79f0ab1",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/04 CINCO PACKAGE",
+    "title": "04 CINCO PACKAGE",
+    "r2_key": "pdfs/6821cc4a94ac4e29a3aec4e6947bb2a0.pdf",
+    "pages": null,
+    "size_bytes": 13086777,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:36.606875+00:00"
+  },
+  {
+    "id": "081e7daa-0b46-4e15-a7ff-4607454c4226",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/01 SIMULATED PRESSURES/01 NFL",
+    "title": "01 NFL",
+    "r2_key": "pdfs/74136af29a3043d2be83ac77e73775b3.pdf",
+    "pages": null,
+    "size_bytes": 16169971,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:50.556307+00:00"
+  },
+  {
+    "id": "5b36b249-5f81-4e50-8cd6-151272fa8f5a",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/01 SIMULATED PRESSURES/02 NBA",
+    "title": "02 NBA",
+    "r2_key": "pdfs/d6dcc29b2f8c4531a1e40a1a8b22c1e8.pdf",
+    "pages": null,
+    "size_bytes": 2180248,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:48.64912+00:00"
+  },
+  {
+    "id": "9702f62c-b7ad-40e3-bc11-5ded4acf35a7",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/02 QUARTER & ZERO PRESSURES",
+    "title": "02 QUARTER & ZERO PRESSURES",
+    "r2_key": "pdfs/4b03155ddd124313a70e065a3850f334.pdf",
+    "pages": null,
+    "size_bytes": 3094009,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:47.566098+00:00"
+  },
+  {
+    "id": "d447c17d-bee1-481b-849b-2b8273b050fe",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/03 FIRE ZONE PRESSURES",
+    "title": "03 FIRE ZONE PRESSURES",
+    "r2_key": "pdfs/8bf79a0718af44b581597dba930eb453.pdf",
+    "pages": null,
+    "size_bytes": 16239641,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:46.702788+00:00"
+  },
+  {
+    "id": "d936a9d1-94f3-4f16-93fa-538f3260b564",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/04 MAN FREE PRESSURES",
+    "title": "04 MAN FREE PRESSURES",
+    "r2_key": "pdfs/c487ff42adc948dd94dd8ea1ea7b7df3.pdf",
+    "pages": null,
+    "size_bytes": 7801310,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:45.211474+00:00"
+  },
+  {
+    "id": "d304d2d3-ff28-4022-aa1b-ce3b4257800b",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/05 BEAR FRONT PRESSURES",
+    "title": "05 BEAR FRONT PRESSURES",
+    "r2_key": "pdfs/5c0fc7ea9811441c8316f1f43cb00e5b.pdf",
+    "pages": null,
+    "size_bytes": 7250747,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:43.695464+00:00"
+  },
+  {
+    "id": "9ac94eed-8556-4940-842c-f58e27df49dd",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/06 MAN FREE, WALK UP PRESSURES",
+    "title": "06 MAN FREE, WALK UP PRESSURES",
+    "r2_key": "pdfs/e6af104bc75f488c997955e2a8958fe7.pdf",
+    "pages": null,
+    "size_bytes": 9871319,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:42.477407+00:00"
+  },
+  {
+    "id": "c90fe8d6-c29e-4b68-99ac-42ffecd9b68f",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/07 OVERLOAD PALMS PRESSURES",
+    "title": "07 OVERLOAD PALMS PRESSURES",
+    "r2_key": "pdfs/ff0e19fa5be74d929c1b5b4c001524c5.pdf",
+    "pages": null,
+    "size_bytes": 4445157,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:41.170845+00:00"
+  },
+  {
+    "id": "bc4217b1-0872-4cf8-ab65-c9b28dae9ac5",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/08 FUEGO PRESSURES",
+    "title": "08 FUEGO PRESSURES",
+    "r2_key": "pdfs/a30b26c6bdcd4249bbc91b4c3f22fd24.pdf",
+    "pages": null,
+    "size_bytes": 4855924,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:40.142902+00:00"
+  },
+  {
+    "id": "2424ced0-3915-4061-af0e-749e580f6718",
+    "folder_path": "2026 AF DEF PLAYBOOK/02 FRONTS, STUNTS, & GAMES",
+    "title": "02 FRONTS, STUNTS, & GAMES",
+    "r2_key": "pdfs/8cb45299fc9d436da1d7a1eeccd1ba46.pdf",
+    "pages": null,
+    "size_bytes": 1927453,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:03.613308+00:00"
+  },
+  {
+    "id": "9598a7d7-9487-4720-a3da-0bbb5af57171",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/01 SIMULATED PRESSURES/00 COVER PAGE",
+    "title": "00 COVER PAGE",
+    "r2_key": "pdfs/aeb61baea89d4695b9c8a7598586ac39.pdf",
+    "pages": null,
+    "size_bytes": 686909,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:51.536046+00:00"
+  },
+  {
+    "id": "a04a5248-033f-48dd-8c31-ca74f2e08187",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/02 PRESSURES/00 COVER PAGES",
+    "title": "00 COVER PAGES",
+    "r2_key": "pdfs/67f68e47d2ad4da0abfb603fb7e7dfa5.pdf",
+    "pages": null,
+    "size_bytes": 549334,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:52.589261+00:00"
+  },
+  {
+    "id": "71c1514f-5712-4f07-82cb-fbfb8e4cee63",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/01 COVERAGES/00 COVER PAGES",
+    "title": "00 COVER PAGES",
+    "r2_key": "pdfs/43a82521ee6a484e8e7bec7ed1c919db.pdf",
+    "pages": null,
+    "size_bytes": 1284594,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:01.490676+00:00"
+  },
+  {
+    "id": "2fa3df79-e64c-4d04-bd32-20b7bdff416c",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/01 COVERAGES/02 STATES",
+    "title": "02 STATES",
+    "r2_key": "pdfs/614711e46b484ea7a2a8efc370ed590d.pdf",
+    "pages": null,
+    "size_bytes": 4799126,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:55.945373+00:00"
+  },
+  {
+    "id": "6c4f0a8d-7c53-49f7-955b-97aee7d02c70",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "00 DEFENSIVE PHILOSOPHY",
+    "r2_key": "pdfs/83314d96f8a04b6ab65428a75af9b0fe.pdf",
+    "pages": null,
+    "size_bytes": 1338668,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:04.928578+00:00"
+  },
+  {
+    "id": "495a5508-555b-4748-8567-c1096af9e775",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "02 OFFENSIVE RUN SCHEMES",
+    "r2_key": "pdfs/15e9a4b0c88546e691b728c1ae3a02c7.pdf",
+    "pages": null,
+    "size_bytes": 704247,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:06.890459+00:00"
+  },
+  {
+    "id": "9fa5e5e8-5ae4-496e-8491-aee04051bccf",
+    "folder_path": "2026 AF DEF PLAYBOOK/03 CALL BUCKETS",
+    "title": "03 CALL BUCKETS",
+    "r2_key": "pdfs/fb21aa85131c4789901ed015df035bd1.pdf",
+    "pages": null,
+    "size_bytes": 1438920,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:02.275089+00:00"
+  },
+  {
+    "id": "44f7195c-7290-4c22-9a55-4e08e17e0df8",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "01 OFFENSIVE TERMINOLOGY",
+    "r2_key": "pdfs/ad054ea86a644c7783064426f85dea07.pdf",
+    "pages": null,
+    "size_bytes": 515614,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:05.873753+00:00"
+  },
+  {
+    "id": "e0166294-4ca8-463a-bdda-9bdc1b897cb6",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/519c56dde9694a569c8bca028549bfc4.pdf",
+    "pages": null,
+    "size_bytes": 1402445,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:07.766492+00:00"
+  },
+  {
+    "id": "b79ec49d-8708-46e2-ab94-9524cea0bc39",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "04 PROTECTION SYSTEM",
+    "r2_key": "pdfs/04f7353f1d76477e82b38e07d1be89e1.pdf",
+    "pages": null,
+    "size_bytes": 61001,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:08.855265+00:00"
+  },
+  {
+    "id": "a1978365-b03d-4508-81af-65f499513926",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "05 DEFENSIVE PERSONNEL GROUPS",
+    "r2_key": "pdfs/445b9f1c873640218f7ab536233a1a85.pdf",
+    "pages": null,
+    "size_bytes": 129132,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:09.666713+00:00"
+  },
+  {
+    "id": "d8a2b734-ba32-4ea4-a793-a4b3a8c113d8",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "06 COVERAGE TERMINOLOGY",
+    "r2_key": "pdfs/159fdf79c22f48fba2c1c5a46f15ec53.pdf",
+    "pages": null,
+    "size_bytes": 67927,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:10.557512+00:00"
+  },
+  {
+    "id": "ae687cb9-0b53-4bfe-9ffb-ca505e2833d7",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "07 COVERAGE TOOLS",
+    "r2_key": "pdfs/af4f11d075c441a0ac0c7cc72915f124.pdf",
+    "pages": null,
+    "size_bytes": 445947,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:11.629607+00:00"
+  },
+  {
+    "id": "5cfaea6e-89ef-44e8-af4b-320f7b5bbf5c",
+    "folder_path": "2026 AF DEF PLAYBOOK/01 WHITE PAGES",
+    "title": "08 DEFENSIVE RULES",
+    "r2_key": "pdfs/ce176febc5ec4d698e5345046a8ccdbf.pdf",
+    "pages": null,
+    "size_bytes": 424605,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:12.499204+00:00"
+  },
+  {
+    "id": "03e9b10a-8baa-4c8b-bbda-2e8f2959854d",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/PRACTICE 1 TIPS",
+    "title": "05 BEAR FRONT PRESSURES",
+    "r2_key": "pdfs/603d2ed5a1c8444f8c027dd91253fc00.pdf",
+    "pages": null,
+    "size_bytes": 7167847,
+    "sort_order": 0,
+    "created_at": "2026-07-02T17:00:45.579407+00:00"
+  },
+  {
+    "id": "bfc2d253-2a5b-413d-9ea9-0928fd1e8705",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/PRACTICE 1 TIPS",
+    "title": "00 DEFENSIVE PHILOSOPHY",
+    "r2_key": "pdfs/fc1b83b493c14b29a8553b96f8a80595.pdf",
+    "pages": 8,
+    "size_bytes": 1128022,
+    "sort_order": 0,
+    "created_at": "2026-07-02T17:28:09.167946+00:00"
+  },
+  {
+    "id": "a9d02dde-6da0-4ee8-8067-ffe9f6f52376",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/PRACTICE 1 TIPS",
+    "title": "Lakota Wills Recruiting Presentation",
+    "r2_key": "pdfs/b17a0ce3c05d4c4aa5bd04c0ba27b9f4.pdf",
+    "pages": 6,
+    "size_bytes": 658778,
+    "sort_order": 0,
+    "created_at": "2026-07-02T17:33:08.47836+00:00"
+  },
+  {
+    "id": "d7f6e26c-931d-4dcf-b44c-6a41c72027a9",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "02 APPLE",
+    "r2_key": "pdfs/99b20d04317f4ae1a1cc847c42ec4320.pdf",
+    "pages": 3,
+    "size_bytes": 408749,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:14:02.345533+00:00"
+  },
+  {
+    "id": "1b189682-9b86-4314-a94e-2b63028520d9",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "00 COVER",
+    "r2_key": "pdfs/efefdfbf724e463a809c2124442845ca.pdf",
+    "pages": 1,
+    "size_bytes": 628840,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:14:13.025813+00:00"
+  },
+  {
+    "id": "291dc8d3-5fde-46ad-83e9-f80ef1128a60",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/POWERPOINT TEST",
+    "title": "TEST PP",
+    "r2_key": "pdfs/9ed10dfc4ae54a879c6d44a021d89fdd.pdf",
+    "pages": 1,
+    "size_bytes": 155661,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:14:23.326151+00:00"
+  },
+  {
+    "id": "e0651689-c784-4120-a478-0c6fe2a9a422",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/PRACTICE 1 TIPS",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/aad86905dd844f22b55d29cb14d6fcc8.pdf",
+    "pages": 10,
+    "size_bytes": 1451939,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:14:49.075175+00:00"
+  },
+  {
+    "id": "749686c8-238c-4ece-a1c8-ceacab9280fc",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/6735eb317be245918d2f7f63d625e4d8.pdf",
+    "pages": 10,
+    "size_bytes": 1457293,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:26:50.177274+00:00"
+  },
+  {
+    "id": "c3b3dbdb-c38d-403f-945e-beed6976e523",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "02 OFFENSIVE RUN SCHEMES",
+    "r2_key": "pdfs/88595adb00d743c19ed13258129a6e60.pdf",
+    "pages": 7,
+    "size_bytes": 607096,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:27:44.362372+00:00"
+  },
+  {
+    "id": "230c0067-12e1-4c07-a26d-f13e6d5f4dad",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/5d3dd1f232874c459afdf513167972fc.pdf",
+    "pages": 10,
+    "size_bytes": 728243,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:28:00.087351+00:00"
+  },
+  {
+    "id": "4e421804-678b-4148-aee3-c3bad87696ff",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/NEW TIPS",
+    "title": "02 OFFENSIVE RUN SCHEMES",
+    "r2_key": "pdfs/c65aa0a6841e44f8a81ed401c342f481.pdf",
+    "pages": 7,
+    "size_bytes": 625986,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:33:49.900185+00:00"
+  },
+  {
+    "id": "7769bb3d-f9a7-4cb7-a958-9555d4570d4c",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/NEW TIPS",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/23d627d9ff404c639c7aab786b94f074.pdf",
+    "pages": 10,
+    "size_bytes": 1111362,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:34:08.058114+00:00"
+  },
+  {
+    "id": "c6ec4079-1d95-43ae-905e-09e3030e396d",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/NEW TIPS",
+    "title": "07 COVERAGE TOOLS",
+    "r2_key": "pdfs/1c817f6b4bd441d586491d8c8ac53309.pdf",
+    "pages": 4,
+    "size_bytes": 377197,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:34:13.052072+00:00"
+  },
+  {
+    "id": "50225c5b-751c-4d84-a193-5e2e6461556d",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/NEW TIPS",
+    "title": "08 DEFENSIVE RULES",
+    "r2_key": "pdfs/ae46d6dbd4944254a109c12451f7923b.pdf",
+    "pages": 6,
+    "size_bytes": 393259,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:34:20.552635+00:00"
+  },
+  {
+    "id": "c5fca2c5-e100-467a-be7e-1c2e902cdf17",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "00 DEFENSIVE PHILOSOPHY",
+    "r2_key": "pdfs/d2f352ced5d54fbbb754fdcfcb8c369c.pdf",
+    "pages": 8,
+    "size_bytes": 1339912,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:46:13.212661+00:00"
+  },
+  {
+    "id": "36fb76be-cb02-4c56-a478-72f67c915c9a",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "02 OFFENSIVE RUN SCHEMES",
+    "r2_key": "pdfs/1455cc10449c4ac3a95c351edfd4314f.pdf",
+    "pages": 7,
+    "size_bytes": 589510,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:46:25.588045+00:00"
+  },
+  {
+    "id": "0abc5877-2294-4fb3-bbea-7a9d362460a6",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/4a63c7d80f7e4881ad321f3fb706f292.pdf",
+    "pages": 10,
+    "size_bytes": 1166181,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:46:42.131121+00:00"
+  },
+  {
+    "id": "8456466b-1866-4d34-a694-213c687e04b4",
+    "folder_path": "2026 GAME PLAN/01 - DUQUESNE (SEP 5)/03 - LINEBACKERS/VISIO TEST",
+    "title": "04 PROTECTION SYSTEM",
+    "r2_key": "pdfs/d37ea33f5acb4ca68028c069e8d40098.pdf",
+    "pages": 1,
+    "size_bytes": 67328,
+    "sort_order": 0,
+    "created_at": "2026-07-02T19:46:45.468083+00:00"
+  },
+  {
+    "id": "ddc2471a-4e0f-4985-9123-b0a0c6825f64",
+    "folder_path": "2026 GAME PLAN/00 - FALL CAMP/03 - LINEBACKERS",
+    "title": "01 OFFENSIVE TERMINOLOGY",
+    "r2_key": "pdfs/577135ad58ce481eb78fbe11c173419a.pdf",
+    "pages": 19,
+    "size_bytes": 747489,
+    "sort_order": 0,
+    "created_at": "2026-07-02T20:02:33.99346+00:00"
+  },
+  {
+    "id": "a96ffea2-3861-4d76-8d5c-325387a747ae",
+    "folder_path": "2026 GAME PLAN/00 - FALL CAMP/03 - LINEBACKERS",
+    "title": "02 OFFENSIVE RUN SCHEMES",
+    "r2_key": "pdfs/fa5de806bfcc4a4d927c1bec24de73c9.pdf",
+    "pages": 7,
+    "size_bytes": 539888,
+    "sort_order": 0,
+    "created_at": "2026-07-02T20:02:44.801284+00:00"
+  },
+  {
+    "id": "e4284814-e700-4cbd-b7da-f35ec8f0ca26",
+    "folder_path": "2026 GAME PLAN/00 - FALL CAMP/03 - LINEBACKERS",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/f282ec115ac5414c97e2661f29c8dc95.pdf",
+    "pages": 10,
+    "size_bytes": 1092654,
+    "sort_order": 0,
+    "created_at": "2026-07-02T20:03:02.043648+00:00"
+  },
+  {
+    "id": "5c8fd843-d709-425f-9048-a671a7eb42b8",
+    "folder_path": "2026 GAME PLAN/00 - FALL CAMP/04 - CORNERS/PRACTICE 1 TIPS",
+    "title": "00 DEFENSIVE PHILOSOPHY",
+    "r2_key": "pdfs/65095367afbb43a59698beae112ced2a.pdf",
+    "pages": 8,
+    "size_bytes": 1339912,
+    "sort_order": 0,
+    "created_at": "2026-07-02T20:24:38.707227+00:00"
+  },
+  {
+    "id": "177ae9eb-5dea-4687-aade-cbe25a401308",
+    "folder_path": "2026 GAME PLAN/00 - FALL CAMP/04 - CORNERS/PRACTICE 1 TIPS",
+    "title": "01 OFFENSIVE TERMINOLOGY",
+    "r2_key": "pdfs/a6d195fd14a84c55af75ae24c1bc4f5f.pdf",
+    "pages": 19,
+    "size_bytes": 748806,
+    "sort_order": 0,
+    "created_at": "2026-07-02T20:26:20.193618+00:00"
+  },
+  {
+    "id": "090125e8-1d0d-4b5d-afa2-9607ce44c33b",
+    "folder_path": "2026 GAME PLAN/00 - FALL CAMP/04 - CORNERS/PRACTICE 1 TIPS",
+    "title": "02 OFFENSIVE RUN SCHEMES",
+    "r2_key": "pdfs/ff81698e594c4a46a4299961e0296797.pdf",
+    "pages": 7,
+    "size_bytes": 726531,
+    "sort_order": 0,
+    "created_at": "2026-07-02T20:26:38.961003+00:00"
+  },
+  {
+    "id": "682ca155-bbdf-448c-b05b-22aeffd5fd91",
+    "folder_path": "2026 GAME PLAN/00 - FALL CAMP/04 - CORNERS/PRACTICE 1 TIPS",
+    "title": "03 PASS GAME IDENTIFICATION",
+    "r2_key": "pdfs/9cd0b20a0c8746a6946f1e42c8c38f00.pdf",
+    "pages": 10,
+    "size_bytes": 1457293,
+    "sort_order": 0,
+    "created_at": "2026-07-02T20:27:10.137613+00:00"
+  },
+  {
+    "id": "bf23d2e9-b9a0-4e6e-99cb-2ef859a52e52",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/01 COVERAGES/03 COUNTRIES",
+    "title": "03 COUNTRIES",
+    "r2_key": "pdfs/29ff2c519ce34fa0a5122630c8d62352.pdf",
+    "pages": null,
+    "size_bytes": 6107316,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:15:54.373792+00:00"
+  },
+  {
+    "id": "68f46ff4-808e-498f-ae46-03d4c3c3172d",
+    "folder_path": "2026 AF DEF PLAYBOOK/04 CALLS/01 CONVENTIONAL CALLS/01 COVERAGES/01 CITIES",
+    "title": "01 CITIES",
+    "r2_key": "pdfs/cdd1a0077cae461ca3d39fff547f40ae.pdf",
+    "pages": null,
+    "size_bytes": 17634360,
+    "sort_order": 0,
+    "created_at": "2026-07-01T19:16:16.62298+00:00"
+  }
+]

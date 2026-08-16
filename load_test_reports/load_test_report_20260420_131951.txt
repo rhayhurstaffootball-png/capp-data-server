@@ -1,0 +1,25 @@
+CAPP LOAD TEST REPORT
+================================================================
+Generated UTC:         2026-04-20T19:19:51.261644+00:00
+Server URL:            https://capp-data-server.onrender.com
+Workers:               50
+Unique games:          50
+Duration:              120.3s
+Total requests:        350
+Request rate:          2.91 req/s
+Errors:                0
+Play fetches:          350
+Plays returned:        59,591
+Response bytes:        19,292,588 (18.4 MB)
+
+Latency:
+  Avg:                 1705.0 ms
+  P95:                 13607.0 ms
+  P99:                 15480.8 ms
+  Max:                 15800.8 ms
+
+Bytes by endpoint:
+  GET /game/plays: 18.4 MB
+
+Server memory visibility:
+  Current server API only exposes /health status/version. Render RAM or process memory cannot be measured from this external GUI test unless you add a metrics endpoint or read Render metrics.

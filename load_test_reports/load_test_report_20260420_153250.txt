@@ -1,0 +1,48 @@
+CAPP LOAD TEST REPORT
+================================================================
+Generated UTC:         2026-04-20T21:32:50.165625+00:00
+Server URL:            https://capp-data-server.onrender.com
+Workers:               50
+Unique games:          50
+Game source:           Fixed 2025 historical game set
+Duration:              120.5s
+Total requests:        353
+Request rate:          2.93 req/s
+Errors:                0
+Play fetches:          353
+Plays returned:        60,100
+Response bytes:        19,544,683 (18.6 MB)
+
+Verdict:
+  Stability:           PASS
+  Latency Target:      FAIL (p95 <= 2000 ms)
+  Restart Detected:    NO
+  Recommendation:      Server stayed up, but latency misses the game-day target. Upgrade Render and keep tuning.
+
+Latency:
+  Avg:                 1501.0 ms
+  P95:                 9917.2 ms
+  P99:                 12358.7 ms
+  Max:                 12675.9 ms
+
+Bytes by endpoint:
+  GET /game/plays: 18.6 MB
+
+Cache preflight:
+  Dataset season:      2025
+  Selected games:      50
+  Cache ready:         50
+  Missing from cache:  0
+
+Warmup phase:
+  Enabled:             YES
+  Warmed games:        50
+  Warmup requests:     50
+  Warmup bytes:        2.6 MB
+  Warmup duration:     14.4s
+
+Server health snapshots:
+  Before: status=warming ready=False rss=75.9 MB
+  After:  status=warming ready=False rss=264.6 MB
+  Fetcher before: cached_games=0 plays_cache=0
+  Fetcher after:  cached_games=0 plays_cache=50

@@ -355,11 +355,23 @@ def _evict_stale_poll_buffers():
     """Drop HTTP-poll frame/input buffers for sessions with no live WS session.
     Covers pure-HTTP-poll nodes whose WS-relay teardown cleanup never runs, so a
     stale (1440p) JPEG can't sit in RAM indefinitely after a node goes away."""
-    stale = [k for k in list(_poll_frames.keys()) if k not in _vnc_sessions]
+    now = time.time()
+    # Age-based: the agent has stopped pushing, so nothing here can be current.
+    # This is the one that catches a pure-HTTP-poll node, which never appears in
+    # _vnc_sessions at all and so was invisible to the check below.
+    stale = [k for k in list(_poll_frames.keys())
+             if now - _poll_frame_seen.get(k, 0) > POLL_FRAME_TTL_SECONDS]
+    # Original rule: a WS session existed and has since torn down.
+    stale += [k for k in list(_poll_frames.keys())
+              if k not in _vnc_sessions and k not in stale]
     for k in stale:
         _poll_frames.pop(k, None)
+        _poll_frame_seen.pop(k, None)
     for k in [k for k in list(_poll_inputs.keys()) if k not in _vnc_sessions]:
         _poll_inputs.pop(k, None)
+    # Never let the seen-map outlive the frames it describes.
+    for k in [k for k in list(_poll_frame_seen.keys()) if k not in _poll_frames]:
+        _poll_frame_seen.pop(k, None)
     if stale:
         import gc
         gc.collect()
@@ -1364,6 +1376,16 @@ async def get_agent_relay(machine_id: str, x_api_key: str = Header(None)):
 
 _poll_frames: Dict[str, bytes] = {}   # "{client_id}:{machine_id}" → latest JPEG
 _poll_inputs: Dict[str, List]  = {}   # "{client_id}:{machine_id}" → pending events
+_poll_frame_seen: Dict[str, float] = {}   # key → time.time() of the last agent PUT
+
+# How long a frame stays servable after the agent stops pushing. Past this the
+# session is over as far as the server is concerned, and a still-polling viewer
+# is told 410 Gone so it STOPS instead of polling into the void.
+# Aug 15 2026: one forgotten viewer polled ~30x/min for 28 HOURS and accounted
+# for 63% of every request this server handled. The client now stops itself on
+# navigate-away and after 15 min idle — this is the backstop for clients already
+# in the field that will never receive that update.
+POLL_FRAME_TTL_SECONDS = 90
 
 
 @app.put("/poll/{machine_id}/frame")
@@ -1377,6 +1399,7 @@ async def poll_push_frame(
     key = f"{client_id}:{machine_id}"
     frame = await request.body()
     _poll_frames[key] = frame
+    _poll_frame_seen[key] = time.time()
 
     # Bridge to WebSocket viewer if one is connected
     ws_viewer = _vnc_sessions.get(key, {}).get("viewer")
@@ -1395,9 +1418,18 @@ async def poll_get_frame(
     client_id: str = Depends(get_client_id),
 ):
     """Viewer polls for latest JPEG frame."""
-    frame = _poll_frames.get(f"{client_id}:{machine_id}")
+    key = f"{client_id}:{machine_id}"
+    frame = _poll_frames.get(key)
     if not frame:
         raise HTTPException(status_code=404, detail="No frame available")
+    # The agent has stopped pushing — the session is over. 410 (not 404) so the
+    # viewer can tell "nothing yet, keep waiting" from "this is finished, stop".
+    age = time.time() - _poll_frame_seen.get(key, 0)
+    if age > POLL_FRAME_TTL_SECONDS:
+        _poll_frames.pop(key, None)
+        _poll_inputs.pop(key, None)
+        _poll_frame_seen.pop(key, None)
+        raise HTTPException(status_code=410, detail="Session ended (no frames from agent)")
     return Response(content=frame, media_type="image/jpeg")
 
 

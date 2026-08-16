@@ -18,3 +18,6 @@ create table if not exists playbook_users (
 -- Server talks to this table with the service key (bypasses RLS). Enable RLS with
 -- no policies so nothing else (e.g. the anon key) can read password material.
 alter table playbook_users enable row level security;
+
+
+Tori 

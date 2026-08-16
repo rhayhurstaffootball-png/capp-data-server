@@ -25,9 +25,9 @@ import urllib.parse
 import urllib.request
 
 # ── FILL THESE IN (from Render env vars on capp-data-server) ────────────────
-R2_ACCOUNT_ID = ""      # e.g. 8b95c3cd59fb1c1f9a554c1d797deaf6 (same as Cloudflare Account ID)
-R2_ACCESS_KEY_ID = ""
-R2_SECRET_KEY = ""
+R2_ACCOUNT_ID = "8b95c3cd59fb1c1f9a554c1d797deaf6"      # e.g. 8b95c3cd59fb1c1f9a554c1d797deaf6 (same as Cloudflare Account ID)
+R2_ACCESS_KEY_ID = "d2d745eeb46802a0ab12e89995ffbee9"
+R2_SECRET_KEY = "82bda38962cec74feede981e5bf3a7a997afc861d39610098121b738071eb3da"
 R2_BUCKET = "capp-playbook"
 # ──────────────────────────────────────────────────────────────────────────
 
