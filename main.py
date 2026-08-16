@@ -369,9 +369,12 @@ def _evict_stale_poll_buffers():
         _poll_frame_seen.pop(k, None)
     for k in [k for k in list(_poll_inputs.keys()) if k not in _vnc_sessions]:
         _poll_inputs.pop(k, None)
-    # Never let the seen-map outlive the frames it describes.
+    # Never let the seen-maps outlive the frames they describe.
     for k in [k for k in list(_poll_frame_seen.keys()) if k not in _poll_frames]:
         _poll_frame_seen.pop(k, None)
+    for k in [k for k in list(_poll_get_seen.keys())
+              if now - _poll_get_seen[k] > POLL_FRAME_TTL_SECONDS * 4]:
+        _poll_get_seen.pop(k, None)
     if stale:
         import gc
         gc.collect()
@@ -1377,6 +1380,7 @@ async def get_agent_relay(machine_id: str, x_api_key: str = Header(None)):
 _poll_frames: Dict[str, bytes] = {}   # "{client_id}:{machine_id}" → latest JPEG
 _poll_inputs: Dict[str, List]  = {}   # "{client_id}:{machine_id}" → pending events
 _poll_frame_seen: Dict[str, float] = {}   # key → time.time() of the last agent PUT
+_poll_get_seen:   Dict[str, float] = {}   # key → first GET while NO frame existed
 
 # How long a frame stays servable after the agent stops pushing. Past this the
 # session is over as far as the server is concerned, and a still-polling viewer
@@ -1421,7 +1425,20 @@ async def poll_get_frame(
     key = f"{client_id}:{machine_id}"
     frame = _poll_frames.get(key)
     if not frame:
+        # No frame AT ALL for this session. Normally that just means the agent
+        # hasn't pushed its first one yet, so 404 = "keep waiting".
+        # But an ABANDONED viewer sits here forever: after a server restart the
+        # buffer is empty, so the stale-frame 410 below can never fire and the
+        # client polls 404 for eternity. That is exactly the session that ran
+        # 28 hours. So: give a genuinely-connecting viewer POLL_FRAME_TTL_SECONDS
+        # of grace, then call it over. Works on clients already in the field,
+        # which is the whole point of having a server-side guard.
+        first = _poll_get_seen.setdefault(key, time.time())
+        if time.time() - first > POLL_FRAME_TTL_SECONDS:
+            _poll_get_seen.pop(key, None)
+            raise HTTPException(status_code=410, detail="Session ended (agent never connected)")
         raise HTTPException(status_code=404, detail="No frame available")
+    _poll_get_seen.pop(key, None)   # a real frame arrived — reset the grace window
     # The agent has stopped pushing — the session is over. 410 (not 404) so the
     # viewer can tell "nothing yet, keep waiting" from "this is finished, stop".
     age = time.time() - _poll_frame_seen.get(key, 0)
