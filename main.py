@@ -3602,7 +3602,8 @@ PB_WORKER_TOKEN = os.environ.get("PB_WORKER_TOKEN", "")
 # Worker converts these to PDF. Keep in step with _convert() in BOTH pb_worker.py
 # and CONVERTER/capp_binder_converter.py — a format allowed here but unhandled
 # there uploads fine and then fails in conversion, which looks like a broken app.
-_PB_CONVERT_EXTS = ("vsd", "vsdx", "vsdm", "ppt", "pptx", "doc", "docx", "docm")
+_PB_CONVERT_EXTS = ("vsd", "vsdx", "vsdm", "ppt", "pptx", "doc", "docx", "docm",
+                    "xls", "xlsx", "xlsm", "xlsb")
 
 
 def _vtuple_pb(v: str) -> tuple:
@@ -4396,7 +4397,7 @@ async def coach_pb_sign_upload(payload: dict = Body(...), _u: dict = Depends(_re
     elif ext in _PB_CONVERT_EXTS:
         key = f"{team_id}/raw/{_uuid.uuid4().hex}.{ext}"
     else:
-        raise HTTPException(status_code=400, detail="Only PDF, Word, PowerPoint, or Visio files.")
+        raise HTTPException(status_code=400, detail="Only PDF, Word, Excel, PowerPoint, or Visio files.")
     return {"key": key, "put_url": _r2_presign("PUT", key, expires=900),
             "kind": "pdf" if ext == "pdf" else "convert"}
 
@@ -4608,7 +4609,7 @@ async def coach_pb_insert(payload: dict = Body(...), _u: dict = Depends(_require
         raise HTTPException(status_code=404, detail="Section not found.")
     ext = (payload.get("ext") or "").lower().lstrip(".")
     if ext != "pdf" and ext not in _PB_CONVERT_EXTS:
-        raise HTTPException(status_code=400, detail="Only PDF, Word, PowerPoint, or Visio files.")
+        raise HTTPException(status_code=400, detail="Only PDF, Word, Excel, PowerPoint, or Visio files.")
     raw_key = (payload.get("key") or "").strip()
     if not raw_key:
         raise HTTPException(status_code=400, detail="key is required.")
@@ -5344,8 +5345,8 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <h2>Upload a whole folder</h2>
         <p class="small" style="margin-bottom:14px;">
           Pick a <strong>root folder</strong> and its entire tree of subfolders is recreated in
-          the portal. <strong>PDFs</strong> go live immediately. <strong>Word, Visio and PowerPoint files</strong>
-          (<code>.doc/.docx/.docm/.vsd/.vsdx/.vsdm/.ppt/.pptx</code>) are queued and converted to PDF by the
+          the portal. <strong>PDFs</strong> go live immediately. <strong>Word, Excel, Visio and PowerPoint files</strong>
+          (<code>.doc/.docx/.docm/.vsd/.vsdx/.vsdm/.ppt/.pptx/.xls/.xlsx/.xlsm/.xlsb</code>) are queued and converted to PDF by the
           conversion worker, then appear automatically. Each file keeps its folder path.
         </p>
         <div class="form-row">
@@ -6585,9 +6586,9 @@ function uploadPbFolder(){
   var files=document.getElementById("pbc-dir").files;
   if(!files || !files.length){ res.className="result err"; res.textContent="Pick a folder first."; return; }
   var list=Array.prototype.slice.call(files).filter(function(f){
-    return /\\.(pdf|vsdx?|vsdm|pptx?|docx?|docm)$/i.test(f.name);
+    return /\\.(pdf|vsdx?|vsdm|pptx?|docx?|docm|xlsx?|xlsm|xlsb)$/i.test(f.name);
   });
-  if(!list.length){ res.className="result err"; res.textContent="No PDF, Word, Visio, or PowerPoint files in that folder."; return; }
+  if(!list.length){ res.className="result err"; res.textContent="No PDF, Word, Excel, Visio, or PowerPoint files in that folder."; return; }
   if(window._pbUploadBusy){ res.className="result err"; res.textContent="An upload is already running — wait for it to finish."; return; }
   window._pbUploadBusy=true;
   var done=0, failed=0, queued=0;
@@ -6608,9 +6609,9 @@ function uploadPbFolder(){
     var f=list[i];
     var rel=f.webkitRelativePath||f.name;
     var folder=_pbFolderOf(rel);
-    var m=f.name.match(/\\.(pdf|vsdx?|vsdm|pptx?|docx?|docm)$/i);
+    var m=f.name.match(/\\.(pdf|vsdx?|vsdm|pptx?|docx?|docm|xlsx?|xlsm|xlsb)$/i);
     var ext=(m?m[1]:"").toLowerCase();
-    var title=f.name.replace(/\\.(pdf|vsdx?|vsdm|pptx?|docx?|docm)$/i,"");
+    var title=f.name.replace(/\\.(pdf|vsdx?|vsdm|pptx?|docx?|docm|xlsx?|xlsm|xlsb)$/i,"");
     var p;
     if(ext==="pdf"){
       p=api("POST","/playbook/docs/sign-upload",{folder:folder}).then(function(s){

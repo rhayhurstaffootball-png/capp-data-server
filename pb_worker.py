@@ -2,7 +2,8 @@
 
 Runs on a Windows PC that has Microsoft Word, Visio and PowerPoint installed
 (Roger's machine). Polls the CAPP server for queued playbook conversion jobs
-(uploaded .doc/.docx/.docm/.vsd/.vsdx/.vsdm/.ppt/.pptx files), converts each to
+(uploaded .doc/.docx/.docm/.vsd/.vsdx/.vsdm/.ppt/.pptx/.xls/.xlsx/.xlsm/.xlsb
+files), converts each to
 PDF via Office COM, normalizes page sizes, uploads the PDF to R2 through the server's
 presigned URL, and marks the job done. PDFs then appear in the Binder portal
 automatically.
@@ -336,6 +337,7 @@ def http_put(url: str, src: pathlib.Path) -> None:
 _VISIO = None
 _PP = None
 _WORD = None
+_XL = None
 
 
 _VISIO_FAIL_STREAK = 0
@@ -410,15 +412,37 @@ def _get_word():
     return _WORD
 
 
+def _get_excel():
+    global _XL
+    if _XL is None:
+        import win32com.client
+        log("starting Excel (kept warm for later jobs)...")
+        _XL = win32com.client.Dispatch("Excel.Application")
+        try:
+            _XL.Visible = False
+            _XL.DisplayAlerts = False
+            # A workbook can carry a Workbook_Open handler and .xlsm can carry
+            # macros outright — same intent as the Word AutomationSecurity and
+            # the "macros off" flag on the Visio OpenEx call.
+            _XL.AutomationSecurity = 3     # msoAutomationSecurityForceDisable
+            _XL.EnableEvents = False
+            # "This workbook contains links to other data sources" is a modal
+            # nobody can see on a headless worker — it would hang the job.
+            _XL.AskToUpdateLinks = False
+        except Exception:
+            pass
+    return _XL
+
+
 def _reset_office() -> None:
-    global _VISIO, _PP, _WORD
-    for app in (_VISIO, _PP, _WORD):
+    global _VISIO, _PP, _WORD, _XL
+    for app in (_VISIO, _PP, _WORD, _XL):
         if app is not None:
             try:
                 app.Quit()
             except Exception:
                 pass
-    _VISIO = _PP = _WORD = None
+    _VISIO = _PP = _WORD = _XL = None
 
 
 atexit.register(_reset_office)
@@ -463,6 +487,67 @@ def convert_word(src: str, out: str) -> None:
         doc.ExportAsFixedFormat(os.path.normpath(out), 17)
     finally:
         doc.Close(0)   # wdDoNotSaveChanges — never leave a "save?" modal behind
+
+
+def convert_excel(src: str, out: str) -> None:
+    """Excel COM ExportAsFixedFormat (xlTypePDF=0) — native vector PDF, same as
+    the other Office paths.
+
+    Spreadsheets need a page-setup pass first, which the other formats don't.
+    A Word/PowerPoint/Visio file already knows its own page size; a worksheet is
+    an unbounded grid, so Excel's default is to slice it into letter-size tiles
+    and emit the left-hand columns on one page, the next few columns pages
+    later. A 14-column call sheet exported raw came out as 7 pages showing 5
+    columns each — to a coach that reads as a broken upload, not a wide sheet.
+
+    So per sheet:
+      * fit to ONE page wide, unlimited pages tall — the whole row stays on one
+        page and long lists still spill downward, which is how a call sheet or
+        a personnel chart is meant to read;
+      * orientation from the used range's own shape (wider than tall ->
+        landscape), rather than forcing one on every sheet.
+    An existing print area is left alone — if a coach has already set one up,
+    that intent wins; this only decides how what's printed gets laid out.
+    """
+    xl = _get_excel()
+    wb = xl.Workbooks.Open(os.path.normpath(src), ReadOnly=True, UpdateLinks=0,
+                           IgnoreReadOnlyRecommended=True)
+    try:
+        # Each PageSetup write is a round-trip to the printer driver; batching
+        # them behind PrintCommunication turns a slow per-property crawl into
+        # one apply. On a multi-sheet workbook this is the difference between
+        # seconds and minutes.
+        try:
+            xl.PrintCommunication = False
+        except Exception:
+            pass
+        printable = 0
+        for ws in wb.Worksheets:
+            try:
+                used = ws.UsedRange
+                if used.Cells.Count <= 1 and not str(used.Value or "").strip():
+                    continue                       # genuinely empty sheet
+                printable += 1
+                ps = ws.PageSetup
+                ps.Orientation = 2 if used.Width > used.Height else 1
+                ps.Zoom = False
+                ps.FitToPagesWide = 1
+                ps.FitToPagesTall = False
+            except Exception as e:
+                # One odd sheet must not sink the workbook — it still exports,
+                # just with whatever page setup it already had.
+                log(f"  (page setup skipped for a sheet: {e})")
+        try:
+            xl.PrintCommunication = True
+        except Exception:
+            pass
+        if not printable:
+            # Excel raises a bare "Document not saved" here, which tells a coach
+            # nothing. Fail with something they can act on.
+            raise RuntimeError("that spreadsheet has no printable content")
+        wb.ExportAsFixedFormat(0, os.path.normpath(out))
+    finally:
+        wb.Close(False)    # never leave a "save changes?" modal behind
 
 
 def page_count(pdf: pathlib.Path):
@@ -544,6 +629,8 @@ def _convert(ext: str, src: str, out: str) -> None:
         convert_powerpoint(src, out)
     elif ext in ("doc", "docx", "docm"):
         convert_word(src, out)
+    elif ext in ("xls", "xlsx", "xlsm", "xlsb"):
+        convert_excel(src, out)
     else:
         raise RuntimeError(f"unsupported extension: {ext}")
 
