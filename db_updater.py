@@ -2,12 +2,16 @@
 db_updater.py
 =============
 Runs twice daily. Updates workflow_server.db with:
-  1. Game results (result, team_score, opponent_score) for completed games
-  2. team_conferences for current season (handles mid-season conference changes)
-  3. Bumps db_meta.version so clients know to download
-  4. Uploads updated DB to Supabase Storage
+  1. team_conferences for current season (handles mid-season conference changes)
+  2. College schedules + games for the current season, from CFBD
+  3. NFL schedules + games for the current season, from ESPN (CFBD is
+     college-only, so the NFL needs its own source — see insert_nfl_games)
+  4. Game results (result, team_score, opponent_score) for completed games
+  5. Bumps db_meta.version so clients know to download
+  6. Uploads updated DB to Supabase Storage
 
-Does NOT insert new games or schedules — that is handled by the CAPP Toolkit.
+Everything schedule-related is imported HERE, server-side, and reaches clients
+only through the workflow.db sync — no client fetches a schedule from ESPN.
 Called by APScheduler in main.py, or run manually: python db_updater.py
 """
 
@@ -282,6 +286,183 @@ def insert_new_games(conn):
     return games_added, schedules_added
 
 
+# ── NFL schedule import (ESPN) ────────────────────────────────────────────────
+# CFBD is college-only, so the FBS/FCS path above can never produce NFL rows.
+# Before this, workflow.db's only NFL data was a one-off 2025 import with
+# placeholder game_ids ("NFL008"), which meant the Workflow module's NFL
+# dropdown was empty for the current season and could never self-correct.
+#
+# NFL comes from ESPN via espn_fetcher.get_team_schedule() — the same proven
+# path SBENTRY's live game selector already uses, including its seasontype
+# handling (the bare no-seasontype response follows the CURRENT phase of the
+# season, so the regular season MUST be requested explicitly) and its
+# cross-phase event dedup. This runs SERVER-SIDE only: the result is baked into
+# workflow.db and reaches clients through the normal /db/version -> /db/download
+# sync, so no client ever calls ESPN for a schedule.
+
+def _nfl_kickoff_date(start_date_utc):
+    """Calendar date for an NFL game from its UTC kickoff, in US Eastern.
+
+    Unlike college (where we use the VENUE timezone, because a late Pacific or
+    Hawaii kickoff genuinely belongs to its own local day), the NFL schedule is
+    published, broadcast and discussed entirely in Eastern — "Thursday night",
+    "Sunday 1 o'clock", "Monday night" are ET labels. No NFL kickoff falls after
+    midnight ET, so the ET date is always the day the game is billed as, and it
+    keeps international games (London, Munich, Melbourne) on the US date ESPN
+    and the league list them under rather than rolling them a day forward.
+    """
+    s = start_date_utc or ""
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return s[:10]
+    return dt.astimezone(_ET).date().isoformat()
+
+
+def insert_nfl_games(conn):
+    """Pull the current NFL season from ESPN into schedules + games.
+
+    Mirrors insert_new_games: one row per team per game, upserted on
+    (team, game_id, season) so a rescheduled kickoff UPDATES the existing row
+    instead of spawning a duplicate.
+
+    Regular season and postseason only — matching the college path, which also
+    has no preseason. Postseason weeks are stored as 19+ so that the Workflow
+    NFL dropdown's `ORDER BY CAST(week AS INTEGER)` puts them after week 18.
+    """
+    try:
+        import espn_fetcher
+    except Exception as e:
+        log.error(f"insert_nfl_games: espn_fetcher unavailable — skipping NFL: {e}")
+        return 0
+
+    cur = conn.cursor()
+
+    # Only write names that already exist in the teams table. The Workflow
+    # schedule query joins teams on the opponent name to get its logo id, so an
+    # unknown name (Pro Bowl squads, a relocation ESPN renamed before we did)
+    # would render a logo-less card. Skipping is loud and harmless; the rest of
+    # the league still imports.
+    known = {r[0] for r in cur.execute("SELECT team FROM teams WHERE division='NFL'")}
+    if not known:
+        log.error("insert_nfl_games: no NFL teams in teams table — skipping NFL")
+        return 0
+
+    try:
+        espn_teams = espn_fetcher.get_team_list("nfl")
+    except Exception as e:
+        log.error(f"insert_nfl_games: ESPN team list FAILED — skipping NFL this run: {e}")
+        return 0
+
+    # game_id -> game dict. Every game is returned by both of its teams, so
+    # collect first and write each exactly once.
+    by_id, failures = {}, 0
+    for t in espn_teams:
+        tid = t.get("id")
+        if not tid:
+            continue
+        try:
+            sched = espn_fetcher.get_team_schedule(tid, CURRENT_SEASON, "nfl")
+        except Exception as e:
+            # Loud but non-fatal, same policy as the FCS fix: one team's failed
+            # pull must not lose the other 31. Existing rows are retained.
+            failures += 1
+            log.error(f"insert_nfl_games: schedule pull FAILED for ESPN team {tid} "
+                      f"({t.get('display_name','?')}): {e}")
+            continue
+        for g in sched:
+            gid = g.get("game_id")
+            if gid:
+                by_id[str(gid)] = g
+        time.sleep(0.2)          # be polite to ESPN across 32 teams
+
+    if failures == len(espn_teams):
+        log.error("insert_nfl_games: EVERY NFL team pull failed — no NFL data written")
+        return 0
+
+    written, skipped = 0, 0
+    for gid, g in by_id.items():
+        if g.get("season_type") not in (2, 3):
+            continue                                    # skip preseason
+        home = _strip_accents(g.get("home_team", "")).strip().upper()
+        away = _strip_accents(g.get("away_team", "")).strip().upper()
+        if home not in known or away not in known:
+            skipped += 1
+            continue
+
+        date_str = _nfl_kickoff_date(g.get("date", ""))
+
+        try:
+            wk = int(g.get("week") or 0)
+        except (TypeError, ValueError):
+            wk = 0
+        week = str(wk + 18 if g.get("season_type") == 3 else wk)
+
+        completed  = g.get("status") == "post"
+        home_pts   = g.get("home_score") if completed else None
+        away_pts   = g.get("away_score") if completed else None
+        home_result = away_result = None
+        if completed and home_pts is not None and away_pts is not None:
+            home_result = "W" if home_pts > away_pts else ("L" if home_pts < away_pts else "T")
+            away_result = "W" if away_pts > home_pts else ("L" if away_pts < home_pts else "T")
+
+        for team, opp, loc, tscore, oscore, result in [
+            (home, away, "vs", home_pts, away_pts, home_result),
+            (away, home, "at", away_pts, home_pts, away_result),
+        ]:
+            # games — keyed on (team, game_id, season), update in place
+            cur.execute("""
+                UPDATE games SET
+                    opponent=?, date=?, home_team=?, away_team=?, week=?,
+                    result=?, team_score=?, opponent_score=?
+                WHERE team=? AND game_id=? AND season=?
+            """, (opp, date_str, home, away, week,
+                  result, tscore, oscore,
+                  team, gid, str(CURRENT_SEASON)))
+            if not cur.rowcount:
+                cur.execute("""
+                    INSERT INTO games
+                        (team, opponent, date, home_team, away_team,
+                         neutral_site, conference_game, week, season, game_id,
+                         result, team_score, opponent_score)
+                    VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(team, opponent, date) DO UPDATE SET
+                        game_id=excluded.game_id,
+                        result=excluded.result,
+                        team_score=excluded.team_score,
+                        opponent_score=excluded.opponent_score
+                """, (team, opp, date_str, home, away, week,
+                      str(CURRENT_SEASON), gid, result, tscore, oscore))
+
+            # schedules — same (team, game_id, season) key
+            existing = cur.execute("""
+                SELECT id FROM schedules WHERE team=? AND game_id=? AND season=?
+            """, (team, gid, str(CURRENT_SEASON))).fetchone()
+            if existing:
+                cur.execute("""
+                    UPDATE schedules SET
+                        opponent=?, date=?, location=?, home_team=?, away_team=?, week=?
+                    WHERE id=?
+                """, (opp, date_str, loc, home, away, week, existing[0]))
+            else:
+                cur.execute("""
+                    INSERT INTO schedules
+                        (team, opponent, date, location, home_team, away_team,
+                         season, game_id, week, team_division, opponent_division)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'NFL', 'NFL')
+                """, (team, opp, date_str, loc, home, away,
+                      str(CURRENT_SEASON), gid, week))
+                written += 1
+
+    conn.commit()
+    log.info(f"NFL {CURRENT_SEASON}: {len(by_id)} games from ESPN, "
+             f"{written} new schedule rows, {skipped} skipped (unknown team), "
+             f"{failures} team pulls failed")
+    return written
+
+
 # ── Update game results ───────────────────────────────────────────────────────
 def update_game_results(conn):
     """
@@ -418,15 +599,17 @@ def run_update():
 
         update_conference_memberships(conn)
         g_added, s_added = insert_new_games(conn)
+        nfl_added = insert_nfl_games(conn)
         updated = update_game_results(conn)
 
-        if not (g_added or s_added or updated):
+        if not (g_added or s_added or nfl_added or updated):
             conn.close()
             elapsed = time.time() - start
             log.info(f"=== No changes — skipping version bump and upload ({elapsed:.1f}s) ===")
             return True
 
-        version = bump_version(conn, f"+{g_added} games, +{s_added} schedules, {updated} results updated")
+        version = bump_version(conn, f"+{g_added} games, +{s_added} schedules, "
+                                     f"+{nfl_added} NFL schedules, {updated} results updated")
         conn.close()
 
         success = upload_to_supabase(DB_PATH)
