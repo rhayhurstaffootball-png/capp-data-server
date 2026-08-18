@@ -1144,6 +1144,7 @@ async def nodes_register(
     rustdesk_id: str = Body(..., embed=True),
     password: str = Body("", embed=True),
     notes: str = Body("", embed=True),
+    agent_version: str = Body("", embed=True),
 ):
     """Register or update a node for this client. Identified by rustdesk_id."""
     from datetime import datetime, timezone
@@ -1157,6 +1158,8 @@ async def nodes_register(
         existing["machine_name"] = machine_name
         existing["last_seen"] = now
         existing["status"] = "online"
+        if agent_version:
+            existing["agent_version"] = agent_version
         if password:
             existing["password"] = password
         if notes:
@@ -1171,16 +1174,51 @@ async def nodes_register(
             "added": now,
             "last_seen": now,
             "status": "online",
+            "agent_version": agent_version,
         })
 
     await _save_nodes(client_id, nodes)
     return {"status": "registered", "machine_name": machine_name, "rustdesk_id": rustdesk_id}
 
 
+# A node re-registers every POLL_INTERVAL (300s) in the agent, so anything seen
+# inside 3 missed check-ins is still healthy. Generous on purpose: a node that
+# blinks offline in the panel every time one POST is slow is worse than useless.
+NODE_ONLINE_WINDOW_SECONDS = 15 * 60
+
+
+def _derive_node_status(node: dict) -> str:
+    """Compute online/offline from last_seen.
+
+    ⚠ The stored "status" field is set to "online" at registration and NEVER
+    updated, so it reported EVERY node online forever — including one whose
+    last_seen was 13 days stale. That actively misled a live outage diagnosis on
+    Aug 18 2026, where the panel showed a storming, unusable node as healthy.
+    last_seen is the only real signal, so status is now derived from it and the
+    stored value is ignored on read.
+    """
+    from datetime import datetime, timezone
+    seen = node.get("last_seen")
+    if not seen:
+        return "offline"
+    try:
+        ts = datetime.fromisoformat(str(seen).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return "unknown"
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    return "online" if age <= NODE_ONLINE_WINDOW_SECONDS else "offline"
+
+
 @app.get("/nodes")
 async def nodes_list(client_id: str = Depends(get_client_id)):
     """List all registered nodes for this client."""
-    return {"nodes": await _load_nodes(client_id)}
+    nodes = await _load_nodes(client_id)
+    for n in nodes:
+        n["status"] = _derive_node_status(n)
+        n.setdefault("agent_version", "")
+    return {"nodes": nodes}
 
 
 @app.patch("/nodes/{node_id}")
