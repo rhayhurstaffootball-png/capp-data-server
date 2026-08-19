@@ -41,7 +41,7 @@ APP_NAME = "CAPP Binder Converter"
 # this against GET /converter/version (the CONVERTER_VERSION env var on Render)
 # and silently updates itself when Render reports a higher one â€” so BOTH have to
 # move for a release to reach anybody: upload the new exe AND bump the env var.
-CONVERTER_VERSION = "1.2.3"
+CONVERTER_VERSION = "1.2.5"
 
 _FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -713,12 +713,26 @@ _XL = None
 _VISIO_FAIL_STREAK = 0
 
 
+# ⚠ DispatchEx, NEVER Dispatch, for every Office app below.
+#
+# Dispatch() ATTACHES to an already-running instance if the coach has one open.
+# The converter then drives THEIR Excel/Word/Visio: it sets Visible = False and
+# DisplayAlerts = False on the app they are working in, opens files in it, and
+# quits it when done. Roger saw Excel open on screen during a Binder conversion
+# (Aug 19 2026) -- on a coach's machine the same code can make their own open
+# workbook disappear mid-edit.
+#
+# DispatchEx() forces a NEW out-of-process instance every time, so the converter
+# stays completely invisible and can never touch the user's session. This is
+# what "no window, no console, no tray" was always supposed to mean.
+
+
 def _get_visio():
     global _VISIO, _VISIO_FAIL_STREAK
     if _VISIO is None:
         import win32com.client
         log("starting Visio (kept warm for later jobs)...")
-        _VISIO = win32com.client.Dispatch("Visio.Application")
+        _VISIO = win32com.client.DispatchEx("Visio.Application")
         # Visio's automation endpoint isn't always fully up the instant
         # Dispatch() returns â€” worse right after a previous instance was
         # just quit, since a rapid relaunch can briefly trip up Office's own
@@ -756,7 +770,25 @@ def _get_powerpoint():
     if _PP is None:
         import win32com.client
         log("starting PowerPoint (kept warm for later jobs)...")
-        _PP = win32com.client.Dispatch("PowerPoint.Application")
+        _PP = win32com.client.DispatchEx("PowerPoint.Application")
+        # PowerPoint is the one Office app whose Application.Visible CANNOT be
+        # forced False -- COM raises on the assignment, which is why this block
+        # is best-effort per setting rather than one try. Everything else that
+        # keeps a headless worker quiet is still applied: alerts off (a modal
+        # nobody can see would hang the job), macros disabled to match the Word
+        # and Excel paths, and the window minimised so a coach does not get a
+        # deck flashing up mid-conversion.
+        for attr, val in (("DisplayAlerts", 1),        # ppAlertsNone
+                          ("AutomationSecurity", 3),   # msoAutomationSecurityForceDisable
+                          ("WindowState", 2)):         # ppWindowMinimized
+            try:
+                setattr(_PP, attr, val)
+            except Exception:
+                pass
+        try:
+            _PP.Visible = False        # works on some builds, raises on most
+        except Exception:
+            pass
     return _PP
 
 
@@ -765,7 +797,7 @@ def _get_word():
     if _WORD is None:
         import win32com.client
         log("starting Word (kept warm for later jobs)...")
-        _WORD = win32com.client.Dispatch("Word.Application")
+        _WORD = win32com.client.DispatchEx("Word.Application")
         try:
             _WORD.Visible = False
             # Word is far more dialog-happy than PowerPoint: "convert this .doc
@@ -786,7 +818,7 @@ def _get_excel():
     if _XL is None:
         import win32com.client
         log("starting Excel (kept warm for later jobs)...")
-        _XL = win32com.client.Dispatch("Excel.Application")
+        _XL = win32com.client.DispatchEx("Excel.Application")
         try:
             _XL.Visible = False
             _XL.DisplayAlerts = False
@@ -1168,27 +1200,46 @@ def main() -> None:
         log("Visio primed and ready.")
     except Exception as e:
         log(f"(Visio priming hit the known first-launch hiccup, as expected: {e} â€” now warmed up for real jobs)")
+    # ⚠ NOTHING below may be allowed to end this loop. On Aug 19 2026 a server
+    # bug made /playbook/worker/complete return 500 after a job had converted
+    # perfectly, and the worker stopped running -- so every later upload sat at
+    # "converting 0 of 1 files" forever, because nothing was left to claim them.
+    # A coach reads that as "the Binder is broken and does nothing".
+    # One bad request must cost one job, never the worker.
     while True:
         try:
-            claim = api("/playbook/worker/claim", {"worker": WORKER_NAME})
+            _work_once(_upd_state)
         except Exception as e:
-            log(f"claim failed ({e}); retrying in {POLL_SECONDS}s")
-            time.sleep(POLL_SECONDS)
-            continue
-        if not claim.get("job"):
-            _maybe_update(_upd_state)   # idle only â€” never mid-conversion
-            time.sleep(POLL_SECONDS)
-            continue
-        job_id = claim["job"]["id"]
-        try:
-            process(claim)
-        except Exception as e:
-            log(f"  FAILED: {e}")
+            log(f"UNEXPECTED error in the worker loop ({e}) -- continuing anyway")
             log(traceback.format_exc())
-            try:
-                api("/playbook/worker/error", {"job_id": job_id, "error": str(e)})
-            except Exception:
-                pass
+            time.sleep(POLL_SECONDS)
+
+
+def _work_once(_upd_state) -> None:
+    """One poll cycle: claim a job if there is one, run it, report the result."""
+    try:
+        claim = api("/playbook/worker/claim", {"worker": WORKER_NAME})
+    except Exception as e:
+        log(f"claim failed ({e}); retrying in {POLL_SECONDS}s")
+        time.sleep(POLL_SECONDS)
+        return
+    if not claim.get("job"):
+        _maybe_update(_upd_state)   # idle only, never mid-conversion
+        time.sleep(POLL_SECONDS)
+        return
+    job_id = claim["job"]["id"]
+    try:
+        process(claim)
+    except Exception as e:
+        log(f"  FAILED: {e}")
+        log(traceback.format_exc())
+        try:
+            api("/playbook/worker/error", {"job_id": job_id, "error": str(e)})
+        except Exception as e2:
+            # The error report can fail for the SAME reason the job did -- on
+            # Aug 19 complete AND error both 500'd. Log it instead of swallowing
+            # it, so a job left mid-flight on the server is visible from here.
+            log(f"  (could not report the failure to the server either: {e2})")
 
 
 if __name__ == "__main__":
