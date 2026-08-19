@@ -65,6 +65,54 @@ Start-Sleep -Seconds 1
 
 Write-Host ""
 Write-Host "Building $OUT_NAME.exe..." -ForegroundColor Yellow
+# ---------------------------------------------------------------------------
+# Generate the Windows version resource from CONVERTER_VERSION so the built EXE
+# identifies itself in Explorer -> Properties -> Details.
+#
+# Aug 19 2026: three converter EXEs were sitting in one folder with NO version
+# on any of them, and two July builds were still running and failing every
+# Excel job. Nothing short of running them told you which was which.
+# ---------------------------------------------------------------------------
+$cv = Select-String -Path "capp_binder_converter.py" -Pattern '^CONVERTER_VERSION *= *"([^"]+)"' | Select-Object -First 1
+if ($cv) { $CONV_VER = $cv.Matches[0].Groups[1].Value } else { $CONV_VER = "0.0.0" }
+$cp = [System.Collections.ArrayList]@($CONV_VER.Split("."))
+while ($cp.Count -lt 4) { [void]$cp.Add("0") }
+$ctup  = "($($cp[0]), $($cp[1]), $($cp[2]), $($cp[3]))"
+$cvstr = "$CONV_VER.0"
+@"
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=$ctup,
+    prodvers=$ctup,
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'040904B0',
+          [StringStruct(u'CompanyName', u'CAPP Solutions LLC'),
+           StringStruct(u'FileDescription', u'CAPP Binder Converter'),
+           StringStruct(u'FileVersion', u'$cvstr'),
+           StringStruct(u'InternalName', u'CAPP_Binder_Converter'),
+           StringStruct(u'LegalCopyright', u'Copyright (c) 2026 CAPP Solutions LLC'),
+           StringStruct(u'OriginalFilename', u'CAPP_Binder_Converter.exe'),
+           StringStruct(u'ProductName', u'CAPP Binder Converter'),
+           StringStruct(u'ProductVersion', u'$cvstr')]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
+"@ | Out-File -FilePath "converter_version_info.txt" -Encoding utf8
+Write-Host "  Version resource: $CONV_VER" -ForegroundColor White
+
 pyinstaller --noconfirm "CAPP_Binder_Converter.spec"
 
 if ($LASTEXITCODE -ne 0) {

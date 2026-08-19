@@ -41,7 +41,7 @@ APP_NAME = "CAPP Binder Converter"
 # this against GET /converter/version (the CONVERTER_VERSION env var on Render)
 # and silently updates itself when Render reports a higher one — so BOTH have to
 # move for a release to reach anybody: upload the new exe AND bump the env var.
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
 
 _FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -144,14 +144,85 @@ def _self_delete_downloaded_exe(exe_path: pathlib.Path) -> None:
         log(f"(couldn't schedule cleanup of downloaded exe: {e})")
 
 
+# The installed EXE is ALWAYS this name, whatever the download was called.
+#
+# ⚠ WHY (Aug 19 2026): this used to install to `_APP_DIR / exe_path.name`, i.e.
+# whatever name the browser gave the download. A coach who downloads twice gets
+# "CAPP_Binder_Converter (1).exe", a third time "(4).exe", and EACH install
+# registers its own filename for autostart and leaves the previous binaries on
+# disk AND RUNNING. Roger's machine had three copies and a pair of JULY builds
+# still running a month later, claiming every Binder job and failing all of them
+# with "unsupported extension: xlsx" because they predated Excel support. The
+# new build installed fine and simply never got the work.
+#
+# A fixed name means a re-download replaces the same file, self-update always
+# targets the copy that is actually running, and autostart cannot fragment.
+_CANONICAL_EXE_NAME = "CAPP_Binder_Converter.exe"
+
+
+def _stop_other_converters() -> int:
+    """Kill any other running converter, whatever filename it was installed as.
+
+    ⚠ Load-bearing for two reasons: an old copy holds the job queue and keeps
+    failing work the new build could do, and a running process locks its own
+    EXE so the install copy would fail outright.
+
+    Matches on the image name PREFIX so the "(1)"/"(4)" variants are caught, and
+    excludes our own PID so a converter never kills itself.
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        import subprocess
+        me = os.getpid()
+        ps = (
+            "Get-Process | Where-Object { $_.Name -like 'CAPP_Binder_Converter*' "
+            f"-and $_.Id -ne {me} }} | ForEach-Object {{ $_.Id; Stop-Process -Id $_.Id -Force }}"
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=30,
+            creationflags=0x08000000)
+        killed = [ln for ln in (r.stdout or "").split() if ln.strip().isdigit()]
+        if killed:
+            log(f"Stopped {len(killed)} older converter process(es): {', '.join(killed)}")
+        return len(killed)
+    except Exception as e:
+        log(f"(couldn't stop older converters: {e})")
+        return 0
+
+
+def _remove_stale_installs(keep: pathlib.Path) -> None:
+    """Delete previously-installed EXEs that used a download-suffixed name.
+
+    Best-effort and deliberately narrow: only files in _APP_DIR whose name
+    starts with 'CAPP_Binder_Converter' and is not the canonical one.
+    """
+    try:
+        for p in _APP_DIR.glob("CAPP_Binder_Converter*.exe"):
+            if p.resolve() == keep.resolve():
+                continue
+            try:
+                p.unlink()
+                log(f"Removed stale converter copy: {p.name}")
+            except OSError:
+                pass          # still locked; it is harmless once autostart points elsewhere
+    except Exception:
+        pass
+
+
 def _self_install_if_needed() -> None:
     if not _FROZEN:
         return
     exe_path = pathlib.Path(sys.executable).resolve()
-    installed_path = _APP_DIR / exe_path.name
+    installed_path = _APP_DIR / _CANONICAL_EXE_NAME
     if exe_path == installed_path:
         return   # already running from the installed location
-    log(f"First launch from {exe_path} — installing to {installed_path} ...")
+    log(f"First launch from {exe_path} - installing to {installed_path} ...")
+    # Stop older copies FIRST: one of them may be holding installed_path open,
+    # and any that survive keep claiming jobs this build should be doing.
+    _stop_other_converters()
+
     embedded_token, marker_offset = _extract_embedded_token(exe_path)
     try:
         if marker_offset is not None:
@@ -192,6 +263,9 @@ def _self_install_if_needed() -> None:
             except Exception:
                 pass
     _register_autostart(installed_path)
+    # Now that autostart points at the canonical copy, drop any older
+    # download-suffixed EXEs so they can never be launched again.
+    _remove_stale_installs(installed_path)
     log("Installed. Launching the installed copy and exiting this one...")
     try:
         if embedded_token:
