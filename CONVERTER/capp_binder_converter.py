@@ -1,11 +1,11 @@
-"""CAPP Binder Converter — the coach-facing, per-machine background worker.
+﻿"""CAPP Binder Converter â€” the coach-facing, per-machine background worker.
 
 Distributed as a single signed EXE. Fully invisible: no window, no console,
-no tray icon — matches the dev-machine pb_worker.py exactly. A coach downloads
+no tray icon â€” matches the dev-machine pb_worker.py exactly. A coach downloads
 this from the Binder's "Complete Setup" screen alongside a one-time pairing
 token; on first launch it installs itself, registers to auto-start with
 Windows, pairs to that coach's own login, and from then on only ever converts
-files THAT coach uploaded — never another coach's, even on the same team.
+files THAT coach uploaded â€” never another coach's, even on the same team.
 See "T:\\BINDER LOCAL PLAN.txt" for the full design.
 
 This is the compiled counterpart to capp-data-server/pb_worker.py (Roger's own
@@ -39,13 +39,13 @@ APP_NAME = "CAPP Binder Converter"
 # This build's version. Stamped by build_converter.ps1 -Version at build time,
 # exactly like AGENT_VERSION in capp_agent.py. An installed converter compares
 # this against GET /converter/version (the CONVERTER_VERSION env var on Render)
-# and silently updates itself when Render reports a higher one — so BOTH have to
+# and silently updates itself when Render reports a higher one â€” so BOTH have to
 # move for a release to reach anybody: upload the new exe AND bump the env var.
-CONVERTER_VERSION = "1.1.0"
+CONVERTER_VERSION = "1.2.3"
 
 _FROZEN = bool(getattr(sys, "frozen", False))
 
-# ── where this install lives ─────────────────────────────────────────────────
+# â”€â”€ where this install lives â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Frozen: a stable per-user folder (survives the exe being re-launched from
 # anywhere). Source/dev run: next to this script, same as pb_worker.py.
 if _FROZEN:
@@ -79,17 +79,17 @@ def _trim_log() -> None:
         pass
 
 
-# ── one-time self-install (frozen only) ──────────────────────────────────────
+# â”€â”€ one-time self-install (frozen only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # A coach double-clicks the downloaded EXE from wherever their browser put it
 # (usually Downloads/Desktop). The "Complete Setup" screen embeds the coach's
 # one-time pairing token INTO the downloaded EXE's own bytes (see the relay's
-# /converter/download?t=... route) — there is no separate pairing_token.txt
+# /converter/download?t=... route) â€” there is no separate pairing_token.txt
 # download anymore. First launch: pull the token out of this file's own
 # trailing bytes, copy the CLEAN (token-stripped) bytes into the stable
 # per-user folder so the permanent install never carries the secret, relaunch
 # that installed copy passing the token as a one-time startup argument,
-# register to auto-start with Windows (HKCU Run key — no admin rights
-# needed), and exit this one — which then gets deleted from Downloads a
+# register to auto-start with Windows (HKCU Run key â€” no admin rights
+# needed), and exit this one â€” which then gets deleted from Downloads a
 # couple seconds later. Every launch after that is already running from
 # _APP_DIR, so this whole function is a no-op.
 #
@@ -117,7 +117,7 @@ def _find_downloaded_token(folder: pathlib.Path) -> pathlib.Path | None:
     """A pairing_token.txt downloaded alongside the EXE lands in the same
     folder as the EXE itself (browser default download location). If the
     coach re-ran 'Complete Setup' before (or the browser already had a file
-    by that name), the browser saves it as 'pairing_token (1).txt' etc — an
+    by that name), the browser saves it as 'pairing_token (1).txt' etc â€” an
     exact-name match would miss it and leave the real token sitting in
     Downloads forever. Glob for any variant and take the newest."""
     try:
@@ -130,7 +130,7 @@ def _find_downloaded_token(folder: pathlib.Path) -> pathlib.Path | None:
 
 def _self_delete_downloaded_exe(exe_path: pathlib.Path) -> None:
     """Best-effort cleanup so the coach's Downloads folder doesn't keep a
-    stray copy of the installer sitting around after setup — Windows won't
+    stray copy of the installer sitting around after setup â€” Windows won't
     let a running process delete its own file, so this hands it off to a
     hidden, detached shell that waits for us to exit first."""
     try:
@@ -146,7 +146,7 @@ def _self_delete_downloaded_exe(exe_path: pathlib.Path) -> None:
 
 # The installed EXE is ALWAYS this name, whatever the download was called.
 #
-# ⚠ WHY (Aug 19 2026): this used to install to `_APP_DIR / exe_path.name`, i.e.
+# âš  WHY (Aug 19 2026): this used to install to `_APP_DIR / exe_path.name`, i.e.
 # whatever name the browser gave the download. A coach who downloads twice gets
 # "CAPP_Binder_Converter (1).exe", a third time "(4).exe", and EACH install
 # registers its own filename for autostart and leaves the previous binaries on
@@ -163,7 +163,7 @@ _CANONICAL_EXE_NAME = "CAPP_Binder_Converter.exe"
 def _stop_other_converters() -> int:
     """Kill any other running converter, whatever filename it was installed as.
 
-    ⚠ Load-bearing for two reasons: an old copy holds the job queue and keeps
+    âš  Load-bearing for two reasons: an old copy holds the job queue and keeps
     failing work the new build could do, and a running process locks its own
     EXE so the install copy would fail outright.
 
@@ -270,18 +270,18 @@ def _self_install_if_needed() -> None:
     try:
         if embedded_token:
             # Hand the token to the fresh process as a startup argument
-            # instead of a file — it's consumed by a single HTTP call within
+            # instead of a file â€” it's consumed by a single HTTP call within
             # a second of launch and never touches disk. (The only residual
             # exposure is that the token is briefly visible in this
             # process's command line, e.g. to Task Manager, for that same
-            # second — an acceptable trade against a file that would
+            # second â€” an acceptable trade against a file that would
             # otherwise sit in Downloads indefinitely.)
             import subprocess
             CREATE_NO_WINDOW = 0x08000000
             subprocess.Popen([str(installed_path), "--pair-token", embedded_token],
                              creationflags=CREATE_NO_WINDOW, close_fds=True)
         else:
-            os.startfile(str(installed_path))   # detached — survives this process exiting
+            os.startfile(str(installed_path))   # detached â€” survives this process exiting
     except Exception as e:
         log(f"FATAL: could not launch installed copy: {e}")
         sys.exit(1)
@@ -290,7 +290,7 @@ def _self_install_if_needed() -> None:
 
 
 def _register_autostart(exe_path: pathlib.Path) -> None:
-    """HKCU Run key — starts silently with Windows, no admin rights, no
+    """HKCU Run key â€” starts silently with Windows, no admin rights, no
     scheduled-task/service complexity. Idempotent (just overwrites the value)."""
     try:
         import winreg
@@ -301,21 +301,21 @@ def _register_autostart(exe_path: pathlib.Path) -> None:
         winreg.CloseKey(key)
         log("Registered to start automatically with Windows.")
     except Exception as e:
-        log(f"(couldn't register auto-start: {e} — you'll need to re-launch it after a restart)")
+        log(f"(couldn't register auto-start: {e} â€” you'll need to re-launch it after a restart)")
 
 
 _self_install_if_needed()
 
-# ── single instance guard (second launch exits quietly) ─────────────────────
-# A named Windows mutex, not a loopback socket bind — real-world testing
+# â”€â”€ single instance guard (second launch exits quietly) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# A named Windows mutex, not a loopback socket bind â€” real-world testing
 # showed two copies (a coach re-running "Complete Setup" while an older
 # instance was still alive) BOTH ending up alive and BOTH polling for jobs,
-# each with its own separate never-primed Visio state — which is what was
+# each with its own separate never-primed Visio state â€” which is what was
 # actually causing seemingly-random single-file failures in a batch (the job
 # claimed by the "invisible" second instance hit its own cold-start race).
 # A named mutex is the standard, reliable Windows single-instance primitive:
 # the OS itself guarantees only one process can hold it, and releases it
-# automatically even if a process is killed rather than exiting cleanly —
+# automatically even if a process is killed rather than exiting cleanly â€”
 # a loopback socket can also do this, but is more exposed to interference
 # from VPN/EDR/security software intercepting or virtualizing localhost,
 # which is a real concern on a managed/military machine.
@@ -327,7 +327,7 @@ try:
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 except ImportError:
-    # pywin32 not available (dev/source run only, never in the frozen EXE) —
+    # pywin32 not available (dev/source run only, never in the frozen EXE) â€”
     # fall back to the old loopback-socket guard so `python capp_binder_
     # converter.py` still behaves sanely for local testing.
     _guard = socket.socket()
@@ -337,9 +337,9 @@ except ImportError:
         sys.exit(0)
 
 
-# ── paired identity ───────────────────────────────────────────────────────────
+# â”€â”€ paired identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Every coach pairs THEIR OWN computer to THEIR OWN login, once. From then on
-# the server only ever hands THIS worker jobs THAT coach uploaded — never
+# the server only ever hands THIS worker jobs THAT coach uploaded â€” never
 # another coach's, even on the same team. See BINDER LOCAL PLAN.txt.
 def _load_device_token() -> str:
     if not _DEVICE_TOKEN_PATH.exists():
@@ -362,7 +362,7 @@ def _register_with_token(tok: str) -> None:
         if not device_token:
             raise RuntimeError("server did not return a worker_token")
         _DEVICE_TOKEN_PATH.write_text(json.dumps({"worker_token": device_token}), encoding="utf-8")
-        log("Paired this computer to your CAPP Binder login — it will only ever "
+        log("Paired this computer to your CAPP Binder login â€” it will only ever "
             "convert YOUR OWN uploads.")
     except Exception as e:
         log(f"FATAL: pairing failed ({e}). Redo 'Complete Setup' from the Binder to try again.")
@@ -372,7 +372,7 @@ def _register_with_token(tok: str) -> None:
 def _register_with_pairing_token_file() -> None:
     """Legacy/fallback path: a pairing_token.txt was dropped next to this
     install by hand (or by an older Binder build). Not used by the normal
-    coach flow anymore — that hands the token in via --pair-token instead."""
+    coach flow anymore â€” that hands the token in via --pair-token instead."""
     tok = _PAIRING_TOKEN_PATH.read_text(encoding="utf-8").strip()
     try:
         _register_with_token(tok)
@@ -383,12 +383,12 @@ def _register_with_pairing_token_file() -> None:
             pass
 
 
-# ── silent self-update ───────────────────────────────────────────────────────
+# â”€â”€ silent self-update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Same shape as the CAPP Nodes Agent's check (GET the server's current version,
 # compare tuples, download, swap the exe via a script that waits for this
 # process to exit, relaunch) with one deliberate difference: the Agent shows an
 # "Update Available" window with Update Now / Later. This converter is designed
-# to be completely invisible — no window, no console, no tray — so there is
+# to be completely invisible â€” no window, no console, no tray â€” so there is
 # nobody to click "Later" and prompting would break that contract. It updates
 # itself quietly and only says so in converter.log.
 #
@@ -432,7 +432,7 @@ def _self_update(new_version: str) -> bool:
         return False
     try:
         running_exe = pathlib.Path(sys.executable).resolve()
-        log(f"update available: v{new_version} (running v{CONVERTER_VERSION}) — downloading ...")
+        log(f"update available: v{new_version} (running v{CONVERTER_VERSION}) â€” downloading ...")
         url = _http_json(f"{SERVER}/converter/download").get("download_url", "")
         if not url:
             log("  update aborted: server returned no download link")
@@ -440,9 +440,9 @@ def _self_update(new_version: str) -> bool:
 
         # NOTE: no ?t= pairing token on this URL. The relay only appends the
         # token trailer when one is requested, so this comes down as a CLEAN
-        # exe — which is exactly right. This machine is already paired and its
+        # exe â€” which is exactly right. This machine is already paired and its
         # device_token.json is untouched by the swap.
-        # Streamed, not http_get() — that buffers the whole body in memory, and
+        # Streamed, not http_get() â€” that buffers the whole body in memory, and
         # this payload is ~128MB on a machine that is also running Office.
         new_path = running_exe.with_suffix(running_exe.suffix + ".new")
         with urllib.request.urlopen(url, timeout=600) as r, open(new_path, "wb") as f:
@@ -526,7 +526,7 @@ def _worker_token() -> str:
 
 TOKEN = _worker_token()
 
-# ── Visio Converter toolkit — bundled into this EXE (not a hardcoded dev path) ─
+# â”€â”€ Visio Converter toolkit â€” bundled into this EXE (not a hardcoded dev path) â”€
 # Gives every coach's worker the same font fidelity Roger's own worker has: the
 # portable Fonts bundle loaded into the session, and the variable-font hybrid
 # (Visio can't embed a variable font like Bahnschrift into vector PDF; those
@@ -612,7 +612,7 @@ def _log_missing_fonts(doc):
                 continue
             if fl not in have and not any(n == fl or n.startswith(fl + " ") for n in have):
                 _WARNED_FONTS.add(fl)
-                log(f'  WARNING: font "{f}" is not on this PC or in the Fonts bundle — '
+                log(f'  WARNING: font "{f}" is not on this PC or in the Fonts bundle â€” '
                     f'Visio will substitute it (layout may shift).')
     except Exception:
         pass
@@ -633,13 +633,13 @@ def _hybrid_fix_variable_fonts(fg_pages, pdf_path):
                         need.add(i)
                         if fam.lower() not in _WARNED_FONTS:
                             _WARNED_FONTS.add(fam.lower())
-                            log(f'  "{fam}" is a variable font — its pages get '
+                            log(f'  "{fam}" is a variable font â€” its pages get '
                                 f'rasterized at high DPI (vector can\'t embed it)')
                         break
         if not need:
             return
         if len(fg_pages) != n_pdf:
-            log("  (page count mismatch — skipping variable-font raster pass)")
+            log("  (page count mismatch â€” skipping variable-font raster pass)")
             return
         png_for = {}
         with tempfile.TemporaryDirectory(prefix="pbhybrid_") as tmp:
@@ -654,7 +654,7 @@ def _hybrid_fix_variable_fonts(fg_pages, pdf_path):
                     vtp.emf_to_image(emf, img, w_in, h_in, dpi=_raster_dpi_for(w_in, h_in))
                     png_for[fi] = img
                 except Exception as e:
-                    log(f"  (raster of page {fi + 1} failed: {e} — leaving it vector)")
+                    log(f"  (raster of page {fi + 1} failed: {e} â€” leaving it vector)")
             if not png_for:
                 return
             src = fitz.open(pdf_path)
@@ -680,7 +680,7 @@ def api(path: str, body: dict) -> dict:
     # x-converter-version rides on every call so the server can record which
     # build each paired machine is actually running. It costs nothing (the
     # worker already calls in constantly to claim jobs) and it's the only way
-    # a coach can be told their converter is stale — the exe is invisible, so
+    # a coach can be told their converter is stale â€” the exe is invisible, so
     # there is nothing to look at on the machine itself.
     req = urllib.request.Request(
         SERVER + path, data=json.dumps(body).encode(), method="POST",
@@ -703,7 +703,7 @@ def http_put(url: str, src: pathlib.Path) -> None:
         pass
 
 
-# ── warm Office instances (launched on first use, reused across jobs) ────────
+# â”€â”€ warm Office instances (launched on first use, reused across jobs) â”€â”€â”€â”€â”€â”€â”€â”€
 _VISIO = None
 _PP = None
 _WORD = None
@@ -720,10 +720,10 @@ def _get_visio():
         log("starting Visio (kept warm for later jobs)...")
         _VISIO = win32com.client.Dispatch("Visio.Application")
         # Visio's automation endpoint isn't always fully up the instant
-        # Dispatch() returns — worse right after a previous instance was
+        # Dispatch() returns â€” worse right after a previous instance was
         # just quit, since a rapid relaunch can briefly trip up Office's own
         # licensing/activation check. Retry for up to ~20s before giving up
-        # (was ~5s — too short for that check to clear on a busy machine).
+        # (was ~5s â€” too short for that check to clear on a busy machine).
         last_err = None
         for _attempt in range(40):
             try:
@@ -743,7 +743,7 @@ def _get_visio():
             _VISIO_FAIL_STREAK += 1
             hint = ""
             if _VISIO_FAIL_STREAK >= 3:
-                hint = (" — this has failed 3+ times in a row now; if it keeps "
+                hint = (" â€” this has failed 3+ times in a row now; if it keeps "
                         "happening, open Visio directly on this PC and check "
                         "File > Account for its activation status.")
             raise RuntimeError(f"Visio did not become ready in time ({last_err}){hint}")
@@ -772,7 +772,7 @@ def _get_word():
             # format?", "recover this file?", "open read-only?" all block on a
             # modal nobody can see on a headless worker, hanging the job.
             _WORD.DisplayAlerts = 0
-            # msoAutomationSecurityForceDisable — a .doc/.docm can carry an
+            # msoAutomationSecurityForceDisable â€” a .doc/.docm can carry an
             # AutoOpen macro that would otherwise run the moment we open it.
             # Same intent as the "macros off" flag on the Visio OpenEx call.
             _WORD.AutomationSecurity = 3
@@ -791,12 +791,12 @@ def _get_excel():
             _XL.Visible = False
             _XL.DisplayAlerts = False
             # A workbook can carry a Workbook_Open handler and .xlsm can carry
-            # macros outright — same intent as the Word AutomationSecurity and
+            # macros outright â€” same intent as the Word AutomationSecurity and
             # the "macros off" flag on the Visio OpenEx call.
             _XL.AutomationSecurity = 3     # msoAutomationSecurityForceDisable
             _XL.EnableEvents = False
             # "This workbook contains links to other data sources" is a modal
-            # nobody can see on a headless worker — it would hang the job.
+            # nobody can see on a headless worker â€” it would hang the job.
             _XL.AskToUpdateLinks = False
         except Exception:
             pass
@@ -841,7 +841,7 @@ def convert_powerpoint(src: str, out: str) -> None:
 
 
 def convert_word(src: str, out: str) -> None:
-    """Word COM ExportAsFixedFormat (wdExportFormatPDF=17) — native vector PDF,
+    """Word COM ExportAsFixedFormat (wdExportFormatPDF=17) â€” native vector PDF,
     same as the Visio/PowerPoint paths rather than a print-to-PDF raster."""
     word = _get_word()
     # ConfirmConversions=False stops the legacy-format prompt on old .doc files;
@@ -851,11 +851,11 @@ def convert_word(src: str, out: str) -> None:
     try:
         doc.ExportAsFixedFormat(os.path.normpath(out), 17)
     finally:
-        doc.Close(0)   # wdDoNotSaveChanges — never leave a "save?" modal behind
+        doc.Close(0)   # wdDoNotSaveChanges â€” never leave a "save?" modal behind
 
 
 def convert_excel(src: str, out: str) -> None:
-    """Excel COM ExportAsFixedFormat (xlTypePDF=0) — native vector PDF, same as
+    """Excel COM ExportAsFixedFormat (xlTypePDF=0) â€” native vector PDF, same as
     the other Office paths.
 
     Spreadsheets need a page-setup pass first, which the other formats don't.
@@ -863,15 +863,15 @@ def convert_excel(src: str, out: str) -> None:
     an unbounded grid, so Excel's default is to slice it into letter-size tiles
     and emit the left-hand columns on one page, the next few columns pages
     later. A 14-column call sheet exported raw came out as 7 pages showing 5
-    columns each — to a coach that reads as a broken upload, not a wide sheet.
+    columns each â€” to a coach that reads as a broken upload, not a wide sheet.
 
     So per sheet:
-      * fit to ONE page wide, unlimited pages tall — the whole row stays on one
+      * fit to ONE page wide, unlimited pages tall â€” the whole row stays on one
         page and long lists still spill downward, which is how a call sheet or
         a personnel chart is meant to read;
       * orientation from the used range's own shape (wider than tall ->
         landscape), rather than forcing one on every sheet.
-    An existing print area is left alone — if a coach has already set one up,
+    An existing print area is left alone â€” if a coach has already set one up,
     that intent wins; this only decides how what's printed gets laid out.
     """
     xl = _get_excel()
@@ -899,7 +899,7 @@ def convert_excel(src: str, out: str) -> None:
                 ps.FitToPagesWide = 1
                 ps.FitToPagesTall = False
             except Exception as e:
-                # One odd sheet must not sink the workbook — it still exports,
+                # One odd sheet must not sink the workbook â€” it still exports,
                 # just with whatever page setup it already had.
                 log(f"  (page setup skipped for a sheet: {e})")
         try:
@@ -929,7 +929,7 @@ def normalize_pdf(pdf_path: pathlib.Path) -> None:
         import collections
         import fitz
     except ImportError:
-        log("  (PyMuPDF not available — skipping page normalization)")
+        log("  (PyMuPDF not available â€” skipping page normalization)")
         return
     book = fitz.open(pdf_path)
     if book.page_count == 0:
@@ -964,8 +964,8 @@ def normalize_pdf(pdf_path: pathlib.Path) -> None:
 
 
 def _stamp_label(page, label: str) -> None:
-    """Same style as the Visio Converter's own booklet stamp — bottom-center,
-    small white pill — so every coach's numbering matches Roger's exactly."""
+    """Same style as the Visio Converter's own booklet stamp â€” bottom-center,
+    small white pill â€” so every coach's numbering matches Roger's exactly."""
     if not label:
         return
     import fitz
@@ -1040,7 +1040,7 @@ def _merge_insert(base_path, play_path, out_path, insert_after: int, label: str)
 
 
 def _convert(ext: str, src: str, out: str) -> None:
-    # Keep in step with _PB_CONVERT_EXTS in main.py and _convert in pb_worker.py —
+    # Keep in step with _PB_CONVERT_EXTS in main.py and _convert in pb_worker.py â€”
     # a format the server accepts but this doesn't handle uploads fine and then
     # dies here, which reads to a coach as a broken app.
     if ext in ("vsd", "vsdx", "vsdm"):
@@ -1056,7 +1056,7 @@ def _convert(ext: str, src: str, out: str) -> None:
 
 
 def _convert_with_retry(ext: str, src: str, out: str) -> None:
-    """One retry with a fresh Office instance on failure — paced with a short
+    """One retry with a fresh Office instance on failure â€” paced with a short
     pause first. Several files landing at once used to cause back-to-back
     instant Visio kill+relaunch cycles (this retry stacked on top of
     _get_visio()'s own retry-then-relaunch), which made a transient
@@ -1141,13 +1141,13 @@ def main() -> None:
     _trim_log()
     log(f"{APP_NAME} v{CONVERTER_VERSION} '{WORKER_NAME}' polling {SERVER} every "
         f"{POLL_SECONDS}s (paired mode; installed at {_APP_DIR}).")
-    # Check once at startup, before any job is claimed — a converter that has
+    # Check once at startup, before any job is claimed â€” a converter that has
     # been off for a month should come back current rather than run a stale
     # build until the first 6-hour tick.
     _upd_state = {"last_update_check": 0.0}
     _maybe_update(_upd_state)
     if vtp is None:
-        log(f"converter toolkit NOT loaded ({globals().get('_VTP_IMPORT_ERR', 'missing')}) — "
+        log(f"converter toolkit NOT loaded ({globals().get('_VTP_IMPORT_ERR', 'missing')}) â€” "
             f"font protections off, plain export only")
     else:
         try:
@@ -1159,7 +1159,7 @@ def main() -> None:
     # Prime Visio once, quietly, before the first real job ever reaches it.
     # The very first Visio.Application launch in this process's lifetime can
     # lose a one-time COM marshaling race ("Property 'Visio.Application.
-    # Visible' can not be set") no matter how long _get_visio() retries —
+    # Visible' can not be set") no matter how long _get_visio() retries â€”
     # but that race only ever happens once per process, pass or fail. Eating
     # that failure here means the coach's actual first upload never sees it,
     # instead of it landing on whichever file happens to be queued first.
@@ -1167,7 +1167,7 @@ def main() -> None:
         _get_visio()
         log("Visio primed and ready.")
     except Exception as e:
-        log(f"(Visio priming hit the known first-launch hiccup, as expected: {e} — now warmed up for real jobs)")
+        log(f"(Visio priming hit the known first-launch hiccup, as expected: {e} â€” now warmed up for real jobs)")
     while True:
         try:
             claim = api("/playbook/worker/claim", {"worker": WORKER_NAME})
@@ -1176,7 +1176,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
         if not claim.get("job"):
-            _maybe_update(_upd_state)   # idle only — never mid-conversion
+            _maybe_update(_upd_state)   # idle only â€” never mid-conversion
             time.sleep(POLL_SECONDS)
             continue
         job_id = claim["job"]["id"]
