@@ -3682,7 +3682,10 @@ async def _worker_identity(x_worker_token: str = Header(""),
         # Heartbeat, plus the version the worker reported in its header so a
         # coach can be told their converter is stale.
         beat = {"last_seen_at": _dtmod.datetime.utcnow().isoformat() + "Z"}
-        ver = (x_converter_version or "").strip()[:20]
+        # Defensive: only ever treat a real str as a version. If this is
+        # somehow called outside FastAPI again, an unresolved Header object
+        # must degrade to "no version", never raise into a 500.
+        ver = (x_converter_version if isinstance(x_converter_version, str) else "").strip()[:20]
         try:
             async with httpx.AsyncClient() as c:
                 url = f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}"
@@ -3703,11 +3706,27 @@ async def _worker_identity(x_worker_token: str = Header(""),
     raise HTTPException(status_code=401, detail="Unauthorized worker")
 
 
-async def _require_worker(x_worker_token: str = Header("")):
+async def _require_worker(x_worker_token: str = Header(""),
+                          x_converter_version: str = Header("")):
     """Validity-only guard for the completion/error endpoints (they already
     operate on a job_id the worker only knows because it claimed that job
-    itself) — accepts the legacy shared token or any paired device token."""
-    await _worker_identity(x_worker_token)
+    itself) — accepts the legacy shared token or any paired device token.
+
+    ⚠ BOTH headers must be declared here and forwarded. This used to call
+    _worker_identity(x_worker_token) with one argument, so x_converter_version
+    kept its DEFAULT — and a default of Header("") is a FastAPI Header OBJECT,
+    not a string, because plain calls get no dependency resolution. It is
+    truthy, so `(x_converter_version or "").strip()` raised
+    "AttributeError: 'Header' object has no attribute 'strip'" and every
+    /playbook/worker/complete returned 500.
+
+    That broke the Binder end to end from Aug 17 2026: the converter did the
+    whole job correctly, uploaded the PDF, reported completion, got a 500, and
+    the unhandled error KILLED THE WORKER PROCESS — so nothing converted after
+    it either. /playbook/worker/claim was unaffected because it takes
+    _worker_identity as a real Depends(), where FastAPI fills both headers in.
+    Forwarding the version also means completions now refresh the heartbeat."""
+    await _worker_identity(x_worker_token, x_converter_version)
 
 
 @app.post("/admin/api/playbook/jobs/sign-upload", dependencies=[Depends(_require_admin)])
