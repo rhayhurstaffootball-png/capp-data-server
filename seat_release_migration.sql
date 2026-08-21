@@ -10,12 +10,17 @@
 -- no more abusable than emailing support, while still being instant.
 --
 -- Safe to re-run.
+--
+-- NOTE: keep semicolons OUT of the COMMENT strings below. The Supabase
+-- dashboard splits statements on ';' without respecting quotes, and a
+-- semicolon inside the text truncates the string mid-quote:
+--   ERROR: 42601: unterminated quoted string
 
 ALTER TABLE capp_clients
     ADD COLUMN IF NOT EXISTS seat_1_released_at timestamptz,
     ADD COLUMN IF NOT EXISTS seat_2_released_at timestamptz;
 
 COMMENT ON COLUMN capp_clients.seat_1_released_at IS
-    'Last self-service release of seat 1 (cappvcs.com/seats). Rate limit only; admin resets do not set it.';
+    'Last self-service release of seat 1 (cappvcs.com/seats). Rate limit only - admin resets do not set it.';
 COMMENT ON COLUMN capp_clients.seat_2_released_at IS
-    'Last self-service release of seat 2 (cappvcs.com/seats). Rate limit only; admin resets do not set it.';
+    'Last self-service release of seat 2 (cappvcs.com/seats). Rate limit only - admin resets do not set it.';
