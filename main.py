@@ -2444,6 +2444,104 @@ async def admin_send_reset(username: str):
     return {"ok": True, "email": email}
 
 
+# ── Self-service seat management (cappvcs.com/seats) ──────────────────────────
+# Schools asked to move CAPP between computers without emailing Roger. The
+# unbind already existed as an ADMIN action; these two endpoints let the school
+# do it themselves with the credentials they already have.
+#
+# ⚠ These deliberately do NOT bind a machine. /auth/login binds on first use,
+# so it cannot be reused to check seat status — looking at your seats would
+# consume one.
+
+SEAT_RELEASE_COOLDOWN_HOURS = 24
+
+
+async def _seat_client(username: str, password: str) -> dict:
+    """Verify credentials and return the client row. 401 on any failure."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}",
+                    "select": "username,client_id,active,password_hash,salt,"
+                              "seat_1_machine,seat_2_machine,"
+                              "seat_1_released_at,seat_2_released_at"},
+            headers=_supabase_headers())
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    u = r.json()[0]
+    if hashlib.sha256((password + u["salt"]).encode()).hexdigest() != u["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    if not u.get("active"):
+        raise HTTPException(status_code=403, detail="This account is not active.")
+    return u
+
+
+def _seat_view(u: dict, n: int) -> dict:
+    """What the seats page shows for one seat."""
+    machine = u.get(f"seat_{n}_machine")
+    rel = u.get(f"seat_{n}_released_at")
+    wait = 0
+    if rel:
+        try:
+            last = _dtmod.datetime.fromisoformat(str(rel).replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+            wait = max(0, SEAT_RELEASE_COOLDOWN_HOURS - age)
+        except Exception:
+            wait = 0
+    return {
+        "seat": n,
+        "bound": bool(machine),
+        # Fingerprint only — there is no computer name to show. Truncated
+        # because the full hash is meaningless to a coach and just noise.
+        "machine": (str(machine)[:12] + "…") if machine else None,
+        "can_release": bool(machine) and wait <= 0,
+        "hours_until_release": round(wait, 1),
+    }
+
+
+@app.post("/seats/status")
+async def seats_status(username: str = Body(..., embed=True),
+                       password: str = Body(..., embed=True)):
+    """Show this account's two seats. Does NOT bind a machine."""
+    u = await _seat_client(username, password)
+    return {"username": u["username"],
+            "seats": [_seat_view(u, 1), _seat_view(u, 2)]}
+
+
+@app.post("/seats/release")
+async def seats_release(username: str = Body(..., embed=True),
+                        password: str = Body(..., embed=True),
+                        seat: int = Body(..., embed=True)):
+    """Release one seat so it can be activated on another computer.
+
+    ⚠ Rate-limited to one release per seat per 24h. Without that, this becomes
+    a way to rotate a single licence around a whole staff — the exact sharing
+    the machine binding exists to prevent.
+    """
+    if seat not in (1, 2):
+        raise HTTPException(status_code=400, detail="Seat must be 1 or 2.")
+    u = await _seat_client(username, password)
+    view = _seat_view(u, seat)
+    if not view["bound"]:
+        raise HTTPException(status_code=400, detail=f"Seat {seat} is already open.")
+    if not view["can_release"]:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Seat {seat} was released recently. You can release it again in "
+                   f"{view['hours_until_release']:.0f} more hour(s).")
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={f"seat_{seat}_machine": None,
+                  f"seat_{seat}_released_at": datetime.now(timezone.utc).isoformat()},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True, "seat": seat,
+            "message": f"Seat {seat} released. Activate CAPP on the new computer to use it."}
+
+
 @app.patch("/admin/api/clients/{username}/reset-seat", dependencies=[Depends(_require_admin)])
 async def admin_reset_single_seat(username: str, seat: int = Body(..., embed=True)):
     """Reset a single seat (1 or 2)."""
