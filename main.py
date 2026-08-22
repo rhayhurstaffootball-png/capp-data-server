@@ -2444,6 +2444,88 @@ async def admin_send_reset(username: str):
     return {"ok": True, "email": email}
 
 
+# ── Broadcast notices (admin blasts a message to every client) ────────────────
+# Roger, Aug 21 2026: "I also need a way to Blast all users with update info."
+#
+# The client polls /app/notice at launch. `min_version` doubles as a MANDATORY
+# UPDATE floor -- below it the client should block rather than offer.
+#
+# ⚠ Stored in Supabase, NOT a Render env var. APP_VERSION is an env var and it
+# already served a stale value until the next deploy. A broadcast you can only
+# send by redeploying is not a broadcast.
+
+_NOTICES = "capp_notices"
+
+
+@app.get("/app/notice")
+async def app_notice():
+    """Public — the newest active notice, or nothing.
+
+    Deliberately unauthenticated and cheap: the client calls it at launch,
+    before it necessarily has a working API key, and a broadcast that only
+    reaches licensed clients cannot warn anyone about a licensing problem.
+    """
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_NOTICES}",
+                        params={"select": "id,title,body,severity,min_version,created_at",
+                                "active": "eq.true",
+                                "order": "created_at.desc", "limit": "1"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        return {"notice": None}          # never break a launch over a broadcast
+    rows = r.json() or []
+    return {"notice": rows[0] if rows else None,
+            "app_version": os.environ.get("APP_VERSION", "2.0.0")}
+
+
+@app.get("/admin/api/notices", dependencies=[Depends(_require_admin)])
+async def admin_notices_list(limit: int = 20):
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_NOTICES}",
+                        params={"select": "*", "order": "created_at.desc",
+                                "limit": str(min(limit, 100))},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.post("/admin/api/notices", dependencies=[Depends(_require_admin)])
+async def admin_notice_create(payload: dict = Body(...)):
+    """Publish a notice. Only the newest active one is ever shown, so
+    publishing supersedes rather than stacking."""
+    row = {
+        "title":    (payload.get("title") or "").strip(),
+        "body":     (payload.get("body") or "").strip(),
+        "severity": (payload.get("severity") or "info").strip().lower(),
+        "min_version": (payload.get("min_version") or "").strip() or None,
+        "active":   True,
+    }
+    if not row["title"] or not row["body"]:
+        raise HTTPException(status_code=400, detail="Title and message are required.")
+    if row["severity"] not in ("info", "warning", "critical"):
+        raise HTTPException(status_code=400, detail="Severity must be info, warning or critical.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_NOTICES}", json=row,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.patch("/admin/api/notices/{notice_id}/retract", dependencies=[Depends(_require_admin)])
+async def admin_notice_retract(notice_id: str):
+    """Pull a notice back. Clients stop showing it on their next launch —
+    anyone already looking at it keeps it until they restart."""
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_NOTICES}",
+                          params={"id": f"eq.{notice_id}"}, json={"active": False},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
 # ── Self-service seat management (cappvcs.com/seats) ──────────────────────────
 # Schools asked to move CAPP between computers without emailing Roger. The
 # unbind already existed as an ADMIN action; these two endpoints let the school
@@ -5278,6 +5360,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
     <button class="tab" onclick="showTab('playbook-tab', this)">Playbook</button>
     <button class="tab" onclick="showTab('pbcontent-tab', this)">Playbook Files</button>
     <button class="tab" onclick="showTab('teams-tab', this)">Binder Teams</button>
+    <button class="tab" onclick="showTab('notices-tab', this)">Broadcast</button>
   </div>
   <div class="main-area">
 
@@ -5426,6 +5509,42 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <button class="btn btn-primary" onclick="addSalesDoc()">Add / Update Number</button>
         <div class="result" id="sd-result"></div>
         <div id="salesdocs-table" style="margin-top:16px;"><div class="loading">Loading...</div></div>
+      </div>
+    </div>
+
+    <div class="panel" id="notices-tab">
+      <div class="card">
+        <h2>Broadcast to All Clients</h2>
+        <p class="small" style="margin-bottom:14px;">
+          Shown once inside CAPP the next time each user launches it. Only the newest
+          active notice is delivered, so publishing a new one supersedes the last.
+        </p>
+        <div style="display:grid;grid-template-columns:1fr 180px;gap:12px;">
+          <input id="ntc-title" placeholder="Title, e.g. CAPP 2.6.4 is available" maxlength="120" />
+          <select id="ntc-severity">
+            <option value="info">Info</option>
+            <option value="warning">Warning</option>
+            <option value="critical">Critical</option>
+          </select>
+        </div>
+        <textarea id="ntc-body" rows="4" placeholder="What you want every user to read." maxlength="1200"
+                  style="width:100%;margin-top:12px;"></textarea>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap;">
+          <input id="ntc-minver" placeholder="Mandatory below version (optional, e.g. 2.6.4)"
+                 style="flex:1;min-width:260px;" />
+          <button class="btn btn-primary" onclick="publishNotice()">Publish</button>
+        </div>
+        <p class="small" style="margin-top:8px;">
+          Leave the version blank for an informational message. Fill it in and clients older
+          than that version are told the update is required.
+        </p>
+        <div id="ntc-msg" class="small" style="margin-top:10px;"></div>
+      </div>
+      <div class="card" style="margin-top:18px;">
+        <h2>Sent
+          <button class="btn" onclick="loadNotices()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <div id="ntc-list"><div class="loading">Loading...</div></div>
       </div>
     </div>
 
@@ -5789,7 +5908,59 @@ function showTab(id, btn) {
   if (id === "playbook-tab") loadPlaybookUsers();
   if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); loadPbAccessLog(); }
   if (id === "teams-tab") { loadBinderTeams(); loadTeamLogoCatalog(); }
+  if (id === "notices-tab") loadNotices();
   closeSlideout();
+}
+
+function loadNotices() {
+  const box = document.getElementById("ntc-list");
+  box.innerHTML = '<div class="loading">Loading...</div>';
+  api("GET", "/notices").then(rows => {
+    if (!rows || !rows.length) { box.innerHTML = '<p class="small">Nothing sent yet.</p>'; return; }
+    box.innerHTML = "<table><tr><th>Sent</th><th>Title</th><th>Severity</th><th>Requires</th><th>Status</th><th></th></tr>" +
+      rows.map(n => {
+        const when = String(n.created_at || "").slice(0, 16).replace("T", " ");
+        const live = n.active
+          ? '<span class="badge badge-green">Live</span>'
+          : '<span class="badge badge-gray">Retracted</span>';
+        const act = n.active
+          ? '<button class="rowbtn danger" data-id="' + n.id + '" onclick="retractNotice(this.dataset.id)">Retract</button>'
+          : "";
+        return "<tr><td>" + when + "</td><td>" + escN(n.title) + "</td><td>" +
+               escN(n.severity) + "</td><td>" + (n.min_version ? escN(n.min_version) : "-") +
+               "</td><td>" + live + "</td><td>" + act + "</td></tr>";
+      }).join("") + "</table>";
+  });
+}
+
+function escN(s) { return String(s == null ? "" : s).replace(/</g, "&lt;"); }
+
+function publishNotice() {
+  const title = document.getElementById("ntc-title").value.trim();
+  const body  = document.getElementById("ntc-body").value.trim();
+  const sev   = document.getElementById("ntc-severity").value;
+  const minv  = document.getElementById("ntc-minver").value.trim();
+  const msg   = document.getElementById("ntc-msg");
+  if (!title || !body) { msg.textContent = "Title and message are both required."; return; }
+  const warn = minv
+    ? "\\n\\nClients older than " + minv + " will be told the update is REQUIRED."
+    : "";
+  if (!confirm("Send this to every CAPP user?" + warn)) return;
+  msg.textContent = "Publishing...";
+  api("POST", "/notices", { title: title, body: body, severity: sev, min_version: minv })
+    .then(r => {
+      if (r && r.detail) { msg.textContent = r.detail; return; }
+      msg.textContent = "Published. Users see it the next time they open CAPP.";
+      document.getElementById("ntc-title").value = "";
+      document.getElementById("ntc-body").value = "";
+      document.getElementById("ntc-minver").value = "";
+      loadNotices();
+    });
+}
+
+function retractNotice(id) {
+  if (!confirm("Retract this notice? Clients stop showing it on their next launch.")) return;
+  api("PATCH", "/notices/" + id + "/retract").then(loadNotices);
 }
 
 function api(method, path, body) {
