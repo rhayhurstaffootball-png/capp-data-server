@@ -5325,38 +5325,74 @@ async def coach_pb_converter_status(_u: dict = Depends(_require_coach)):
     it checked in recently? Drives the one-time-setup prompt on a
     PowerPoint/Visio upload (a coach who only ever uploads PDFs never needs it)."""
     latest = os.environ.get("CONVERTER_VERSION", "1.0.0")
+
+    # ⚠ ALL of this coach's machines, not just the newest.
+    #
+    # This used to read `limit=1` ordered by paired_at, so a coach with the
+    # converter on two computers only ever saw the most recently paired one -
+    # the other could be doing all the work while the page reported a different
+    # machine, or reported "offline" because the newest one happened to be off.
+    #
+    # Nothing else required that limit: jobs are claimed by EMAIL
+    # (claim_playbook_job_scoped p_uploader_email), so ANY paired machine of
+    # this coach can already do their conversions, and registration is a plain
+    # insert with no replace. Multi-machine was always supported by the data;
+    # only this read pretended otherwise.
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
                         params={"select": "device_name,last_seen_at,converter_version",
                                 "email": f"eq.{_u['email']}",
-                                "order": "paired_at.desc", "limit": "1"},
+                                "order": "paired_at.desc"},
                         headers=_supa_headers_json())
         # Tolerate the column not existing yet (see _worker_identity).
         if r.status_code >= 400:
             r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
                             params={"select": "device_name,last_seen_at",
                                     "email": f"eq.{_u['email']}",
-                                    "order": "paired_at.desc", "limit": "1"},
+                                    "order": "paired_at.desc"},
                             headers=_supa_headers_json())
     rows = r.json() if r.status_code == 200 else []
     if not rows:
-        return {"paired": False, "online": False, "latest_version": latest}
-    last_seen = rows[0].get("last_seen_at")
-    online = False
-    if last_seen:
-        try:
-            dt = _dtmod.datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
-            online = (_dtmod.datetime.now(_dtmod.timezone.utc) - dt).total_seconds() < 300
-        except Exception:
-            online = False
-    # A version is only known once the machine has run a build that reports it.
-    # Older builds report nothing, which is itself the signal that it's stale.
-    running = (rows[0].get("converter_version") or "").strip()
-    return {"paired": True, "online": online,
-            "device_name": rows[0].get("device_name"),
+        return {"paired": False, "online": False, "devices": [], "latest_version": latest}
+
+    now = _dtmod.datetime.now(_dtmod.timezone.utc)
+    devices = []
+    for row in rows:
+        last_seen = row.get("last_seen_at")
+        is_online = False
+        if last_seen:
+            try:
+                dt = _dtmod.datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+                is_online = (now - dt).total_seconds() < 300
+            except Exception:
+                is_online = False
+        # A version is only known once the machine has run a build that reports
+        # it. Older builds report nothing, which is itself the signal it's stale.
+        running = (row.get("converter_version") or "").strip()
+        devices.append({
+            "device_name": row.get("device_name"),
+            "last_seen_at": last_seen,
+            "online": is_online,
             "version": running or None,
+            "up_to_date": bool(running) and _vtuple_pb(running) >= _vtuple_pb(latest),
+        })
+
+    # The headline fields describe the BEST machine this coach has: an online
+    # one beats an offline one, and among those the most up to date wins. That
+    # is what "is my Binder going to convert things" actually depends on, and it
+    # stops a spare laptop that has been off for a week from making a working
+    # setup look broken.
+    best = sorted(devices, key=lambda d: (d["online"], d["up_to_date"],
+                                          d["last_seen_at"] or ""), reverse=True)[0]
+    return {"paired": True,
+            "online": any(d["online"] for d in devices),
+            "device_name": best["device_name"],
+            "version": best["version"],
+            "up_to_date": best["up_to_date"],
             "latest_version": latest,
-            "up_to_date": bool(running) and _vtuple_pb(running) >= _vtuple_pb(latest)}
+            "device_count": len(devices),
+            "online_count": sum(1 for d in devices if d["online"]),
+            "devices": devices}
 
 
 @app.post("/converter/register")
