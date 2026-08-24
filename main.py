@@ -4480,12 +4480,24 @@ async def pb_worker_complete(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="job_id required.")
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
-                        params={"select": "folder_path,title,out_key,team_id",
+                        params={"select": "folder_path,title,out_key,team_id,review",
                                 "id": f"eq.{job_id}", "limit": "1"},
                         headers=_supa_headers_json())
         if g.status_code != 200 or not g.json():
             raise HTTPException(status_code=404, detail="Job not found.")
         job = g.json()[0]
+
+    # The file converted fine, but the coach still has to choose pages. Stop
+    # here WITHOUT creating a playbook_docs row - nothing reaches players until
+    # they publish a selection.
+    if job.get("review"):
+        await _pb_job_patch(job_id, {"status": "review",
+                                     "pages": payload.get("pages"),
+                                     "size_bytes": payload.get("size"),
+                                     "error": None})
+        return {"ok": True, "review": True}
+
+    async with httpx.AsyncClient() as c:
         doc = {
             "team_id":     job.get("team_id"),
             "folder_path": job.get("folder_path") or "",
@@ -5315,6 +5327,164 @@ async def _pb_pdf_inline(job_id: str, job: dict) -> None:
         await _pb_job_patch(job_id, {"status": "error", "error": str(exc)[:400]})
 
 
+# ── Page selection for converted uploads ──────────────────────────────────────
+# A converted file waits in `review` until the coach picks pages. Thumbnails
+# are rendered here with PyMuPDF - the browser cannot render PowerPoint, Excel
+# or Visio, so previewing before conversion is impossible; this previews the
+# CONVERTED result, which is what actually gets published.
+
+_THUMB_MAX_PAGES = 400          # a guard, not a real limit - playbooks run ~160
+
+
+async def _pb_review_job(job_id: str, coach: dict) -> dict:
+    """Fetch a job and prove it belongs to this coach's team."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        params={"select": "id,team_id,title,folder_path,out_key,status,"
+                                          "review,number_after,pages",
+                                "id": f"eq.{job_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+    rows = g.json() if g.status_code == 200 else []
+    if not rows:
+        raise HTTPException(status_code=404, detail="That upload was not found.")
+    job = rows[0]
+    # team_id comes from the JOB and is compared to the coach's own - never
+    # taken from the request, so one team can't read another's pages.
+    if job.get("team_id") != coach.get("team_id"):
+        raise HTTPException(status_code=403, detail="Not your upload.")
+    return job
+
+
+async def _pb_fetch_out_pdf(job: dict) -> bytes:
+    if not job.get("out_key"):
+        raise HTTPException(status_code=409, detail="That upload has not finished converting.")
+    async with httpx.AsyncClient(timeout=180) as c:
+        r = await c.get(_r2_presign("GET", job["out_key"], expires=900))
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Could not read the converted file.")
+    return r.content
+
+
+def _pdf_thumb(data: bytes, page_no: int, width: int = 240) -> bytes:
+    """One page as a JPEG, sized for a picker grid."""
+    import fitz
+    book = fitz.open(stream=data, filetype="pdf")
+    try:
+        if page_no < 1 or page_no > book.page_count:
+            raise HTTPException(status_code=404, detail="No such page.")
+        page = book[page_no - 1]
+        zoom = width / max(page.rect.width, 1)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("jpeg", jpg_quality=72)
+    finally:
+        book.close()
+
+
+def _pdf_select_pages(data: bytes, keep: list, number: bool) -> tuple:
+    """
+    Build a new PDF containing only `keep` (1-based, in the given order).
+    Unselected pages are discarded. Numbers are stamped AFTER selection, so the
+    result reads 1..N with no gaps.
+    """
+    import fitz
+    src = fitz.open(stream=data, filetype="pdf")
+    try:
+        pages = [n for n in keep if 1 <= n <= src.page_count]
+        if not pages:
+            raise HTTPException(status_code=400, detail="No pages selected.")
+        out = fitz.open()
+        try:
+            for n in pages:
+                out.insert_pdf(src, from_page=n - 1, to_page=n - 1)
+            if number:
+                for i in range(out.page_count):
+                    page = out[i]
+                    label = str(i + 1)
+                    r = page.rect
+                    fs = 13
+                    tw = fitz.get_text_length(label, fontname="helv", fontsize=fs)
+                    cx = r.width / 2.0
+                    baseline = r.height - 24
+                    box = fitz.Rect(cx - tw / 2 - 6, baseline - fs - 1,
+                                    cx + tw / 2 + 6, baseline + 4)
+                    page.draw_rect(box, fill=(1, 1, 1), color=(0.7, 0.7, 0.7), width=0.4)
+                    page.insert_text((cx - tw / 2, baseline), label,
+                                     fontname="helv", fontsize=fs, color=(0, 0, 0))
+            return out.tobytes(deflate=True, garbage=3), out.page_count
+        finally:
+            out.close()
+    finally:
+        src.close()
+
+
+@app.get("/coach/playbook/jobs/{job_id}/pages")
+async def coach_pb_job_pages(job_id: str, _u: dict = Depends(_require_coach)):
+    """How many pages the converted file has, so the picker can lay out a grid."""
+    job = await _pb_review_job(job_id, _u)
+    data = await _pb_fetch_out_pdf(job)
+    count = await run_in_threadpool(_pdf_page_count, data)
+    return {"job_id": job_id, "title": job.get("title"),
+            "pages": min(count, _THUMB_MAX_PAGES), "status": job.get("status")}
+
+
+@app.get("/coach/playbook/jobs/{job_id}/page/{page_no}")
+async def coach_pb_job_page(job_id: str, page_no: int, _u: dict = Depends(_require_coach)):
+    """One page as a JPEG thumbnail."""
+    job = await _pb_review_job(job_id, _u)
+    data = await _pb_fetch_out_pdf(job)
+    img = await run_in_threadpool(_pdf_thumb, data, page_no)
+    from fastapi.responses import Response as _Resp
+    return _Resp(content=img, media_type="image/jpeg",
+                 headers={"Cache-Control": "private, max-age=600"})
+
+
+@app.post("/coach/playbook/jobs/{job_id}/publish")
+async def coach_pb_job_publish(job_id: str, payload: dict = Body(...),
+                               _u: dict = Depends(_require_coach)):
+    """
+    Publish the chosen pages. Unselected pages are DISCARDED.
+
+    The trimmed file is stored under a NEW key rather than overwriting the
+    converted one, so a publish can never destroy the source it was made from.
+    """
+    import uuid as _uuid
+    job = await _pb_review_job(job_id, _u)
+    keep = payload.get("pages")
+    if not isinstance(keep, list) or not keep:
+        raise HTTPException(status_code=400, detail="Choose at least one page.")
+    try:
+        keep = [int(n) for n in keep]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Page numbers must be whole numbers.")
+
+    data = await _pb_fetch_out_pdf(job)
+    number = bool(job.get("number_after", True))
+    trimmed, pages = await run_in_threadpool(_pdf_select_pages, data, keep, number)
+
+    out_key = f"{job['team_id']}/pdfs/{_uuid.uuid4().hex}.pdf"
+    async with httpx.AsyncClient(timeout=180) as c:
+        put = await c.put(_r2_presign("PUT", out_key, expires=900), content=trimmed,
+                          headers={"Content-Type": "application/pdf"})
+    if put.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=502, detail="Could not store the finished file.")
+
+    doc = {"team_id": job["team_id"],
+           "folder_path": job.get("folder_path") or "",
+           "title": job.get("title") or "",
+           "r2_key": out_key, "pages": pages,
+           "size_bytes": len(trimmed), "sort_order": 0}
+    async with httpx.AsyncClient() as c:
+        d = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}", json=doc,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if d.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=d.text)
+    doc_id = (d.json() or [{}])[0].get("id")
+    await _pb_job_patch(job_id, {"status": "done", "doc_id": doc_id,
+                                 "out_key": out_key, "pages": pages,
+                                 "size_bytes": len(trimmed), "error": None})
+    return {"ok": True, "doc_id": doc_id, "pages": pages}
+
+
 @app.post("/coach/playbook/jobs")
 async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
     """Queue a coach upload for the worker — PowerPoint/Visio (converted to PDF)
@@ -5330,7 +5500,13 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
         "raw_key":     (payload.get("key") or "").strip(),
         "ext":         ext,
         "uploader_email": _u["email"],   # scopes the claim to THIS coach's own paired worker
-        "number":      bool(payload.get("number", True)),
+        # ⚠ A review job must NOT be numbered by the converter. Pages are
+        # chosen afterwards, so numbering first would publish a document
+        # visibly numbered "3, 7, 9". The server stamps 1..N post-selection.
+        "number":      False if bool(payload.get("review")) else bool(payload.get("number", True)),
+        "review":      bool(payload.get("review")),
+        # Remembered so the server knows whether to stamp after selection.
+        "number_after": bool(payload.get("number", True)),
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
         "title":       (payload.get("title") or "").strip(),
         # A PDF is handled by the server immediately, so it must NOT be offered
