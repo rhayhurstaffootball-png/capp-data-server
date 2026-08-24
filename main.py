@@ -1,4 +1,8 @@
 from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body, WebSocket, WebSocketDisconnect, Request
+# smtplib is blocking. Sending a blast on the event loop would stall every
+# other request on the server for the length of the send - on game day that is
+# an outage, not a slow page.
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, RedirectResponse, Response, HTMLResponse
 from typing import Optional, Dict, List
 import os
@@ -2673,6 +2677,290 @@ async def admin_reset_single_seat(username: str, seat: int = Body(..., embed=Tru
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
     return {"ok": True}
+
+
+# ── Message blasts to schools ─────────────────────────────────────────────────
+#
+# Sends one message to every customer school. Email today - it reaches an
+# installed CAPP of ANY version, and needs nothing installed or updated. The
+# same rows also carry an in-app notice for a later client build, so there is
+# one system rather than two.
+#
+# ⚠ THE SAFETY STORY MATTERS MORE THAN THE FEATURE. This mails real customers,
+# and a mistake cannot be recalled. So:
+#   * /preview lists exactly who would receive it, BEFORE anything is sent
+#   * /test sends only to the address given, so the real thing is never the
+#     first time the message has been seen
+#   * a send records every recipient, so "did Nebraska get it?" is answerable
+#   * one send per row - a row that already has sent_at is refused
+
+BROADCAST_AUDIENCES = ("licensed", "licensed_trial", "all")
+
+
+async def _broadcast_recipients(audience: str) -> list:
+    """
+    Who a blast would go to. Also used by /preview, so what you review is
+    produced by the same code that does the sending - never a separate guess.
+    """
+    if audience not in BROADCAST_AUDIENCES:
+        raise HTTPException(status_code=400, detail=f"Unknown audience '{audience}'.")
+
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"select": "username,email,school,licensed,active,is_admin",
+                    "order": "username.asc"},
+            headers=_supabase_headers())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+
+    out = []
+    for u in r.json():
+        if not u.get("active"):
+            continue                     # never mail a disabled account
+        if not (u.get("email") or "").strip():
+            continue                     # nothing to send to
+        if audience == "licensed" and not u.get("licensed"):
+            continue
+        if audience == "licensed_trial" and u.get("is_admin"):
+            continue                     # internal/admin accounts are not customers
+        out.append({
+            "username": u.get("username"),
+            "email": (u.get("email") or "").strip(),
+            "school": u.get("school") or u.get("username"),
+            "licensed": bool(u.get("licensed")),
+        })
+    return out
+
+
+def _broadcast_email_html(school: str, subject: str, body: str) -> str:
+    """
+    Same visual language as the registration and reset emails, so a blast looks
+    like it came from CAPP rather than from a mailing tool.
+
+    The body is plain text from the compose box, escaped and turned into
+    paragraphs - never raw HTML. A stray angle bracket in a message must not be
+    able to break the email, and nothing typed in that box should be executable.
+    """
+    import html as _html
+    paras = "".join(
+        f'<p style="color:#c8d2e0;font-size:0.92rem;line-height:1.6;margin:0 0 14px;">{_html.escape(chunk).replace(chr(10), "<br/>")}</p>'
+        for chunk in body.split(chr(10) + chr(10)) if chunk.strip())
+
+    return f"""
+    <div style="font-family:'Segoe UI',Arial,sans-serif;background:#070a0f;color:#e8edf5;padding:40px 0;">
+      <div style="max-width:520px;margin:0 auto;background:#111825;border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:36px;">
+        <div style="text-align:center;margin-bottom:24px;">
+          <img src="https://cappvcs.com/capplogo.png" alt="CAPP" style="height:40px;" />
+        </div>
+        <h2 style="color:#e8edf5;font-size:1.2rem;font-weight:700;margin:0 0 18px;">{_html.escape(subject)}</h2>
+        {paras}
+        <p style="color:#6d7a8c;font-size:0.8rem;margin:26px 0 0;padding-top:16px;border-top:1px solid rgba(255,255,255,0.07);">
+          Sent to {_html.escape(school)} &middot; CAPP Video Coordinator Suite<br/>
+          Questions? Reply to this email or contact
+          <a href="mailto:roger@cappvcs.com" style="color:#3a7ebf;">roger@cappvcs.com</a>.
+        </p>
+      </div>
+    </div>
+    """
+
+
+def _send_broadcast_email(to_email: str, school: str, subject: str, body: str) -> None:
+    """One message. Raises on failure so the caller can count it."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host = os.environ.get("SMTP_HOST", "")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    from_addr = os.environ.get("FROM_EMAIL", smtp_user)
+    if not smtp_host or not smtp_user or not smtp_pass:
+        raise RuntimeError("SMTP is not configured on the server.")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = f"CAPP Video Coordinator Suite <{from_addr}>"
+    msg["To"] = to_email
+    # Sent individually rather than as one BCC blast: each school sees only its
+    # own address, and one bad address cannot take down the whole send.
+    msg.attach(MIMEText(_broadcast_email_html(school, subject, body), "html"))
+
+    with smtplib.SMTP(smtp_host, smtp_port) as srv:
+        srv.starttls()
+        srv.login(smtp_user, smtp_pass)
+        srv.sendmail(from_addr, [to_email], msg.as_string())
+
+
+@app.get("/admin/api/broadcast/preview", dependencies=[Depends(_require_admin)])
+async def broadcast_preview(audience: str = Query("licensed_trial")):
+    """Exactly who would receive this. Always look before sending."""
+    people = await _broadcast_recipients(audience)
+    return {"audience": audience, "count": len(people), "recipients": people}
+
+
+@app.get("/admin/api/broadcast", dependencies=[Depends(_require_admin)])
+async def broadcast_list():
+    """Recent blasts, newest first."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/capp_broadcasts",
+            params={"select": "id,subject,body,audience,send_email,show_in_app,"
+                              "active,sent_at,sent_count,failed_count,created_at",
+                    "order": "created_at.desc", "limit": "25"},
+            headers=_supabase_headers())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return r.json()
+
+
+@app.post("/admin/api/broadcast/test", dependencies=[Depends(_require_admin)])
+async def broadcast_test(payload: dict = Body(...)):
+    """
+    Send the message to ONE address, usually Roger's own.
+
+    Deliberately separate from a real send and it writes nothing: the real
+    blast should never be the first time a message has actually been seen.
+    """
+    to = str(payload.get("to", "")).strip()
+    subject = str(payload.get("subject", "")).strip()
+    body = str(payload.get("body", "")).strip()
+    if not to or "@" not in to:
+        raise HTTPException(status_code=400, detail="A test address is required.")
+    if not subject or not body:
+        raise HTTPException(status_code=400, detail="Subject and message are both required.")
+    try:
+        await run_in_threadpool(_send_broadcast_email, to, "Test", subject, body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not send: {exc}")
+    return {"ok": True, "sent_to": to}
+
+
+@app.post("/admin/api/broadcast/send", dependencies=[Depends(_require_admin)])
+async def broadcast_send(payload: dict = Body(...)):
+    """
+    Send a blast, and record exactly who it reached.
+
+    `confirm_count` must equal the number of recipients the preview reported.
+    That is not ceremony: it means a send cannot quietly go to a different set
+    of people than the one that was reviewed - if somebody's licence changed
+    between previewing and sending, this refuses rather than surprising you.
+    """
+    subject = str(payload.get("subject", "")).strip()
+    body = str(payload.get("body", "")).strip()
+    audience = str(payload.get("audience", "licensed_trial")).strip()
+    show_in_app = bool(payload.get("show_in_app"))
+    send_email = payload.get("send_email", True)
+    confirm_count = payload.get("confirm_count")
+
+    if not subject or not body:
+        raise HTTPException(status_code=400, detail="Subject and message are both required.")
+
+    people = await _broadcast_recipients(audience)
+    if confirm_count is not None and int(confirm_count) != len(people):
+        raise HTTPException(
+            status_code=409,
+            detail=(f"The recipient list changed since you previewed it "
+                    f"({confirm_count} then, {len(people)} now). Preview again."))
+    if send_email and not people:
+        raise HTTPException(status_code=400, detail="No one matches that audience.")
+
+    # In-app delivery goes through the notice system that already exists
+    # (capp_notices, read by /app/notice at launch). One message, one source of
+    # truth - the blast row records that it happened and points at it.
+    notice_id = None
+    if show_in_app:
+        notice_row = {
+            "title": subject, "body": body,
+            "severity": str(payload.get("severity", "info")).strip().lower() or "info",
+            "min_version": (str(payload.get("min_version", "")).strip() or None),
+            "active": True,
+        }
+        if notice_row["severity"] not in ("info", "warning", "critical"):
+            raise HTTPException(status_code=400,
+                                detail="Severity must be info, warning or critical.")
+        async with httpx.AsyncClient() as c:
+            nr = await c.post(f"{SUPABASE_URL}/rest/v1/{_NOTICES}", json=notice_row,
+                              headers={**_supa_headers_json(),
+                                       "Prefer": "return=representation"})
+        if nr.status_code not in (200, 201):
+            raise HTTPException(status_code=500,
+                                detail=f"Could not publish the in-app notice: {nr.text[:200]}")
+        notice_id = (nr.json() or [{}])[0].get("id")
+
+    sent, failed, delivered = 0, 0, []
+    if send_email:
+        for person in people:
+            try:
+                await run_in_threadpool(_send_broadcast_email, person["email"],
+                                        person["school"], subject, body)
+                sent += 1
+                delivered.append({"username": person["username"],
+                                  "email": person["email"], "ok": True})
+            except Exception as exc:
+                # Keep going. One bad address must not stop everyone else's
+                # message, and the failure is recorded rather than swallowed.
+                failed += 1
+                delivered.append({"username": person["username"],
+                                  "email": person["email"], "ok": False,
+                                  "error": str(exc)[:200]})
+
+    row = {
+        "subject": subject, "body": body, "audience": audience,
+        "send_email": bool(send_email), "show_in_app": show_in_app,
+        "active": True,
+        "sent_at": datetime.now(timezone.utc).isoformat() if send_email else None,
+        "sent_count": sent, "failed_count": failed,
+        "recipients": delivered,
+        "notice_id": notice_id,
+    }
+    async with httpx.AsyncClient() as c:
+        w = await c.post(f"{SUPABASE_URL}/rest/v1/capp_broadcasts",
+                         json=row,
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if w.status_code not in (200, 201):
+        # The mail is already gone; say so rather than implying nothing happened.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Sent to {sent} school(s), but the record could not be saved: {w.text[:200]}")
+
+    return {"ok": True, "sent": sent, "failed": failed,
+            "recipients": delivered, "id": (w.json() or [{}])[0].get("id")}
+
+
+@app.patch("/admin/api/broadcast/{bid}/retire", dependencies=[Depends(_require_admin)])
+async def broadcast_retire(bid: int):
+    """
+    Stop an in-app notice showing. Does NOT un-send any email - mail that has
+    left cannot be recalled, and pretending otherwise would be worse than
+    saying so.
+
+    Retires BOTH rows: the blast record and the capp_notices row it published.
+    Retiring only one is how you end up with a message that is "off" in one
+    place and still on screen in the other.
+    """
+    async with httpx.AsyncClient() as c:
+        cur = await c.get(f"{SUPABASE_URL}/rest/v1/capp_broadcasts",
+                          params={"id": f"eq.{bid}", "select": "notice_id"},
+                          headers=_supabase_headers())
+        notice_id = None
+        if cur.status_code == 200 and cur.json():
+            notice_id = (cur.json()[0] or {}).get("notice_id")
+
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/capp_broadcasts",
+                          params={"id": f"eq.{bid}"},
+                          json={"active": False},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=r.text)
+
+        if notice_id:
+            await c.patch(f"{SUPABASE_URL}/rest/v1/{_NOTICES}",
+                          params={"id": f"eq.{notice_id}"},
+                          json={"active": False},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    return {"ok": True, "notice_retired": bool(notice_id)}
 
 
 @app.patch("/admin/api/clients/{username}/seat-limit", dependencies=[Depends(_require_admin)])
@@ -5590,15 +5878,35 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <textarea id="ntc-body" rows="4" placeholder="What you want every user to read." maxlength="1200"
                   style="width:100%;margin-top:12px;"></textarea>
         <div style="display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap;">
-          <input id="ntc-minver" placeholder="Mandatory below version (optional, e.g. 2.6.4)"
+          <input id="ntc-minver" placeholder="Mandatory below version (optional, e.g. 2.6.5)"
                  style="flex:1;min-width:260px;" />
-          <button class="btn btn-primary" onclick="publishNotice()">Publish</button>
+          <button class="btn btn-primary" onclick="publishNotice()">Publish in app</button>
         </div>
         <p class="small" style="margin-top:8px;">
           Leave the version blank for an informational message. Fill it in and clients older
           than that version are told the update is required.
         </p>
         <div id="ntc-msg" class="small" style="margin-top:10px;"></div>
+
+        <div style="margin-top:22px;padding-top:18px;border-top:1px solid var(--border,#2c3b55);">
+          <h3 style="margin:0 0 4px;font-size:1rem;">Email the same message</h3>
+          <p class="small" style="margin-bottom:12px;">
+            Reaches schools whether or not CAPP is open, and works with every installed
+            version. Uses the title and message above.
+          </p>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <select id="bc-audience" onchange="previewBlast()" style="min-width:210px;">
+              <option value="licensed_trial">Licensed + trial schools</option>
+              <option value="licensed">Licensed schools only</option>
+              <option value="all">Every active account</option>
+            </select>
+            <button class="btn" onclick="previewBlast()">Who gets this?</button>
+            <button class="btn" onclick="testBlast()">Send test to me</button>
+            <button class="btn btn-warning" onclick="sendBlast()">Send email now</button>
+          </div>
+          <div id="bc-preview" class="small" style="margin-top:12px;"></div>
+          <div id="bc-msg" class="small" style="margin-top:8px;"></div>
+        </div>
       </div>
       <div class="card" style="margin-top:18px;">
         <h2>Sent
@@ -6017,6 +6325,76 @@ function loadNotices() {
 }
 
 function escN(s) { return String(s == null ? "" : s).replace(/</g, "&lt;"); }
+
+// Email blasts. Deliberately three separate actions: see who gets it, send
+// yourself a copy, then send for real. Mail cannot be recalled, so the real
+// send should never be the first time the message has been looked at.
+let _bcPreviewCount = null;
+
+function previewBlast() {
+  const aud = document.getElementById("bc-audience").value;
+  const box = document.getElementById("bc-preview");
+  _bcPreviewCount = null;
+  box.innerHTML = "Checking...";
+  api("GET", "/broadcast/preview?audience=" + encodeURIComponent(aud))
+    .then(d => {
+      _bcPreviewCount = d.count;
+      if (!d.count) { box.innerHTML = '<b>No one matches that audience.</b>'; return; }
+      const names = d.recipients.map(r =>
+        pbEsc(r.school) + ' &lt;' + pbEsc(r.email) + '&gt;' + (r.licensed ? '' : ' <i>(trial)</i>')
+      ).join("<br/>");
+      box.innerHTML = '<b>' + d.count + ' recipient' + (d.count === 1 ? '' : 's') +
+                      ':</b><br/>' + names;
+    })
+    .catch(e => { box.innerHTML = "Could not load recipients: " + e; });
+}
+
+function testBlast() {
+  const title = document.getElementById("ntc-title").value.trim();
+  const body  = document.getElementById("ntc-body").value.trim();
+  const msg   = document.getElementById("bc-msg");
+  if (!title || !body) { msg.textContent = "Fill in the title and message first."; return; }
+  const to = prompt("Send a test copy to which address?", "roger@cappvcs.com");
+  if (!to) return;
+  msg.textContent = "Sending test...";
+  api("POST", "/broadcast/test", { to: to, subject: title, body: body })
+    .then(d => { msg.innerHTML = "<b>Test sent to " + pbEsc(d.sent_to) + ".</b> Check it before sending for real."; })
+    .catch(e => { msg.textContent = "Test failed: " + e; });
+}
+
+function sendBlast() {
+  const title = document.getElementById("ntc-title").value.trim();
+  const body  = document.getElementById("ntc-body").value.trim();
+  const aud   = document.getElementById("bc-audience").value;
+  const msg   = document.getElementById("bc-msg");
+  if (!title || !body) { msg.textContent = "Fill in the title and message first."; return; }
+  if (_bcPreviewCount === null) {
+    msg.textContent = 'Press "Who gets this?" first, so you can see the list before it goes.';
+    return;
+  }
+  // Single quotes and no escapes: this JS lives inside a Python string, so an
+  // escaped double quote silently loses a level and breaks the whole script.
+  if (!confirm('Email: ' + title + ' -- send to ' + _bcPreviewCount +
+               ' school(s)? This cannot be undone.')) return;
+  msg.textContent = "Sending to " + _bcPreviewCount + " school(s)...";
+  // confirm_count makes the server refuse if the recipient list changed since
+  // the preview - so what goes out is always what was reviewed.
+  api("POST", "/broadcast/send", {
+      subject: title, body: body, audience: aud,
+      send_email: true, show_in_app: false,
+      confirm_count: _bcPreviewCount })
+    .then(d => {
+      let out = "<b>Sent to " + d.sent + " school(s).</b>";
+      if (d.failed) {
+        const bad = (d.recipients || []).filter(r => !r.ok)
+          .map(r => pbEsc(r.username)).join(", ");
+        out += ' <span style="color:#f08a7e;">' + d.failed + " failed: " + bad + "</span>";
+      }
+      msg.innerHTML = out;
+      loadNotices();
+    })
+    .catch(e => { msg.textContent = "Send failed: " + e; });
+}
 
 function publishNotice() {
   const title = document.getElementById("ntc-title").value.trim();
