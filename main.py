@@ -6074,6 +6074,19 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <div class="result" id="pbc-folder-result"></div>
       </div>
       <div class="card">
+        <h2>Coach converters
+          <button class="btn btn-primary" onclick="loadPbDevices()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
+        </h2>
+        <p class="small" style="margin-bottom:10px;">
+          Each coach's own PC does their conversions, and a job is only ever offered to
+          <strong>that coach's</strong> paired machine. So a converter that is offline or on an old
+          build means that coach's uploads sit in <em>queued</em> forever — check here first.
+          <strong>Unpair</strong> clears the pairing so their next sign-in installs a fresh copy.
+        </p>
+        <div id="pbdevices-table"><div class="loading">Loading...</div></div>
+      </div>
+
+      <div class="card">
         <h2>Conversion jobs
           <button class="btn btn-primary" onclick="loadPbJobs()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
         </h2>
@@ -6370,7 +6383,7 @@ function showTab(id, btn) {
   if (id === "crm-tab") { loadProspects(); loadSalesDocs(); }
   if (id === "gameday-tab") { loadGameDayStatus(); startGameDayRefresh(); }
   if (id === "playbook-tab") loadPlaybookUsers();
-  if (id === "pbcontent-tab") { loadPbDocs(); loadPbJobs(); loadPbFolders(); loadPbAccessLog(); }
+  if (id === "pbcontent-tab") { loadPbDevices(); loadPbDocs(); loadPbJobs(); loadPbFolders(); loadPbAccessLog(); }
   if (id === "teams-tab") { loadBinderTeams(); loadTeamLogoCatalog(); }
   if (id === "notices-tab") loadNotices();
   closeSlideout();
@@ -7517,6 +7530,53 @@ function uploadPbFolder(){
 }
 
 // ── Conversion jobs ───────────────────────────────────────────────────────────
+function loadPbDevices(){
+  var box=document.getElementById("pbdevices-table");
+  api("GET","/playbook/devices").then(function(data){
+    if(!Array.isArray(data)){ box.innerHTML='<div class="loading">Error loading converters.</div>'; return; }
+    if(!data.length){ box.innerHTML='<div class="loading">No converters paired yet.</div>'; return; }
+    var rows=data.map(function(d){
+      var mins=d.minutes_since_seen;
+      var seen, seenColor;
+      if(mins===null||mins===undefined){ seen="never"; seenColor="#d14343"; }
+      else if(mins<5){ seen="just now"; seenColor="#2f9d55"; }
+      else if(mins<60){ seen=Math.round(mins)+" min ago"; seenColor="#d19a2f"; }
+      else if(mins<1440){ seen=(mins/60).toFixed(1)+" hours ago"; seenColor="#d14343"; }
+      else { seen=(mins/1440).toFixed(1)+" DAYS ago"; seenColor="#d14343"; }
+      var state=d.online
+        ? '<span style="color:#2f9d55;font-weight:600">Online</span>'
+        : '<span style="color:#d14343;font-weight:600">Offline</span>';
+      // No reported version means a build older than Aug 9 2026 - those predate
+      // self-update, so they stay stale forever until someone reinstalls.
+      var ver=d.converter_version
+        ? pbEsc(d.converter_version)
+        : '<span style="color:#d14343" title="Pre-Aug-2026 build: cannot update itself. Unpair and have them set up again.">none — too old to self-update</span>';
+      return "<tr>"+
+        "<td>"+pbEsc(d.email||"")+"</td>"+
+        "<td>"+pbEsc(d.device_name||"")+"</td>"+
+        "<td>"+ver+"</td>"+
+        "<td>"+state+"</td>"+
+        '<td style="color:'+seenColor+'">'+seen+"</td>"+
+        '<td><button class="btn btn-danger btn-sm" onclick="unpairPbDevice(\\''+
+          pbEsc(d.email||"")+'\\')">Unpair</button></td>'+
+      "</tr>";
+    }).join("");
+    box.innerHTML='<table><thead><tr><th>Coach</th><th>Machine</th><th>Converter</th>'+
+      '<th>State</th><th>Last check-in</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
+  }).catch(function(){ box.innerHTML='<div class="loading">Error.</div>'; });
+}
+
+function unpairPbDevice(email){
+  if(!email) return;
+  if(!confirm("Unpair the converter for "+email+"?"+String.fromCharCode(10)+String.fromCharCode(10)+
+              "This only clears the pairing on the server - it cannot touch their PC. "+
+              "Next time they sign in to the Binder they will be asked to set it up again, "+
+              "which installs the current build.")) return;
+  api("DELETE","/playbook/devices?email="+encodeURIComponent(email))
+    .then(function(){ loadPbDevices(); })
+    .catch(function(e){ alert("Could not unpair: "+e); });
+}
+
 function loadPbJobs(){
   var box=document.getElementById("pbjobs-table");
   api("GET","/playbook/jobs").then(function(data){
