@@ -5207,6 +5207,114 @@ async def coach_pb_delete_doc(doc_id: str, _u: dict = Depends(_require_coach)):
     return await admin_pb_delete_doc(doc_id)
 
 
+# ── Server-side PDF page numbering ────────────────────────────────────────────
+#
+# ⚠ WHY: a PDF was routed to the coach's OWN PC purely to have page numbers
+# stamped on it. Stamping needs no Office - PyMuPDF does it in pure Python - so
+# the one reason the local worker exists (Word/Excel/PowerPoint/Visio via COM)
+# does not apply to PDFs at all.
+#
+# The cost was severe and invisible: a 125 KB PDF took FIVE MINUTES, because
+# the upload finished instantly and the job then sat in `queued` waiting for a
+# converter that was switched off. Three of four coaches had dead converters,
+# so for them PDFs never appeared at all.
+#
+# BINDER LOCAL PLAN.txt always said this: "If the coach uploads a PDF, it goes
+# directly into CAPP Binder. No conversion or local worker is needed." The
+# page-numbering feature quietly broke that rule. This restores it.
+#
+# The stamp is identical to the local converter's (bottom-centre white pill), so
+# a PDF numbered here cannot be told apart from one numbered on a coach's PC.
+
+
+def _pdf_stamp_numbers(data: bytes) -> tuple:
+    """Stamp 1..N bottom-centre. Returns (new_bytes, page_count). Pure CPU."""
+    import fitz
+    book = fitz.open(stream=data, filetype="pdf")
+    try:
+        for i in range(book.page_count):
+            page = book[i]
+            label = str(i + 1)
+            r = page.rect
+            fs = 13
+            tw = fitz.get_text_length(label, fontname="helv", fontsize=fs)
+            cx = r.width / 2.0
+            baseline = r.height - 24
+            box = fitz.Rect(cx - tw / 2 - 6, baseline - fs - 1,
+                            cx + tw / 2 + 6, baseline + 4)
+            page.draw_rect(box, fill=(1, 1, 1), color=(0.7, 0.7, 0.7), width=0.4)
+            page.insert_text((cx - tw / 2, baseline), label,
+                             fontname="helv", fontsize=fs, color=(0, 0, 0))
+        return book.tobytes(deflate=True, garbage=3), book.page_count
+    finally:
+        book.close()
+
+
+def _pdf_page_count(data: bytes) -> int:
+    import fitz
+    book = fitz.open(stream=data, filetype="pdf")
+    try:
+        return book.page_count
+    finally:
+        book.close()
+
+
+async def _pb_pdf_inline(job_id: str, job: dict) -> None:
+    """
+    Do a PDF job here and now - no local worker involved.
+
+    Runs as a background task so the upload request returns immediately; the
+    coach page's existing job polling then shows it go done, exactly as it does
+    for a converted file.
+
+    Any failure marks the job `error` with a readable reason. Leaving a job
+    stuck with no explanation is the behaviour this whole change exists to
+    remove, so it must not be reintroduced by an unhandled exception here.
+    """
+    import uuid as _uuid
+    try:
+        raw_url = _r2_presign("GET", job["raw_key"], expires=900)
+        async with httpx.AsyncClient(timeout=180) as c:
+            g = await c.get(raw_url)
+        if g.status_code != 200:
+            raise RuntimeError(f"could not read the uploaded file ({g.status_code})")
+        data = g.content
+
+        # PyMuPDF is blocking and CPU-bound; on the event loop it would stall
+        # every other request for the length of a big playbook.
+        if job.get("number"):
+            data, pages = await run_in_threadpool(_pdf_stamp_numbers, data)
+        else:
+            pages = await run_in_threadpool(_pdf_page_count, data)
+
+        out_key = f"{job['team_id']}/pdfs/{_uuid.uuid4().hex}.pdf"
+        put_url = _r2_presign("PUT", out_key, expires=900)
+        async with httpx.AsyncClient(timeout=180) as c:
+            put = await c.put(put_url, content=data,
+                              headers={"Content-Type": "application/pdf"})
+        if put.status_code not in (200, 201, 204):
+            raise RuntimeError(f"could not store the finished file ({put.status_code})")
+
+        doc = {"team_id": job["team_id"],
+               "folder_path": job.get("folder_path") or "",
+               "title": job.get("title") or "",
+               "r2_key": out_key, "pages": pages,
+               "size_bytes": len(data), "sort_order": 0}
+        async with httpx.AsyncClient() as c:
+            d = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}", json=doc,
+                             headers={**_supa_headers_json(),
+                                      "Prefer": "return=representation"})
+        if d.status_code not in (200, 201):
+            raise RuntimeError(f"could not register the document ({d.text[:120]})")
+        doc_id = (d.json() or [{}])[0].get("id")
+        await _pb_job_patch(job_id, {"status": "done", "doc_id": doc_id,
+                                     "out_key": out_key, "pages": pages,
+                                     "size_bytes": len(data), "error": None,
+                                     "claimed_by": "server"})
+    except Exception as exc:
+        await _pb_job_patch(job_id, {"status": "error", "error": str(exc)[:400]})
+
+
 @app.post("/coach/playbook/jobs")
 async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
     """Queue a coach upload for the worker — PowerPoint/Visio (converted to PDF)
@@ -5225,7 +5333,11 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
         "number":      bool(payload.get("number", True)),
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
         "title":       (payload.get("title") or "").strip(),
-        "status":      "queued",
+        # A PDF is handled by the server immediately, so it must NOT be offered
+        # to a local worker: created straight into "converting" so the claim RPC
+        # (which only hands out `queued`) can never race it and have two things
+        # process the same file.
+        "status":      "converting" if ext == "pdf" else "queued",
     }
     if not row["title"] or not row["raw_key"]:
         raise HTTPException(status_code=400, detail="title and key are required.")
@@ -5234,7 +5346,24 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
                          headers={**_scoped_headers(_u["team_id"]), "Prefer": "return=representation"})
     if r.status_code not in (200, 201):
         raise HTTPException(status_code=500, detail=r.text)
-    return (r.json() or [{}])[0]
+    created = (r.json() or [{}])[0]
+
+    # A PDF needs no Office, so it never needs the coach's PC. Doing it here
+    # means the file is live in seconds instead of waiting on a converter that
+    # may be switched off - which is exactly what made a 125 KB PDF take five
+    # minutes, and what made PDFs never appear at all for the three coaches
+    # whose converters were dead.
+    if ext == "pdf":
+        job = dict(created)
+        job.setdefault("team_id", _u["team_id"])
+        job.setdefault("raw_key", row["raw_key"])
+        job.setdefault("number", row["number"])
+        job.setdefault("folder_path", row["folder_path"])
+        job.setdefault("title", row["title"])
+        asyncio.create_task(_pb_pdf_inline(created.get("id"), job))
+        created["handled_by"] = "server"
+
+    return created
 
 
 @app.get("/coach/playbook/doc/{doc_id}/url")
