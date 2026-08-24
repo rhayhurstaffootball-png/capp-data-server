@@ -4295,6 +4295,73 @@ async def admin_pb_create_job(payload: dict = Body(...)):
     return (r.json() or [{}])[0]
 
 
+@app.get("/admin/api/playbook/devices", dependencies=[Depends(_require_admin)])
+async def admin_pb_devices():
+    """
+    Every converter paired to a coach: who, which machine, what build, last seen.
+
+    ⚠ THIS IS THE FIRST THING TO LOOK AT when "nothing is converting" for one
+    coach. Jobs are claimed SCOPED to the uploader's own paired worker, so a
+    coach whose machine is unpaired, stale, or paired under a different email
+    has jobs that sit in `queued` forever with claimed_by null - and nothing
+    anywhere else in the panel explains why.
+
+    Until now there was no way to see this table without going into Supabase by
+    hand, which is why the same problem got diagnosed by guesswork more than once.
+    """
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                        params={"select": "*", "order": "last_seen_at.desc.nullslast"},
+                        headers=_supa_headers_json())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    rows = r.json() or []
+    now = datetime.now(timezone.utc)
+    out = []
+    for d in rows:
+        seen = d.get("last_seen_at")
+        mins = None
+        if seen:
+            try:
+                dt = _dtmod.datetime.fromisoformat(str(seen).replace("Z", "+00:00"))
+                mins = round((now - dt).total_seconds() / 60, 1)
+            except Exception:
+                mins = None
+        out.append({
+            "email": d.get("email"),
+            "device_name": d.get("device_name"),
+            "converter_version": d.get("converter_version") or None,
+            "paired_at": d.get("paired_at"),
+            "last_seen_at": seen,
+            "minutes_since_seen": mins,
+            # The converter polls every 5s, so anything past ~5 minutes is not
+            # running - not merely idle.
+            "online": (mins is not None and mins < 5),
+        })
+    return out
+
+
+@app.delete("/admin/api/playbook/devices", dependencies=[Depends(_require_admin)])
+async def admin_pb_unpair(email: str = Query(...), device_name: str = Query("")):
+    """
+    Unpair a converter so the coach's next setup pairs cleanly.
+
+    Deliberately does NOT touch that machine - it cannot. It clears the server's
+    record, so "Complete Setup" fires again and the coach gets a fresh install
+    and a fresh pairing.
+    """
+    params = {"email": f"eq.{email}"}
+    if device_name:
+        params["device_name"] = f"eq.{device_name}"
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
+                           params=params,
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True, "email": email, "device_name": device_name or "(all)"}
+
+
 @app.get("/admin/api/playbook/jobs", dependencies=[Depends(_require_admin)])
 async def admin_pb_list_jobs(team: str = "airforce"):
     t = await _team_get(slug=team)
@@ -4302,8 +4369,11 @@ async def admin_pb_list_jobs(team: str = "airforce"):
         raise HTTPException(status_code=400, detail="Unknown team.")
     async with httpx.AsyncClient() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
+                        # uploader_email is what ties a stuck job to a coach.
+                        # Without it the panel shows three jobs sitting in
+                        # "queued" and no way to tell whose converter is missing.
                         params={"select": "id,folder_path,title,ext,status,error,"
-                                          "claimed_by,claimed_at,created_at",
+                                          "claimed_by,claimed_at,created_at,uploader_email",
                                 "team_id": f"eq.{t['id']}",
                                 "order": "created_at.desc"},
                         headers=_supa_headers_json())
