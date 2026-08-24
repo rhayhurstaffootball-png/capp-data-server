@@ -852,7 +852,8 @@ async def auth_login(
     url = f"{SUPABASE_URL}/rest/v1/capp_clients"
     params = {
         "username": f"eq.{username}",
-        "select": "client_id,password_hash,salt,api_key,active,is_admin,seat_1_machine,seat_2_machine"
+        "select": "client_id,password_hash,salt,api_key,active,is_admin,"
+                  "seat_1_machine,seat_2_machine,seat_3_machine,seat_limit"
     }
     async with httpx.AsyncClient() as client:
         r = await client.get(url, params=params, headers=_supabase_headers())
@@ -866,22 +867,48 @@ async def auth_login(
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     # --- Machine binding (skipped for admin accounts) ---
+    #
+    # `seat` is a HINT, not an instruction. The client loops seat_1 then seat_2
+    # and accepts whichever returns 200, so the server is free to decide which
+    # seat a machine actually lands on. That is what lets a school have three
+    # seats WITHOUT any client change: an installed 2.6.x asking for "seat_1"
+    # on a third computer is simply bound to seat 3 and never knows.
+    #
+    # Machine binding is fully intact - the NUMBER of seats is what varies now,
+    # not whether binding applies. (is_admin still skips binding entirely; that
+    # is a different thing and deliberately untouched.)
     if not user.get("is_admin"):
-        seat_col = "seat_1_machine" if seat == "seat_1" else "seat_2_machine"
-        bound_machine = user.get(seat_col)
-        if bound_machine is None:
-            # First activation on this seat — bind this machine
+        limit = user.get("seat_limit") or 2
+        limit = max(1, min(3, int(limit)))
+        seats = [user.get(f"seat_{n}_machine") for n in range(1, limit + 1)]
+
+        if machine_id in seats:
+            pass                        # already bound here - re-activation is a no-op
+        elif None in seats:
+            # Bind the lowest free seat. The is.null filter on the PATCH makes
+            # this safe if two machines activate at the same moment: the second
+            # write matches no row and is reported as a conflict, instead of
+            # silently overwriting the first machine's binding.
+            n = seats.index(None) + 1
+            col = f"seat_{n}_machine"
             async with httpx.AsyncClient() as client:
-                await client.patch(
+                w = await client.patch(
                     f"{SUPABASE_URL}/rest/v1/capp_clients",
-                    params={"username": f"eq.{username}"},
-                    json={seat_col: machine_id},
-                    headers={**_supabase_headers(), "Prefer": "return=minimal"},
+                    params={"username": f"eq.{username}", col: "is.null"},
+                    json={col: machine_id},
+                    headers={**_supabase_headers(), "Prefer": "return=representation"},
                 )
-        elif bound_machine != machine_id:
+            if w.status_code not in (200, 204) or (
+                    w.status_code == 200 and not w.json()):
+                raise HTTPException(
+                    status_code=409,
+                    detail="That seat was just taken by another computer. Try again.",
+                )
+        else:
             raise HTTPException(
                 status_code=403,
-                detail="This seat is already activated on a different machine. Contact your administrator."
+                detail=(f"All {limit} seats are already activated on other machines. "
+                        f"Release one at cappvcs.com/seats, then activate again."),
             )
 
     return {"client_id": user["client_id"], "api_key": user["api_key"]}
@@ -2384,7 +2411,7 @@ async def admin_list_clients():
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"select": "username,client_id,email,active,licensed,is_admin,seat_1_machine,seat_2_machine,notes,next_invoice_date,created_at,trial_extension_days",
+            params={"select": "username,client_id,email,active,licensed,is_admin,seat_1_machine,seat_2_machine,seat_3_machine,seat_limit,notes,next_invoice_date,created_at,trial_extension_days",
                     "order": "username.asc"},
             headers=_supa_headers_json(),
         )
@@ -2544,9 +2571,10 @@ async def _seat_client(username: str, password: str) -> dict:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
             params={"username": f"eq.{username}",
-                    "select": "username,client_id,active,password_hash,salt,"
-                              "seat_1_machine,seat_2_machine,"
-                              "seat_1_released_at,seat_2_released_at"},
+                    "select": "username,client_id,active,password_hash,salt,seat_limit,"
+                              "seat_1_machine,seat_2_machine,seat_3_machine,"
+                              "seat_1_released_at,seat_2_released_at,"
+                              "seat_3_released_at"},
             headers=_supabase_headers())
     if r.status_code != 200 or not r.json():
         raise HTTPException(status_code=401, detail="Invalid username or password.")
@@ -2584,10 +2612,12 @@ def _seat_view(u: dict, n: int) -> dict:
 @app.post("/seats/status")
 async def seats_status(username: str = Body(..., embed=True),
                        password: str = Body(..., embed=True)):
-    """Show this account's two seats. Does NOT bind a machine."""
+    """Show this account's seats. Does NOT bind a machine."""
     u = await _seat_client(username, password)
+    limit = max(1, min(3, int(u.get("seat_limit") or 2)))
     return {"username": u["username"],
-            "seats": [_seat_view(u, 1), _seat_view(u, 2)]}
+            "seat_limit": limit,
+            "seats": [_seat_view(u, n) for n in range(1, limit + 1)]}
 
 
 @app.post("/seats/release")
@@ -2600,9 +2630,12 @@ async def seats_release(username: str = Body(..., embed=True),
     a way to rotate a single licence around a whole staff — the exact sharing
     the machine binding exists to prevent.
     """
-    if seat not in (1, 2):
-        raise HTTPException(status_code=400, detail="Seat must be 1 or 2.")
+    if seat not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Seat must be 1, 2 or 3.")
     u = await _seat_client(username, password)
+    if seat > int(u.get("seat_limit") or 2):
+        raise HTTPException(status_code=400,
+                            detail=f"This account does not have a seat {seat}.")
     view = _seat_view(u, seat)
     if not view["bound"]:
         raise HTTPException(status_code=400, detail=f"Seat {seat} is already open.")
@@ -2626,8 +2659,10 @@ async def seats_release(username: str = Body(..., embed=True),
 
 @app.patch("/admin/api/clients/{username}/reset-seat", dependencies=[Depends(_require_admin)])
 async def admin_reset_single_seat(username: str, seat: int = Body(..., embed=True)):
-    """Reset a single seat (1 or 2)."""
-    col = "seat_1_machine" if seat == 1 else "seat_2_machine"
+    """Reset a single seat (1, 2 or 3)."""
+    if seat not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Seat must be 1, 2 or 3.")
+    col = f"seat_{seat}_machine"
     async with httpx.AsyncClient() as c:
         r = await c.patch(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
@@ -2640,13 +2675,38 @@ async def admin_reset_single_seat(username: str, seat: int = Body(..., embed=Tru
     return {"ok": True}
 
 
+@app.patch("/admin/api/clients/{username}/seat-limit", dependencies=[Depends(_require_admin)])
+async def admin_set_seat_limit(username: str, seat_limit: int = Body(..., embed=True)):
+    """
+    Change how many seats a school gets (1-3).
+
+    Lowering the limit deliberately does NOT unbind anything. A machine already
+    on seat 3 keeps working until someone releases it on purpose - quietly
+    cutting a coach off mid-season because a number changed would be the worst
+    possible behaviour here.
+    """
+    if seat_limit not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Seat limit must be 1, 2 or 3.")
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/capp_clients",
+            params={"username": f"eq.{username}"},
+            json={"seat_limit": seat_limit},
+            headers={**_supa_headers_json(), "Prefer": "return=minimal"},
+        )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True, "username": username, "seat_limit": seat_limit}
+
+
 @app.patch("/admin/api/clients/{username}/reset-seats", dependencies=[Depends(_require_admin)])
 async def admin_reset_seats(username: str):
     async with httpx.AsyncClient() as c:
         r = await c.patch(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
             params={"username": f"eq.{username}"},
-            json={"seat_1_machine": None, "seat_2_machine": None},
+            json={"seat_1_machine": None, "seat_2_machine": None,
+                  "seat_3_machine": None},
             headers={**_supa_headers_json(), "Prefer": "return=minimal"},
         )
     if r.status_code not in (200, 204):
@@ -5778,6 +5838,29 @@ _ADMIN_HTML = """<!DOCTYPE html>
           <button class="btn btn-warning btn-sm" onclick="resetSeat(2)">Reset</button>
         </div>
       </div>
+      <div class="so-field" id="so-seat3-row" style="display:none;">
+        <label>Seat 3</label>
+        <div class="seat-row">
+          <div class="so-val muted" id="so-seat3">—</div>
+          <button class="btn btn-warning btn-sm" onclick="resetSeat(3)">Reset</button>
+        </div>
+      </div>
+      <div class="so-field">
+        <label>Seats allowed</label>
+        <div class="seat-row">
+          <select id="so-seat-limit" class="btn btn-sm" style="min-width:70px;">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="setSeatLimit()">Save</button>
+        </div>
+        <div class="muted" style="font-size:11px;margin-top:4px;">
+          Machines stay bound to their computer. This only changes how many
+          computers the school may activate on. Lowering it never disconnects
+          a machine that is already bound.
+        </div>
+      </div>
     </div>
 
     <div class="so-section">
@@ -6148,6 +6231,9 @@ function loadClients() {
       const admin  = c.is_admin ? ' <span class="badge badge-blue">Admin</span>' : '';
       const s1     = c.seat_1_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
       const s2     = c.seat_2_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
+      const s3     = (c.seat_limit || 2) >= 3
+        ? (c.seat_3_machine ? ' <span class="badge badge-gray">Bound</span>' : ' <span class="badge badge-green">Open</span>')
+        : '';
       const inv    = c.next_invoice_date ? c.next_invoice_date : '<span style="color:#8b95a1">—</span>';
       let licBadge;
       if (c.licensed) {
@@ -6199,6 +6285,13 @@ function openSlideout(username) {
 
   document.getElementById("so-seat1").textContent = c.seat_1_machine
     ? c.seat_1_machine.substring(0, 24) + "…" : "Open";
+  const _lim = c.seat_limit || 2;
+  document.getElementById("so-seat-limit").value = String(_lim);
+  // Seat 3 is only shown when the school actually has one, so the panel does
+  // not imply a seat that cannot be used.
+  document.getElementById("so-seat3-row").style.display = _lim >= 3 ? "" : "none";
+  document.getElementById("so-seat3").textContent = c.seat_3_machine
+    ? c.seat_3_machine.substring(0, 24) + "…" : "Open";
   document.getElementById("so-seat2").textContent = c.seat_2_machine
     ? c.seat_2_machine.substring(0, 24) + "…" : "Open";
 
@@ -6465,6 +6558,16 @@ function deleteProspect() {
     closeSlideout();
     loadProspects();
   });
+}
+
+function setSeatLimit() {
+  if (!_currentUser) return;
+  const n = parseInt(document.getElementById("so-seat-limit").value, 10);
+  api("PATCH", "/clients/" + _currentUser.username + "/seat-limit", { seat_limit: n })
+    .then(d => {
+      if (d.ok) { loadClients(); closeSlideout(); }
+      else alert("Error: " + JSON.stringify(d));
+    });
 }
 
 function resetSeat(seat) {
