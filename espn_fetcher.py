@@ -4,6 +4,7 @@ Ports the complete mapping logic from CAPP's espn_live.py so the server
 returns fully CAPP-ready play entries to clients.
 """
 
+import re
 import requests
 import threading
 import time
@@ -346,6 +347,54 @@ def espn_name_to_capp_name(espn_display_name, league="cfb"):
 # ============================================================
 # Clock Utilities
 # ============================================================
+
+# NFL play text uses GAMEBOOK abbreviations, which differ from the abbreviation
+# in ESPN's own team data for six teams. Attributing a timeout by looking for
+# the team abbreviation in the play text therefore matched nothing for them, and
+# both timeout flags stayed "No" - no red scoreboard background and no
+# timeouts-remaining decrement. Confirmed still live on 401874101 (Dallas at
+# Arizona, Aug 22 2026): "Timeout #2 by ARZ" dropped while "Timeout #1 by DAL"
+# registered.
+#
+# College is unaffected - its play text uses a different format entirely.
+GAMEBOOK_ABBREV_ALIASES = {
+    "ARI": ["arz"],     # Arizona Cardinals
+    "BAL": ["blt"],     # Baltimore Ravens
+    "CLE": ["clv"],     # Cleveland Browns
+    "HOU": ["hst"],     # Houston Texans
+    "LAR": ["la"],      # Los Angeles Rams
+    "WSH": ["was"],     # Washington Commanders
+}
+
+
+def _timeout_abbrevs(team_abbrev):
+    """
+    Every abbreviation a team's timeout might be written under, lowercased.
+    The real abbreviation comes first so an alias can never beat a genuine match.
+    """
+    if not team_abbrev:
+        return []
+    real = team_abbrev.strip()
+    out = [real.lower()]
+    out.extend(GAMEBOOK_ABBREV_ALIASES.get(real.upper(), []))
+    return out
+
+
+def _abbrev_in_text(abbrevs, desc_lower):
+    """
+    Match an abbreviation as a WHOLE WORD, never as a substring.
+
+    ⚠ This is not a refinement, it is required for correctness. The Rams alias
+    is "LA", and a plain substring test matches it inside "LAC" - so a Chargers
+    timeout in a Rams home game would be credited to the Rams. It also matches
+    inside ordinary words ("Atlanta", "delay"). Word boundaries remove the whole
+    class of false positive, for the real abbreviations as well as the aliases.
+    """
+    for a in abbrevs:
+        if a and re.search(r"\b" + re.escape(a) + r"\b", desc_lower):
+            return True
+    return False
+
 
 def _clock_to_seconds(clock_str):
     try:
@@ -1024,9 +1073,11 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
     home_time_out = away_time_out = "No"
     if is_timeout:
         desc_lower = description.lower()
-        if home_team_abbrev and home_team_abbrev.lower() in desc_lower:
+        home_abbrevs = _timeout_abbrevs(home_team_abbrev)
+        away_abbrevs = _timeout_abbrevs(away_team_abbrev)
+        if _abbrev_in_text(home_abbrevs, desc_lower):
             home_time_out = "Yes"
-        elif away_team_abbrev and away_team_abbrev.lower() in desc_lower:
+        elif _abbrev_in_text(away_abbrevs, desc_lower):
             away_time_out = "Yes"
         elif home_team_display and home_team_display.lower() in desc_lower:
             home_time_out = "Yes"
