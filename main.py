@@ -2598,7 +2598,7 @@ def _seat_view(u: dict, n: int) -> dict:
     if rel:
         try:
             last = _dtmod.datetime.fromisoformat(str(rel).replace("Z", "+00:00"))
-            age = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+            age = (_dtmod.datetime.now(_dtmod.timezone.utc) - last).total_seconds() / 3600
             wait = max(0, SEAT_RELEASE_COOLDOWN_HOURS - age)
         except Exception:
             wait = 0
@@ -2653,7 +2653,7 @@ async def seats_release(username: str = Body(..., embed=True),
             f"{SUPABASE_URL}/rest/v1/capp_clients",
             params={"username": f"eq.{username}"},
             json={f"seat_{seat}_machine": None,
-                  f"seat_{seat}_released_at": datetime.now(timezone.utc).isoformat()},
+                  f"seat_{seat}_released_at": _dtmod.datetime.now(_dtmod.timezone.utc).isoformat()},
             headers={**_supa_headers_json(), "Prefer": "return=minimal"})
     if r.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail=r.text)
@@ -2910,7 +2910,7 @@ async def broadcast_send(payload: dict = Body(...)):
         "subject": subject, "body": body, "audience": audience,
         "send_email": bool(send_email), "show_in_app": show_in_app,
         "active": True,
-        "sent_at": datetime.now(timezone.utc).isoformat() if send_email else None,
+        "sent_at": _dtmod.datetime.now(_dtmod.timezone.utc).isoformat() if send_email else None,
         "sent_count": sent, "failed_count": failed,
         "recipients": delivered,
         "notice_id": notice_id,
@@ -4316,7 +4316,10 @@ async def admin_pb_devices():
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
     rows = r.json() or []
-    now = datetime.now(timezone.utc)
+    # _dtmod is the module-level import (line ~3584). Bare `datetime` is only
+    # imported INSIDE other functions here, so it is not in scope at module
+    # level - assuming it was cost a 500 on this route.
+    now = _dtmod.datetime.now(_dtmod.timezone.utc)
     out = []
     for d in rows:
         seen = d.get("last_seen_at")
