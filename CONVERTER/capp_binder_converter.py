@@ -350,7 +350,12 @@ def _load_device_token() -> str:
         return ""
 
 
-def _register_with_token(tok: str) -> None:
+def _register_with_token(tok: str, fatal: bool = True) -> bool:
+    """Exchange a one-time pairing token for this device's permanent token.
+
+    `fatal=False` is used when we are RE-pairing a machine that already holds a
+    device_token.json: a failed re-pair must fall back to the existing
+    credential rather than kill a converter that was working."""
     try:
         req = urllib.request.Request(
             SERVER + "/converter/register",
@@ -364,9 +369,13 @@ def _register_with_token(tok: str) -> None:
         _DEVICE_TOKEN_PATH.write_text(json.dumps({"worker_token": device_token}), encoding="utf-8")
         log("Paired this computer to your CAPP Binder login â€” it will only ever "
             "convert YOUR OWN uploads.")
+        return True
     except Exception as e:
-        log(f"FATAL: pairing failed ({e}). Redo 'Complete Setup' from the Binder to try again.")
-        sys.exit(1)
+        if fatal:
+            log(f"FATAL: pairing failed ({e}). Redo 'Complete Setup' from the Binder to try again.")
+            sys.exit(1)
+        log(f"Re-pairing failed ({e}); keeping the device credential already on disk.")
+        return False
 
 
 def _register_with_pairing_token_file() -> None:
@@ -504,16 +513,36 @@ def _maybe_update(state: dict) -> None:
 
 def _worker_token() -> str:
     saved = _load_device_token()
-    if saved:
-        return saved
+    # A --pair-token is a DELIBERATE act: the coach just clicked "Setup
+    # Converter" in the Binder while signed in, which means "bind THIS computer
+    # to THAT account, now". So it has to OUTRANK any device_token.json already
+    # on disk.
+    #
+    # This used to check `saved` first and return early, which made re-pairing
+    # structurally impossible: once a machine had ever paired, every future
+    # setup silently reused the old credential and NEVER called
+    # /converter/register. If the server side of that pairing was gone (the
+    # device row unpaired from the admin panel, or replaced when another
+    # machine paired to the same coach), the worker was left holding a token
+    # the server rejects, polling into 401s forever -- while the Binder's setup
+    # screen waited for a device that could never appear. Re-downloading the
+    # installer could not fix it, because reinstalling is the very path that
+    # was short-circuited. Hit for real by a coach Aug 12-26 2026: 8 pairing
+    # tokens minted, every one left unredeemed.
     if "--pair-token" in sys.argv:
         i = sys.argv.index("--pair-token")
         tok = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
         if tok:
-            _register_with_token(tok)
-            saved = _load_device_token()
+            # Only fatal if there is no existing credential to fall back on --
+            # a failed re-pair must never take out a converter that was working.
+            if _register_with_token(tok, fatal=not saved):
+                fresh = _load_device_token()
+                if fresh:
+                    return fresh
             if saved:
                 return saved
+    if saved:
+        return saved
     if _PAIRING_TOKEN_PATH.exists():
         _register_with_pairing_token_file()
         saved = _load_device_token()
