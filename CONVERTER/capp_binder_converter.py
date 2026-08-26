@@ -41,7 +41,7 @@ APP_NAME = "CAPP Binder Converter"
 # this against GET /converter/version (the CONVERTER_VERSION env var on Render)
 # and silently updates itself when Render reports a higher one â€” so BOTH have to
 # move for a release to reach anybody: upload the new exe AND bump the env var.
-CONVERTER_VERSION = "1.2.5"
+CONVERTER_VERSION = "1.2.6"
 
 _FROZEN = bool(getattr(sys, "frozen", False))
 
