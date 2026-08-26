@@ -5355,14 +5355,42 @@ async def _pb_review_job(job_id: str, coach: dict) -> dict:
     return job
 
 
+# ⚠ ONE-ENTRY PDF CACHE FOR THE PAGE PICKER.
+#
+# Every thumbnail request used to download the ENTIRE converted PDF from R2 and
+# re-parse it, to render ONE page. Opening the picker on a 52-sheet Excel
+# workbook therefore pulled the same file 52 times (Roger, Aug 26 2026). Adding
+# a click-to-enlarge preview on top of that would have multiplied it again.
+#
+# Deliberately tiny, because unbounded caches are what OOM'd this service three
+# times in June 2026 (_plays_cache, _schedule_cache, REQUEST_PATH_COUNTS):
+#   - ONE entry. A picker session is one job at a time, so a second job simply
+#     replaces the first. No growth is possible.
+#   - Size-capped. A big Visio playbook PDF is not worth holding in RAM on a
+#     2 GB box, so anything over the cap is fetched fresh every time (i.e. the
+#     old behaviour) rather than cached.
+#   - Short TTL, so a re-converted file can never be served stale.
+_PB_PDF_CACHE = {}                          # out_key -> (fetched_at, bytes)
+_PB_PDF_CACHE_TTL = 300                     # seconds
+_PB_PDF_CACHE_MAX_BYTES = 25 * 1024 * 1024  # skip the cache above this
+
+
 async def _pb_fetch_out_pdf(job: dict) -> bytes:
-    if not job.get("out_key"):
+    key = job.get("out_key")
+    if not key:
         raise HTTPException(status_code=409, detail="That upload has not finished converting.")
+    hit = _PB_PDF_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _PB_PDF_CACHE_TTL:
+        return hit[1]
     async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.get(_r2_presign("GET", job["out_key"], expires=900))
+        r = await c.get(_r2_presign("GET", key, expires=900))
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail="Could not read the converted file.")
-    return r.content
+    data = r.content
+    if len(data) <= _PB_PDF_CACHE_MAX_BYTES:
+        _PB_PDF_CACHE.clear()               # ONE entry, always
+        _PB_PDF_CACHE[key] = (time.time(), data)
+    return data
 
 
 def _pdf_thumb(data: bytes, page_no: int, width: int = 240) -> bytes:
@@ -5428,11 +5456,28 @@ async def coach_pb_job_pages(job_id: str, _u: dict = Depends(_require_coach)):
 
 
 @app.get("/coach/playbook/jobs/{job_id}/page/{page_no}")
-async def coach_pb_job_page(job_id: str, page_no: int, _u: dict = Depends(_require_coach)):
-    """One page as a JPEG thumbnail."""
+async def coach_pb_job_page(job_id: str, page_no: int, w: int = 240,
+                            _u: dict = Depends(_require_coach)):
+    """One page as a JPEG.
+
+    `w` is the render width. The grid keeps the default 240; the click-to-
+    enlarge preview asks for a big one. Added because a 240px render of an
+    Excel sheet exported at 22x17in landscape gives each column about 17
+    pixels - unreadable at any tile size, so enlarging the TILE alone could
+    never have fixed it (Roger, Aug 26 2026).
+
+    Clamped, because this is a CPU render on a shared box and the width comes
+    from the client: a request for 20000px would be a free way to burn the
+    server. The ceiling is comfortably past what any screen needs.
+    """
+    try:
+        w = int(w)
+    except Exception:
+        w = 240
+    w = max(120, min(2000, w))
     job = await _pb_review_job(job_id, _u)
     data = await _pb_fetch_out_pdf(job)
-    img = await run_in_threadpool(_pdf_thumb, data, page_no)
+    img = await run_in_threadpool(_pdf_thumb, data, page_no, w)
     from fastapi.responses import Response as _Resp
     return _Resp(content=img, media_type="image/jpeg",
                  headers={"Cache-Control": "private, max-age=600"})
