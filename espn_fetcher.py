@@ -380,6 +380,24 @@ def _timeout_abbrevs(team_abbrev):
     return out
 
 
+def _fold_accents(s):
+    """
+    Accent-fold a string for comparison against play text.
+
+    ⚠ Required for correctness, not a nicety. CAPP's canonical team name is plain
+    ASCII ("San Jose State" — the whole layer stack was deliberately folded to
+    ASCII), but ESPN's PLAY TEXT still carries the accent ("Timeout San José
+    State"). The substring test therefore never matched and every San José State
+    timeout was silently dropped — 6 of 8 in SJSU @ USC, Aug 29 2026, while USC's
+    own matched only because its abbreviation happens to be "USC".
+
+    Folding both sides is generic: it fixes any future accented team and cannot
+    change the result for a team that already matched.
+    """
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "")
+                   if not unicodedata.combining(c))
+
+
 def _abbrev_in_text(abbrevs, desc_lower):
     """
     Match an abbreviation as a WHOLE WORD, never as a substring.
@@ -1073,15 +1091,17 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
     home_time_out = away_time_out = "No"
     if is_timeout:
         desc_lower = description.lower()
+        # Accent-folded copy: CAPP names are ASCII, ESPN play text is not.
+        desc_folded = _fold_accents(desc_lower)
         home_abbrevs = _timeout_abbrevs(home_team_abbrev)
         away_abbrevs = _timeout_abbrevs(away_team_abbrev)
         if _abbrev_in_text(home_abbrevs, desc_lower):
             home_time_out = "Yes"
         elif _abbrev_in_text(away_abbrevs, desc_lower):
             away_time_out = "Yes"
-        elif home_team_display and home_team_display.lower() in desc_lower:
+        elif home_team_display and _fold_accents(home_team_display.lower()) in desc_folded:
             home_time_out = "Yes"
-        elif away_team_display and away_team_display.lower() in desc_lower:
+        elif away_team_display and _fold_accents(away_team_display.lower()) in desc_folded:
             away_time_out = "Yes"
         elif "home" in desc_lower:
             home_time_out = "Yes"
