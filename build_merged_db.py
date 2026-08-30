@@ -20,7 +20,7 @@ import os
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CFBD_KEY     = "vbfhFBcMYIky2ixPSJqCVrmdBYe0Fr4y3ei4kVHypGf1FiQBvoCyGr8vMpduRKOI"
+CFBD_KEY     = "0nmEW1UEpBtWKTuvy7/p6+aOjne6V1IdAQSilX81n10qSEhxrnwE7V8bALRd9Zpg"
 CFBD_BASE    = "https://apinext.collegefootballdata.com"
 CFBD_HEADERS = {"Authorization": f"Bearer {CFBD_KEY}", "Accept": "application/json"}
 
