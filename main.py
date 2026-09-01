@@ -941,6 +941,148 @@ async def storage_save(
     return {"status": "saved", "path": path}
 
 
+# ── SB Designer layout sync ───────────────────────────────────────────────────
+#
+# Layouts are ~7 KB of JSON each and live on the coach's disk at
+# %USERPROFILE%\CAPP_Data\SB_LAYOUTS\<name>.json. These routes are the CLOUD
+# MIRROR of that folder so a coordinator's desk machine and laptop can hold the
+# same set, and so a dead laptop does not take a season of layouts with it.
+#
+# ⚠ THE CLOUD IS A MIRROR, NEVER THE AUTHORITY. There is deliberately no "sync"
+# route that reconciles the two sides: the client decides what to send and what
+# to take, and nothing here can reach into a machine and delete a local file.
+# This is the 2.6.7 SBENTRY lesson — a refresh during an upstream hiccup wiped a
+# coach's tree AND overwrote their saved JSON. A layout store that can only be
+# written to explicitly cannot repeat that.
+#
+# ⚠ client_id comes from Depends(get_client_id) — DERIVED FROM THE API KEY, never
+# accepted from the caller. (The older /storage/* routes above take it as a query
+# parameter, which lets any valid key read or write another customer's files.
+# Flagged separately; do NOT copy that shape here.)
+
+LAYOUT_PREFIX = "SB_LAYOUTS"
+_LAYOUT_NAME_OK = re.compile(r"^[A-Za-z0-9 _.\-()&']{1,80}$")
+
+
+def _safe_layout_name(name: str) -> str:
+    """Validate a layout name before it becomes part of a storage path.
+
+    ⚠ The name is user-typed in the SB Designer and lands in a URL path, so it is
+    checked against an allowlist rather than escaped — a name containing '/', '\'
+    or '..' could otherwise write outside the client's own prefix. Trailing '.json'
+    is stripped so 'HOF GAME' and 'HOF GAME.json' address the same object instead
+    of quietly becoming two.
+    """
+    name = (name or "").strip()
+    if name.lower().endswith(".json"):
+        name = name[:-5].strip()
+    if not name or not _LAYOUT_NAME_OK.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Layout name must be 1-80 characters and may not contain "
+                   "slashes or dots-only segments.",
+        )
+    return name
+
+
+def _layout_path(client_id: str, name: str) -> str:
+    return f"{client_id}/{LAYOUT_PREFIX}/{name}.json"
+
+
+@app.get("/layouts/list")
+async def layouts_list(client_id: str = Depends(get_client_id)):
+    """Every layout this customer has mirrored, newest first."""
+    _require_supabase()
+    url = f"{SUPABASE_URL}/storage/v1/object/list/{SUPABASE_BUCKET}"
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            url,
+            json={"prefix": f"{client_id}/{LAYOUT_PREFIX}/", "limit": 500,
+                  "sortBy": {"column": "updated_at", "order": "desc"}},
+            headers={**_supabase_headers(), "Content-Type": "application/json"},
+            timeout=15,
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Could not list layouts: {r.text[:200]}")
+    out = []
+    for row in r.json():
+        nm = row.get("name", "")
+        if not nm.endswith(".json"):
+            continue
+        meta = row.get("metadata") or {}
+        out.append({
+            "name": nm[:-5],
+            "size": meta.get("size", 0),
+            "updated_at": row.get("updated_at") or row.get("created_at"),
+        })
+    return {"layouts": out, "count": len(out)}
+
+
+@app.get("/layouts/get")
+async def layouts_get(name: str = Query(...), client_id: str = Depends(get_client_id)):
+    """One layout's JSON, exactly as the SB Designer wrote it."""
+    _require_supabase()
+    name = _safe_layout_name(name)
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{_layout_path(client_id, name)}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=_supabase_headers(), timeout=15)
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"No layout named {name!r} is stored.")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Could not read layout: {r.text[:200]}")
+    try:
+        return {"name": name, "layout": r.json()}
+    except Exception:
+        raise HTTPException(status_code=502, detail="Stored layout is not valid JSON.")
+
+
+@app.put("/layouts/put")
+async def layouts_put(
+    client_id: str = Depends(get_client_id),
+    name: str = Body(..., embed=True),
+    layout: dict = Body(..., embed=True),
+):
+    """Mirror one layout up. Upserts, so re-sending the same name replaces it."""
+    _require_supabase()
+    name = _safe_layout_name(name)
+    if not isinstance(layout, dict) or not layout:
+        raise HTTPException(status_code=400, detail="Layout body is empty or not an object.")
+    # A real layout carries elements; refuse anything that plainly is not one
+    # rather than mirroring junk that the Designer will fail to open later.
+    if "elements" not in layout:
+        raise HTTPException(status_code=400,
+                            detail="That does not look like an SB Designer layout "
+                                   "(no 'elements' key).")
+    data = json.dumps(layout).encode()
+    if len(data) > 2_000_000:
+        raise HTTPException(status_code=413, detail="Layout is larger than 2 MB.")
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{_layout_path(client_id, name)}"
+    async with httpx.AsyncClient() as client:
+        r = await client.put(url, content=data, headers={
+            **_supabase_headers(),
+            "Content-Type": "application/json",
+            "x-upsert": "true",
+        }, timeout=30)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Could not store layout: {r.text[:200]}")
+    return {"status": "stored", "name": name, "bytes": len(data)}
+
+
+@app.delete("/layouts/delete")
+async def layouts_delete(name: str = Query(...), client_id: str = Depends(get_client_id)):
+    """Remove one layout from the mirror. Never touches the coach's own copy."""
+    _require_supabase()
+    name = _safe_layout_name(name)
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{_layout_path(client_id, name)}"
+    async with httpx.AsyncClient() as client:
+        r = await client.delete(url, headers=_supabase_headers(), timeout=15)
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"No layout named {name!r} is stored.")
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=502, detail=f"Could not delete layout: {r.text[:200]}")
+    return {"status": "deleted", "name": name}
+
+
 # ── DB Update Endpoints ───────────────────────────────────────────────────────
 
 @app.get("/db/version")
