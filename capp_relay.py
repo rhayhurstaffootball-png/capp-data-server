@@ -15,8 +15,8 @@ _send_locks:  Dict[str, Dict[str, asyncio.Lock]]         = {}
 
 _KEEPALIVE_INTERVAL = 10
 
-INSTALLER_PATH = "/opt/capp_installer/CAPP_Setup_2.6.9.exe"
-INSTALLER_NAME = "CAPP_Setup_2.6.9.exe"
+INSTALLER_PATH = "/opt/capp_installer/CAPP_Setup_2.7.0.exe"
+INSTALLER_NAME = "CAPP_Setup_2.7.0.exe"
 
 # CAPP Binder Converter — the per-coach local conversion worker. Hosted here
 # (not Supabase) because Supabase's project-wide Storage upload limit rejects
