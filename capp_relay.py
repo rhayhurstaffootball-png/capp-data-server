@@ -15,8 +15,8 @@ _send_locks:  Dict[str, Dict[str, asyncio.Lock]]         = {}
 
 _KEEPALIVE_INTERVAL = 10
 
-INSTALLER_PATH = "/opt/capp_installer/CAPP_Setup_2.6.7.exe"
-INSTALLER_NAME = "CAPP_Setup_2.6.7.exe"
+INSTALLER_PATH = "/opt/capp_installer/CAPP_Setup_2.6.9.exe"
+INSTALLER_NAME = "CAPP_Setup_2.6.9.exe"
 
 # CAPP Binder Converter — the per-coach local conversion worker. Hosted here
 # (not Supabase) because Supabase's project-wide Storage upload limit rejects
@@ -309,3 +309,159 @@ async def workflow_put(client_id: str, filename: str, request: _WfRequest):
     tmp.write_text(_wf_json.dumps(body, ensure_ascii=False), encoding="utf-8")
     _wf_os.replace(tmp, path)
     return _WfJSONResponse({"ok": True})
+
+
+# =============================================================================
+# Scoreboard Designer cloud sync  (added Sep 1 2026)
+# =============================================================================
+# Roger: "If you save a layout on one computer, if you log onto another computer
+# with the same login, the layout is available."
+#
+# Same namespace trick as the workflow routes above -- storage keyed on
+# sha256(api_key)[:24], and both seats of a licence share one key, so "same
+# login sees the same data" needs no per-user logic. The client_id in the path
+# is accepted and ignored for storage (guessable string vs unguessable key).
+#
+# ⚠ WHY THERE ARE ASSET ROUTES AND NOT JUST LAYOUT JSON: a layout file is NOT
+# self-contained. SBEDITOR_qt.save_layout() stores only BASENAMES for the
+# background, per-element images and the font; load_layout_by_name() re-joins
+# them against the local BGIMAGES/Fonts folders and silently skips whatever is
+# missing (every resolve is guarded by os.path.exists). Syncing the JSON alone
+# would hand seat B a layout with no background and the wrong font, showing no
+# error at all. The bytes have to travel with it.
+from fastapi.responses import Response as _WfResponse
+
+_SB_STORE = _WfPath("/root/sb_sync")
+
+# Backgrounds are PNG/JPG, not a 16 KB JSON -- this is the one endpoint here
+# that moves real bytes. Caps are deliberately tight: THIS BOX FILLED ITS DISK
+# ON AUG 14 2026 and took the relay down for two days.
+_SB_MAX_LAYOUT_BYTES = 2_000_000
+_SB_MAX_ASSET_BYTES = 10_000_000
+_SB_MAX_LAYOUTS = 300
+_SB_MAX_ASSETS = 300                      # per kind
+_SB_KINDS = {"bg", "font"}
+_SB_EXTS = {
+    "bg": {".png", ".jpg", ".jpeg"},
+    "font": {".ttf", ".otf", ".ttc"},
+}
+
+
+def _sb_ns(api_key: str, *parts) -> _WfPath:
+    h = _wf_hashlib.sha256(api_key.encode()).hexdigest()[:24]
+    p = _SB_STORE.joinpath(h, *parts)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _sb_safe_name(filename: str, kind: str = None) -> str:
+    """Same permissive rule as _wf_safe_name -- layout names are FREE TEXT typed
+    into a dialog and will contain spaces, apostrophes and periods. When `kind`
+    is given the extension must also be one we expect to serve."""
+    if not filename or len(filename) > 160:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if ("/" in filename or "\\" in filename or "\x00" in filename
+            or ".." in filename or filename.startswith(".")):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not _wf_re.match(r"^[A-Za-z0-9 _\-().'&+]+$", filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if kind is not None:
+        if _wf_os.path.splitext(filename)[1].lower() not in _SB_EXTS[kind]:
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+    return filename
+
+
+def _sb_kind(kind: str) -> str:
+    if kind not in _SB_KINDS:
+        raise HTTPException(status_code=400, detail="Unknown asset kind")
+    return kind
+
+
+def _sb_write_atomic(path: _WfPath, raw: bytes):
+    """A half-written background must never be readable -- the next seat to pull
+    would cache a truncated image and the layout would render wrong with no
+    error (same failure class the workflow routes guard against)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(raw)
+    _wf_os.replace(tmp, path)
+
+
+@app.get("/sbsync/{client_id}/meta")
+async def sb_meta(client_id: str, request: _WfRequest):
+    """Everything a client needs to decide what to move, in one call.
+
+    layouts: {name: mtime}         -- pull only what is newer than local
+    assets:  {kind: {name: sha}}   -- skip an upload whose bytes already match,
+                                      and pull only assets a layout references.
+
+    ⚠ Declared BEFORE the generic routes below: FastAPI matches in declaration
+    order, so otherwise "meta" would be read as a layout name.
+    """
+    key = _wf_key_from_request(request)
+    layouts = {f.stem: f.stat().st_mtime for f in _sb_ns(key, "layouts").glob("*.json")}
+    assets = {}
+    for kind in sorted(_SB_KINDS):
+        d = _sb_ns(key, "assets", kind)
+        entry = {}
+        for f in d.iterdir():
+            if f.is_file() and not f.name.endswith(".tmp"):
+                entry[f.name] = _wf_hashlib.sha256(f.read_bytes()).hexdigest()[:32]
+        assets[kind] = entry
+    return _WfJSONResponse({"layouts": layouts, "assets": assets})
+
+
+@app.get("/sbsync/{client_id}/layout/{name}")
+async def sb_layout_get(client_id: str, name: str, request: _WfRequest):
+    ns = _sb_ns(_wf_key_from_request(request), "layouts")
+    path = ns / f"{_sb_safe_name(name)}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        return _WfJSONResponse(_wf_json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@app.put("/sbsync/{client_id}/layout/{name}")
+async def sb_layout_put(client_id: str, name: str, request: _WfRequest):
+    ns = _sb_ns(_wf_key_from_request(request), "layouts")
+    safe = _sb_safe_name(name)
+    raw = await request.body()
+    if len(raw) > _SB_MAX_LAYOUT_BYTES:
+        raise HTTPException(status_code=413, detail="Layout too large")
+    try:
+        body = _wf_json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    path = ns / f"{safe}.json"
+    if not path.exists() and len(list(ns.glob("*.json"))) >= _SB_MAX_LAYOUTS:
+        raise HTTPException(status_code=507, detail="Too many layouts")
+    _sb_write_atomic(path, _wf_json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    return _WfJSONResponse({"ok": True})
+
+
+@app.get("/sbsync/{client_id}/asset/{kind}/{name}")
+async def sb_asset_get(client_id: str, kind: str, name: str, request: _WfRequest):
+    kind = _sb_kind(kind)
+    ns = _sb_ns(_wf_key_from_request(request), "assets", kind)
+    path = ns / _sb_safe_name(name, kind)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return _WfResponse(path.read_bytes(), media_type="application/octet-stream")
+
+
+@app.put("/sbsync/{client_id}/asset/{kind}/{name}")
+async def sb_asset_put(client_id: str, kind: str, name: str, request: _WfRequest):
+    kind = _sb_kind(kind)
+    ns = _sb_ns(_wf_key_from_request(request), "assets", kind)
+    safe = _sb_safe_name(name, kind)
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty body")
+    if len(raw) > _SB_MAX_ASSET_BYTES:
+        raise HTTPException(status_code=413, detail="Asset too large")
+    path = ns / safe
+    if not path.exists() and sum(1 for f in ns.iterdir() if f.is_file()) >= _SB_MAX_ASSETS:
+        raise HTTPException(status_code=507, detail="Too many assets")
+    _sb_write_atomic(path, raw)
+    return _WfJSONResponse({"ok": True, "sha": _wf_hashlib.sha256(raw).hexdigest()[:32]})
