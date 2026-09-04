@@ -36,3 +36,12 @@ ALTER TABLE capp_clients ADD COLUMN IF NOT EXISTS seat_10_released_at timestampt
 --        seat_5_machine, seat_6_machine, seat_7_machine, seat_8_machine,
 --        seat_9_machine, seat_10_machine
 --   from capp_clients order by username;
+
+-- ⚠ ADDED Sep 4 2026 AFTER THE FIRST RUN FAILED. Columns alone are not enough:
+-- a CHECK constraint also pins seat_limit, and setting an account to 7 failed
+-- with 23514 "violates check constraint capp_clients_seat_limit_range".
+-- Adding columns without widening this leaves the ceiling at 3 in the database
+-- no matter what the server allows.
+ALTER TABLE capp_clients DROP CONSTRAINT IF EXISTS capp_clients_seat_limit_range;
+ALTER TABLE capp_clients ADD CONSTRAINT capp_clients_seat_limit_range
+    CHECK (seat_limit >= 1 AND seat_limit <= 10);
