@@ -28,6 +28,7 @@ from espn_fetcher import (
     get_fetcher_metrics,
     get_game_monitor_rows,
     get_feed_health,
+    set_feed_alert_callback,
 )
 import cfbd_live
 from db_updater import run_update
@@ -735,6 +736,86 @@ def plays(
         latency_ms = (time.perf_counter() - started) * 1000
         _record_game_request(game_id, "plays", latency_ms, 500, error=f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+# ── Live-feed alerting ────────────────────────────────────────────────────────
+# Roger, Sep 3 2026: *"Still makes me nervous that I may have to tell clients
+# 'Oh well, no data for this game'."* The gap is not the outage itself - nothing
+# can invent plays nobody publishes - it is FINDING OUT FROM THE CUSTOMER. This
+# closes that: when a live game stops producing plays, he hears first and can
+# call them, which is a completely different conversation.
+#
+# ⚠ Fires on a TRANSITION and is de-duped in the fetcher. A live game is polled
+# every few seconds; without that guard this is hundreds of emails a quarter.
+FEED_ALERT_EMAIL = os.environ.get("FEED_ALERT_EMAIL", "roger@cappvcs.com")
+
+
+def _send_feed_alert(game_id: str, state: str, info: dict) -> None:
+    """Runs on a background thread (smtplib blocks). Never raises — an alert
+    that fails must not disturb the poll that triggered it."""
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+
+        smtp_host = os.environ.get("SMTP_HOST", "")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_user = os.environ.get("SMTP_USER", "")
+        smtp_pass = os.environ.get("SMTP_PASS", "")
+        from_addr = os.environ.get("FROM_EMAIL", smtp_user)
+        if not smtp_host or not smtp_user or not smtp_pass:
+            return                       # email not configured — skip silently
+
+        matchup = f"{info.get('away') or '?'} at {info.get('home') or '?'}"
+
+        if state == "healthy":
+            subject = f"CAPP: plays RESUMED — {matchup}"
+            lead = "Play data is flowing again for this game."
+            verdict = ""
+        else:
+            # Second opinion, so the email says whose problem it is.
+            cfbd = cfbd_live.live_play_count(game_id)
+            if cfbd.get("available") and cfbd.get("plays", 0) > 0:
+                verdict = (f"CFBD HAS {cfbd['plays']} plays for this game — so the data exists "
+                           f"and ESPN is the problem.")
+            elif cfbd.get("available"):
+                verdict = ("CFBD is ALSO empty — nothing is being published for this game by "
+                           "any source. Tell the coach to use Manual Entry; this cannot be "
+                           "fixed from our side.")
+            else:
+                verdict = f"CFBD could not be reached ({cfbd.get('note')}), so the cause is unconfirmed."
+            subject = f"CAPP: no plays — {matchup}"
+            lead = (f"This game is live but has produced no new plays for "
+                    f"{int(info.get('quiet_seconds', 0) // 60)} minutes.")
+
+        lines = [
+            lead,
+            "",
+            f"Game     : {matchup}",
+            f"Game ID  : {game_id}",
+            f"Status   : {info.get('status_detail') or ''}",
+            f"Plays    : {info.get('plays', 0)}",
+            f"State    : {state}",
+            "",
+            verdict,
+            "",
+            "ESPN's own page (fastest confirmation):",
+            f"https://www.espn.com/college-football/playbyplay/_/gameId/{game_id}",
+        ]
+        body = chr(10).join(lines)
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = f"CAPP Feed Monitor <{from_addr}>"
+        msg["To"] = FEED_ALERT_EMAIL
+
+        with smtplib.SMTP(smtp_host, smtp_port) as srv:
+            srv.starttls()
+            srv.login(smtp_user, smtp_pass)
+            srv.sendmail(from_addr, [FEED_ALERT_EMAIL], msg.as_string())
+    except Exception as e:
+        print(f"feed alert email failed ({game_id}): {e}")
+
+
+set_feed_alert_callback(_send_feed_alert)
+
 
 @app.get("/game/{game_id}/feed-health", dependencies=[Depends(verify_api_key)])
 def game_feed_health(game_id: str, league: str = Query("cfb", description="cfb or nfl")):

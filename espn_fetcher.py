@@ -1630,6 +1630,53 @@ def _note_feed_health(game_id, mapped):
             h["checked_at"] = now
     except Exception:
         pass          # health tracking must never break a poll
+    try:
+        snapshot = get_feed_health(game_id)
+        _maybe_alert(game_id, snapshot.get("state", ""), {
+            "game_id": game_id,
+            "home": (mapped or {}).get("home_name", ""),
+            "away": (mapped or {}).get("away_name", ""),
+            "status_detail": (mapped or {}).get("status_detail", ""),
+            "plays": snapshot.get("plays", 0),
+            "quiet_seconds": snapshot.get("seconds_since_new_play", 0),
+        })
+    except Exception:
+        pass
+
+
+# One-shot alerting. A game going dark must notify ONCE, not on every poll —
+# a live game is polled every few seconds, so an un-deduped alert would mean
+# hundreds of emails during a single quarter.
+_feed_alert_cb = None
+_feed_alert_state: dict = {}     # game_id -> last state we alerted on
+
+
+def set_feed_alert_callback(fn):
+    """Registered by main.py. Kept as a hook so this module never imports the
+    app — the fetcher must stay importable on its own for tests."""
+    global _feed_alert_cb
+    _feed_alert_cb = fn
+
+
+def _maybe_alert(game_id, state, payload):
+    """Fire on a TRANSITION only: healthy -> dark/stalled, and back again."""
+    if state not in ("dark", "stalled", "healthy"):
+        return
+    prev = _feed_alert_state.get(game_id)
+    if prev == state:
+        return
+    # Only alert on the first bad state, and on the recovery that follows one.
+    if state == "healthy" and prev not in ("dark", "stalled"):
+        _feed_alert_state[game_id] = state
+        return
+    _feed_alert_state[game_id] = state
+    cb = _feed_alert_cb
+    if not cb:
+        return
+    try:
+        threading.Thread(target=cb, args=(game_id, state, payload), daemon=True).start()
+    except Exception as e:
+        print(f"feed alert dispatch failed ({game_id}): {e}")
 
 
 def get_feed_health(game_id) -> dict:
@@ -1774,12 +1821,38 @@ def _refresh_live_list_if_stale():
     with _lock:
         if (time.time() - _games_cache_at) < LIVE_LIST_TTL:
             return
+    # ⚠ THE BARE {} CALL SILENTLY DROPS WHOLE DAYS. Measured Sep 3 2026: ESPN's
+    # default scoreboard reported "week 1" and returned Aug 29 + Sep 4-7 —
+    # skipping Sep 3, THAT DAY, entirely. 12 games were in progress and this
+    # list showed 2. Nine of the ten missing were FBS (Colorado @ Georgia Tech,
+    # UMass @ Rutgers, Eastern Illinois @ Minnesota, UAB @ Illinois, Akron @
+    # Wake Forest, Bethune-Cookman @ UCF...), so it is NOT a lower-division
+    # filter — it is a hole at ESPN's week boundary, and Thursday/Friday games
+    # are what fall through it.
+    #
+    # Fix is additive on purpose: keep the default call (it carries the upcoming
+    # week, which the selector relies on) and UNION it with explicit dates for
+    # today and tomorrow. Tomorrow is included because ESPN's date buckets are
+    # US-Eastern while this server runs UTC, so a night kickoff is already
+    # "tomorrow" here. Dedupe by game_id, first writer wins.
+    from datetime import datetime, timedelta, timezone
+    et_now = datetime.now(timezone.utc) - timedelta(hours=4)   # ET, DST-safe enough for a date bucket
+    day_params = [{}] + [{"dates": (et_now + timedelta(days=d)).strftime("%Y%m%d")}
+                         for d in (0, 1)]
     new_games = []
+    seen_ids = set()
     for lg in ("cfb", "nfl"):
-        try:
-            new_games.extend(_events_to_games(_fetch_scoreboard(lg, {}), lg))
-        except Exception as e:
-            print(f"Live list error ({lg}): {e}")
+        for params in day_params:
+            try:
+                for game in _events_to_games(_fetch_scoreboard(lg, params), lg):
+                    gid = str(game.get("game_id", ""))
+                    if gid and gid in seen_ids:
+                        continue
+                    if gid:
+                        seen_ids.add(gid)
+                    new_games.append(game)
+            except Exception as e:
+                print(f"Live list error ({lg} {params or 'default'}): {e}")
     with _lock:
         _games_cache.clear()
         _games_cache.extend(new_games)
