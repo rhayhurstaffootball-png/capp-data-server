@@ -571,6 +571,25 @@ async def _lookup_api_key(api_key: str) -> dict:
     return entry
 
 # --- API Key Auth ---
+# ── Seats ─────────────────────────────────────────────────────────────────────
+# Raised from 3 to 10 on Sep 4 2026 (Roger: "change the admin so I can Give up
+# to 10 Licenses").
+#
+# ⚠ NO CLIENT BUILD IS NEEDED FOR THIS, and that is by design: /auth/login
+# treats the client's `seat` field as a HINT and binds the lowest FREE seat
+# server-side. An installed 2.6.x asking for "seat_1" on a seventh computer is
+# bound to seat 7 and never knows. Machine binding and the 24h release limit are
+# untouched — only the NUMBER of seats moved.
+#
+# ⚠ REQUIRES seats_to_10_migration.sql TO HAVE BEEN RUN. Without those columns a
+# seat above 3 reads back as None from Supabase, which would look like a free
+# seat and let the same account bind unlimited machines. The health check below
+# reports whether the columns are present.
+MAX_SEATS = 10
+_SEAT_MACHINE_COLS = ",".join(f"seat_{n}_machine" for n in range(1, MAX_SEATS + 1))
+_SEAT_RELEASED_COLS = ",".join(f"seat_{n}_released_at" for n in range(1, MAX_SEATS + 1))
+
+
 async def verify_api_key(x_api_key: str = Header(..., description="CAPP API key")):
     row = await _lookup_api_key(x_api_key)
     if not row:
@@ -991,8 +1010,8 @@ async def auth_login(
     url = f"{SUPABASE_URL}/rest/v1/capp_clients"
     params = {
         "username": f"eq.{username}",
-        "select": "client_id,password_hash,salt,api_key,active,is_admin,"
-                  "seat_1_machine,seat_2_machine,seat_3_machine,seat_limit"
+        "select": ("client_id,password_hash,salt,api_key,active,is_admin,"
+                   + _SEAT_MACHINE_COLS + ",seat_limit")
     }
     async with httpx.AsyncClient() as client:
         r = await client.get(url, params=params, headers=_supabase_headers())
@@ -1018,7 +1037,7 @@ async def auth_login(
     # is a different thing and deliberately untouched.)
     if not user.get("is_admin"):
         limit = user.get("seat_limit") or 2
-        limit = max(1, min(3, int(limit)))
+        limit = max(1, min(MAX_SEATS, int(limit)))
         seats = [user.get(f"seat_{n}_machine") for n in range(1, limit + 1)]
 
         if machine_id in seats:
@@ -2692,7 +2711,7 @@ async def admin_list_clients():
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"select": "username,client_id,email,active,licensed,is_admin,seat_1_machine,seat_2_machine,seat_3_machine,seat_limit,notes,next_invoice_date,created_at,trial_extension_days",
+            params={"select": ("username,client_id,email,active,licensed,is_admin," + _SEAT_MACHINE_COLS + ",seat_limit,notes,next_invoice_date,created_at,trial_extension_days"),
                     "order": "username.asc"},
             headers=_supa_headers_json(),
         )
@@ -2852,10 +2871,8 @@ async def _seat_client(username: str, password: str) -> dict:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
             params={"username": f"eq.{username}",
-                    "select": "username,client_id,active,password_hash,salt,seat_limit,"
-                              "seat_1_machine,seat_2_machine,seat_3_machine,"
-                              "seat_1_released_at,seat_2_released_at,"
-                              "seat_3_released_at"},
+                    "select": ("username,client_id,active,password_hash,salt,seat_limit,"
+                               + _SEAT_MACHINE_COLS + "," + _SEAT_RELEASED_COLS)},
             headers=_supabase_headers())
     if r.status_code != 200 or not r.json():
         raise HTTPException(status_code=401, detail="Invalid username or password.")
@@ -2895,7 +2912,7 @@ async def seats_status(username: str = Body(..., embed=True),
                        password: str = Body(..., embed=True)):
     """Show this account's seats. Does NOT bind a machine."""
     u = await _seat_client(username, password)
-    limit = max(1, min(3, int(u.get("seat_limit") or 2)))
+    limit = max(1, min(MAX_SEATS, int(u.get("seat_limit") or 2)))
     return {"username": u["username"],
             "seat_limit": limit,
             "seats": [_seat_view(u, n) for n in range(1, limit + 1)]}
@@ -2911,8 +2928,8 @@ async def seats_release(username: str = Body(..., embed=True),
     a way to rotate a single licence around a whole staff — the exact sharing
     the machine binding exists to prevent.
     """
-    if seat not in (1, 2, 3):
-        raise HTTPException(status_code=400, detail="Seat must be 1, 2 or 3.")
+    if seat not in range(1, MAX_SEATS + 1):
+        raise HTTPException(status_code=400, detail=f"Seat must be between 1 and {MAX_SEATS}.")
     u = await _seat_client(username, password)
     if seat > int(u.get("seat_limit") or 2):
         raise HTTPException(status_code=400,
@@ -2941,8 +2958,8 @@ async def seats_release(username: str = Body(..., embed=True),
 @app.patch("/admin/api/clients/{username}/reset-seat", dependencies=[Depends(_require_admin)])
 async def admin_reset_single_seat(username: str, seat: int = Body(..., embed=True)):
     """Reset a single seat (1, 2 or 3)."""
-    if seat not in (1, 2, 3):
-        raise HTTPException(status_code=400, detail="Seat must be 1, 2 or 3.")
+    if seat not in range(1, MAX_SEATS + 1):
+        raise HTTPException(status_code=400, detail=f"Seat must be between 1 and {MAX_SEATS}.")
     col = f"seat_{seat}_machine"
     async with httpx.AsyncClient() as c:
         r = await c.patch(
@@ -3250,7 +3267,7 @@ async def admin_set_seat_limit(username: str, seat_limit: int = Body(..., embed=
     cutting a coach off mid-season because a number changed would be the worst
     possible behaviour here.
     """
-    if seat_limit not in (1, 2, 3):
+    if seat_limit not in range(1, MAX_SEATS + 1):
         raise HTTPException(status_code=400, detail="Seat limit must be 1, 2 or 3.")
     async with httpx.AsyncClient() as c:
         r = await c.patch(
@@ -3270,8 +3287,7 @@ async def admin_reset_seats(username: str):
         r = await c.patch(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
             params={"username": f"eq.{username}"},
-            json={"seat_1_machine": None, "seat_2_machine": None,
-                  "seat_3_machine": None},
+            json={f"seat_{n}_machine": None for n in range(1, MAX_SEATS + 1)},
             headers={**_supa_headers_json(), "Prefer": "return=minimal"},
         )
     if r.status_code not in (200, 204):
@@ -6881,27 +6897,10 @@ _ADMIN_HTML = """<!DOCTYPE html>
 
     <div class="so-section">
       <h3>Machine Seats</h3>
-      <div class="so-field">
-        <label>Seat 1</label>
-        <div class="seat-row">
-          <div class="so-val muted" id="so-seat1">—</div>
-          <button class="btn btn-warning btn-sm" onclick="resetSeat(1)">Reset</button>
-        </div>
-      </div>
-      <div class="so-field">
-        <label>Seat 2</label>
-        <div class="seat-row">
-          <div class="so-val muted" id="so-seat2">—</div>
-          <button class="btn btn-warning btn-sm" onclick="resetSeat(2)">Reset</button>
-        </div>
-      </div>
-      <div class="so-field" id="so-seat3-row" style="display:none;">
-        <label>Seat 3</label>
-        <div class="seat-row">
-          <div class="so-val muted" id="so-seat3">—</div>
-          <button class="btn btn-warning btn-sm" onclick="resetSeat(3)">Reset</button>
-        </div>
-      </div>
+      <!-- Seat rows are BUILT IN JS from seat_limit (up to 10). Hardcoding them
+           meant seats 4-10 were invisible and un-resettable the moment the
+           ceiling was raised. -->
+      <div id="so-seat-rows"></div>
       <div class="so-field">
         <label>Seats allowed</label>
         <div class="seat-row">
@@ -6909,6 +6908,13 @@ _ADMIN_HTML = """<!DOCTYPE html>
             <option value="1">1</option>
             <option value="2">2</option>
             <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5</option>
+            <option value="6">6</option>
+            <option value="7">7</option>
+            <option value="8">8</option>
+            <option value="9">9</option>
+            <option value="10">10</option>
           </select>
           <button class="btn btn-primary btn-sm" onclick="setSeatLimit()">Save</button>
         </div>
@@ -7356,11 +7362,15 @@ function loadClients() {
     const rows = data.map(c => {
       const active = c.active ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-red">Inactive</span>';
       const admin  = c.is_admin ? ' <span class="badge badge-blue">Admin</span>' : '';
-      const s1     = c.seat_1_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
-      const s2     = c.seat_2_machine ? '<span class="badge badge-gray">Bound</span>' : '<span class="badge badge-green">Open</span>';
-      const s3     = (c.seat_limit || 2) >= 3
-        ? (c.seat_3_machine ? ' <span class="badge badge-gray">Bound</span>' : ' <span class="badge badge-green">Open</span>')
-        : '';
+      // Up to 10 seats now, so per-seat badges no longer fit the row — show a
+      // count instead, green while seats remain free.
+      const _sl    = c.seat_limit || 2;
+      let _bound   = 0;
+      for (let n = 1; n <= _sl; n++) { if (c["seat_" + n + "_machine"]) _bound++; }
+      const _cls   = _bound >= _sl ? "badge-gray" : "badge-green";
+      const s1     = '<span class="badge ' + _cls + '">' + _bound + ' / ' + _sl + '</span>';
+      const s2     = '';
+      const s3     = '';
       const inv    = c.next_invoice_date ? c.next_invoice_date : '<span style="color:#8b95a1">—</span>';
       let licBadge;
       if (c.licensed) {
@@ -7410,17 +7420,20 @@ function openSlideout(username) {
     : '<span class="badge badge-red">Inactive</span>';
   if (c.is_admin) statusEl.innerHTML += ' <span class="badge badge-blue">Admin</span>';
 
-  document.getElementById("so-seat1").textContent = c.seat_1_machine
-    ? c.seat_1_machine.substring(0, 24) + "…" : "Open";
   const _lim = c.seat_limit || 2;
   document.getElementById("so-seat-limit").value = String(_lim);
-  // Seat 3 is only shown when the school actually has one, so the panel does
-  // not imply a seat that cannot be used.
-  document.getElementById("so-seat3-row").style.display = _lim >= 3 ? "" : "none";
-  document.getElementById("so-seat3").textContent = c.seat_3_machine
-    ? c.seat_3_machine.substring(0, 24) + "…" : "Open";
-  document.getElementById("so-seat2").textContent = c.seat_2_machine
-    ? c.seat_2_machine.substring(0, 24) + "…" : "Open";
+  // Only seats the school actually has are drawn, so the panel never implies a
+  // seat that cannot be used.
+  let _rows = "";
+  for (let n = 1; n <= _lim; n++) {
+    const m = c["seat_" + n + "_machine"];
+    const val = m ? (m.substring(0, 24) + "…") : "Open";
+    _rows += '<div class="so-field"><label>Seat ' + n + '</label>'
+           + '<div class="seat-row"><div class="so-val muted">' + val + '</div>'
+           + '<button class="btn btn-warning btn-sm" onclick="resetSeat(' + n + ')">Reset</button>'
+           + '</div></div>';
+  }
+  document.getElementById("so-seat-rows").innerHTML = _rows;
 
   document.getElementById("so-email").value = c.email || "";
   document.getElementById("so-invoice-date").value = c.next_invoice_date || "";
