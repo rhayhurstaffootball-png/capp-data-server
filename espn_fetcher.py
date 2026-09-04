@@ -1546,6 +1546,7 @@ def _poll_loop():
                     mapped = _fetch_game_plays_mapped(gid, league)
                     with _lock:
                         _plays_cache[gid] = mapped
+                    _note_feed_health(gid, mapped)
                     _schedule_next_poll(gid, mapped.get("status", ""))
                 except Exception as e:
                     print(f"Live plays error ({gid}): {e}")
@@ -1577,6 +1578,87 @@ def start_poller():
         _poller_thread = threading.Thread(target=_poll_loop, daemon=True, name="capp-espn-poller")
         _poller_thread.start()
     return True
+
+
+# ── Per-game feed health ──────────────────────────────────────────────────────
+# ⚠ WHY THIS EXISTS AND WHY THE EXISTING METRICS WERE NOT ENOUGH.
+# Sep 3 2026, Colorado @ Georgia Tech: the game sat "In Progress" at 7:49 of the
+# 2nd for 40+ minutes with 0 drives and 0 plays, while two other live games fed
+# normally through this same code. get_fetcher_metrics() was GREEN the whole
+# time and would have stayed green — it answers "is the poller working", not
+# "is THIS GAME producing plays". A coach saw silence and had no way to tell
+# whether CAPP was broken. That distinction is the entire point of this block.
+#
+# Cross-checking CFBD is what makes the answer actionable rather than a shrug:
+#   ESPN dark + CFBD has plays  -> the problem is ESPN; a fallback can cover it
+#   BOTH dark                   -> nothing is being published for this game at
+#                                  the source; the honest answer is "use Manual
+#                                  Entry", and no amount of retrying will help.
+# Measured that night: Colorado/GT was 0 on BOTH; the two healthy games matched
+# closely (ESPN 86 / CFBD 84, ESPN 34 / CFBD 30). So redundancy does NOT rescue
+# a dead game feed — do not promise that it does.
+_feed_health: dict = {}      # game_id -> tracking dict
+
+# A live game with no new play for this long is stalled. Real football has long
+# gaps — TV timeouts, reviews, injuries, halftime — so this is deliberately
+# generous. Under it, normal play is silent for ~1-3 minutes.
+FEED_STALL_SECONDS = 360          # 6 minutes with zero new plays while "in"
+FEED_DARK_SECONDS = 300           # "in" this long having produced NOTHING at all
+
+
+def _note_feed_health(game_id, mapped):
+    """Record whether this game is actually producing plays. Called on every
+    cache write, both the poller's and the on-demand path."""
+    try:
+        status = (mapped or {}).get("status", "")
+        count = len((mapped or {}).get("entries", []) or [])
+        now = time.time()
+        with _lock:
+            h = _feed_health.get(game_id)
+            if not h:
+                h = {"first_seen_at": now, "last_change_at": now,
+                     "last_count": count, "status": status, "in_since": 0.0}
+                _feed_health[game_id] = h
+            if status == "in" and not h["in_since"]:
+                h["in_since"] = now
+            if status != "in":
+                h["in_since"] = 0.0
+            if count != h["last_count"]:
+                h["last_count"] = count
+                h["last_change_at"] = now
+            h["status"] = status
+            h["checked_at"] = now
+    except Exception:
+        pass          # health tracking must never break a poll
+
+
+def get_feed_health(game_id) -> dict:
+    """Is THIS game producing plays? 'healthy' | 'stalled' | 'dark' | 'unknown'.
+
+    Only ever reports a problem for a game ESPN says is IN PROGRESS — a pre-game
+    or final game with no new plays is correct, not broken.
+    """
+    now = time.time()
+    with _lock:
+        h = dict(_feed_health.get(game_id) or {})
+    if not h:
+        return {"state": "unknown", "plays": 0, "seconds_since_new_play": 0}
+    plays = h.get("last_count", 0)
+    quiet = max(0.0, now - h.get("last_change_at", now))
+    live_for = max(0.0, now - h["in_since"]) if h.get("in_since") else 0.0
+    state = "healthy"
+    if h.get("status") == "in":
+        if plays == 0 and live_for > FEED_DARK_SECONDS:
+            state = "dark"
+        elif plays > 0 and quiet > FEED_STALL_SECONDS:
+            state = "stalled"
+    return {
+        "state": state,
+        "status": h.get("status", ""),
+        "plays": plays,
+        "seconds_since_new_play": int(quiet),
+        "live_for_seconds": int(live_for),
+    }
 
 
 def get_fetcher_metrics() -> dict:
@@ -1665,9 +1747,19 @@ def get_game_monitor_rows() -> list:
             "manual_gap_count": int(qc_summary.get("manual_gap_count", 0) or 0),
             "qc_issue_count": len(qc_entries),
             "qc_examples": qc_examples,
+            # Per-game feed state, so a game that is live-but-producing-nothing is
+            # visible on the dashboard instead of looking identical to a healthy
+            # one. See _note_feed_health for the night that made this necessary.
+            "feed_state": (get_feed_health(str(game_id)) or {}).get("state", "unknown"),
+            "seconds_since_new_play": (get_feed_health(str(game_id)) or {}).get(
+                "seconds_since_new_play", 0),
         })
 
-    rows.sort(key=lambda row: (row["status"] != "in", -(row["fetched_at"] or 0), row["game_id"]))
+    # Unhealthy live games first — the whole point is that they stop hiding among
+    # the healthy ones.
+    rows.sort(key=lambda row: (row["status"] != "in",
+                               row.get("feed_state") in ("healthy", "unknown"),
+                               -(row["fetched_at"] or 0), row["game_id"]))
     return rows
 
 # ============================================================
@@ -1723,6 +1815,7 @@ def get_game_plays(game_id, league="cfb", force_refresh=False):
     result = _fetch_game_plays_mapped(game_id, league)
     with _lock:
         _plays_cache[game_id] = result        # cache fresh result for subsequent requests
+    _note_feed_health(game_id, result)
     return result
 
 

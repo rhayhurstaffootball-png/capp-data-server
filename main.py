@@ -27,7 +27,9 @@ from espn_fetcher import (
     get_team_schedule,
     get_fetcher_metrics,
     get_game_monitor_rows,
+    get_feed_health,
 )
+import cfbd_live
 from db_updater import run_update
 
 
@@ -733,6 +735,58 @@ def plays(
         latency_ms = (time.perf_counter() - started) * 1000
         _record_game_request(game_id, "plays", latency_ms, 500, error=f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+@app.get("/game/{game_id}/feed-health", dependencies=[Depends(verify_api_key)])
+def game_feed_health(game_id: str, league: str = Query("cfb", description="cfb or nfl")):
+    """Is this game actually producing plays, and if not, WHOSE fault is it?
+
+    ⚠ THE POINT IS THE DIFFERENCE BETWEEN TWO SILENCES THAT LOOK IDENTICAL.
+    Sep 3 2026, Colorado @ Georgia Tech: "In Progress", 7:49 of the 2nd, frozen
+    for 40+ minutes, ZERO plays — while two other live games fed normally
+    through the same code. Every existing health metric was green, because they
+    answer "is the poller alive", not "is this game producing plays". The coach
+    just saw nothing and could not tell whether CAPP was broken.
+
+    CFBD is queried as a SECOND OPINION, and the two answers mean opposite
+    things:
+      espn_outage  - ESPN is dark but CFBD has plays -> our source is the
+                     problem, and a fallback could cover it.
+      no_source_data - BOTH are dark -> nothing is being published for this game
+                     at all. Retrying cannot help; Manual Entry is the answer.
+                     ⚠ Measured that night: Colorado/GT was 0 on BOTH. CFBD is
+                     NOT a rescue for a dead game feed - do not imply it is.
+    """
+    health = get_feed_health(game_id)
+    state = health.get("state", "unknown")
+    out = {"game_id": game_id, "espn": health, "cfbd": None,
+           "state": state, "message": ""}
+
+    if state in ("dark", "stalled"):
+        cfbd = cfbd_live.live_play_count(game_id)
+        out["cfbd"] = cfbd
+        if cfbd.get("available") and cfbd.get("plays", 0) > 0:
+            out["state"] = "espn_outage"
+            out["message"] = (
+                "Plays are being published for this game, but our live source is "
+                "not returning them right now. Support has been alerted."
+            )
+        elif cfbd.get("available"):
+            out["state"] = "no_source_data"
+            out["message"] = (
+                "No play-by-play is being published for this game by any source. "
+                "This is upstream of CAPP and cannot be fixed from here - use "
+                "Manual Entry to keep charting."
+            )
+        else:
+            out["message"] = (
+                "This game has produced no new plays for a while. The second "
+                "source could not be reached, so the cause is unconfirmed."
+            )
+    elif state == "healthy":
+        out["message"] = "Feed healthy."
+    elif state == "unknown":
+        out["message"] = "This game has not been polled yet."
+    return out
 
 @app.get("/game/{game_id}/version", dependencies=[Depends(verify_api_key)])
 def game_version(game_id: str):
