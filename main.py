@@ -29,6 +29,7 @@ from espn_fetcher import (
     get_game_monitor_rows,
     get_feed_health,
     set_feed_alert_callback,
+    is_game_watched,
 )
 import cfbd_live
 from db_updater import run_update
@@ -236,7 +237,15 @@ def _build_gameday_payload() -> dict:
             reasons.append(f"{merged['qc_issue_count']} QC issue(s)")
         if merged.get("auto_fixed_count", 0) > 0:
             reasons.append(f"{merged['auto_fixed_count']} auto-fixed")
-        if merged.get("status") == "in" and merged.get("age_seconds") is not None and merged["age_seconds"] > 45:
+        # ⚠ Only a game a client is ACTUALLY WATCHING can be "stale". Polling is
+        # demand-driven, so a game the coach closed stops being fetched and its
+        # cache ages on purpose. Alarming on that fired RED on every game anyone
+        # switched away from (live case: UTEP at Oklahoma, Sep 4 2026, 37 min
+        # after Roger moved to another game).
+        if (merged.get("status") == "in"
+                and merged.get("age_seconds") is not None
+                and merged["age_seconds"] > 45
+                and is_game_watched(str(merged.get("game_id", "")))):
             merged["alert_level"] = "red"
             reasons.append("live game cache stale")
         merged["alert_reasons"] = reasons

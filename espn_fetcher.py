@@ -1639,6 +1639,21 @@ FEED_STALL_SECONDS = 360          # 6 minutes with zero new plays while "in"
 FEED_DARK_SECONDS = 300           # "in" this long having produced NOTHING at all
 
 
+def is_game_watched(game_id) -> bool:
+    """Is a client actually holding this game open right now?
+
+    ⚠ POLLING IS DEMAND-DRIVEN. A game is only fetched while a client
+    heartbeats it (see mark_game_active). The moment a coach closes the window
+    the game ages out and STOPS being polled — that is correct behaviour, not an
+    outage, and nothing may raise an alarm about it. get_fetcher_metrics already
+    carries this warning for the idle case; feed health and the gameday alerts
+    need the same guard or they cry wolf on every game anyone closes.
+    """
+    with _lock:
+        entry = _active_games.get(game_id)
+        return bool(entry and not entry.get("done"))
+
+
 def _note_feed_health(game_id, mapped):
     """Record whether this game is actually producing plays. Called on every
     cache write, both the poller's and the on-demand path."""
@@ -1727,7 +1742,9 @@ def get_feed_health(game_id) -> dict:
     quiet = max(0.0, now - h.get("last_change_at", now))
     live_for = max(0.0, now - h["in_since"]) if h.get("in_since") else 0.0
     state = "healthy"
-    if h.get("status") == "in":
+    # Never report a problem for a game nobody has open — it is not being polled
+    # BY DESIGN, so "no new plays" says nothing about the feed.
+    if h.get("status") == "in" and is_game_watched(game_id):
         if plays == 0 and live_for > FEED_DARK_SECONDS:
             state = "dark"
         elif plays > 0 and quiet > FEED_STALL_SECONDS:
@@ -1735,6 +1752,7 @@ def get_feed_health(game_id) -> dict:
     return {
         "state": state,
         "status": h.get("status", ""),
+        "watched": is_game_watched(game_id),
         "plays": plays,
         "seconds_since_new_play": int(quiet),
         "live_for_seconds": int(live_for),
