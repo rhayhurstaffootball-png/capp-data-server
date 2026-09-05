@@ -786,6 +786,34 @@ def _qc_flag_entries(entries, home_name, away_name):
 # Play Parsing
 # ============================================================
 
+# ⚠ A DEFENSIVE / SPECIAL-TEAMS TD MUST NEVER BE CREDITED TO THE OFFENSE.
+# Sep 4 2026, UTEP at Oklahoma: a punt-return TD briefly showed 7-6 in the live
+# tree — the 6 credited to UTEP, who had possession, instead of Oklahoma, who
+# returned it. Roger: "SOmetimes the DEfense scores".
+#
+# The score DELTA is the reliable signal, but it is exactly what is missing at
+# the moment these plays arrive: ESPN lags the score update most on return
+# touchdowns. With no delta the old code fell through to "whoever had the ball",
+# which is the wrong team by definition on a return TD.
+#
+# ESPN names the play type outright ("Punt Return Touchdown"), so use that as a
+# second, lag-proof signal BEFORE falling back to possession.
+_RETURN_TD_MARKERS = (
+    "return touchdown",      # punt / kickoff / interception / fumble return TD
+    "interception return",
+    "fumble return",
+    "blocked field goal touchdown",
+    "blocked punt touchdown",
+    "missed field goal return",
+)
+
+
+def _is_return_touchdown(type_text: str) -> bool:
+    """True when the play type says the NON-possessing team scored."""
+    t = (type_text or "").lower()
+    return any(m in t for m in _RETURN_TD_MARKERS)
+
+
 def _annotate_td_scoring_teams(all_plays):
     """
     Set play["_td_scoring_team"] = "home" or "away" on every play that
@@ -1120,6 +1148,11 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
             td_scorer = play.get("_td_scoring_team")
             if td_scorer:
                 scored_home = (td_scorer == "home")
+            elif _is_return_touchdown(type_text_lower):
+                # ESPN's own play type says the receiving/defending team scored,
+                # so credit the team that did NOT have the ball. This works even
+                # when the score has not updated yet, which is when it matters.
+                scored_home = (drive_team_id != home_team_id)
             elif is_punt:
                 # Punt plays: drive_team_id is the PUNTING team.
                 # A scoring punt must be a punt return TD — the RECEIVING
