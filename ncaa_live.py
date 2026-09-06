@@ -386,13 +386,25 @@ def timeouts(ncaa_game_id) -> dict:
         charged, team_name = None, ""
         if folded in ("other", "", "official", "officials", "media", "tv", "injury"):
             charged = None
-        elif _name_score(who, home_forms):
-            charged, team_name = "home", home.get("short", "")
-        elif _name_score(who, away_forms):
-            charged, team_name = "away", away.get("short", "")
         else:
-            # A team name we could not tie to either side. Say so; do not guess.
-            charged, team_name = "unknown", who
+            # ⚠ SCORE BOTH SIDES AND COMPARE. Testing home first and taking any
+            # non-zero hit charged "Timeout Texas St." to TEXAS, because "texas"
+            # is a substring of "texas state" and home was asked first. Every
+            # in-state pairing has this shape - Texas/Texas St., Oregon/Oregon
+            # St., Miami (FL)/Miami (OH), Washington/Washington St. - so it is
+            # not an edge case, and charging a timeout to the wrong team is
+            # worse than not classifying it.
+            hs = _name_score(who, home_forms)
+            aws = _name_score(who, away_forms)
+            if hs > aws:
+                charged, team_name = "home", home.get("short", "")
+            elif aws > hs:
+                charged, team_name = "away", away.get("short", "")
+            else:
+                # Either neither matched, or both matched equally well (think
+                # "Timeout Miami" in Miami (OH) @ Miami (FL)). Say so; the coach
+                # picks. Never guess a side.
+                charged, team_name = "unknown", who
 
         out.append({
             "quarter": p["quarter"],
