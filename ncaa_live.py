@@ -20,7 +20,11 @@ Built Sep 6 2026, the morning after a Saturday where two problems cost real work
 
   2. **Stuck clocks.** When a stat crew stops advancing the clock, ESPN stamps a
      whole run of plays with one time. NCAA is a separate transcription, so its
-     run is usually intact.
+     run is often intact - but HOW MUCH CLOCK NCAA CARRIES DEPENDS ON THE SAME
+     CREW. Measured across eight games from Sep 5 2026, the share of plays with
+     a clock ran: Penn St. 100%, Texas 94%, Air Force 94%, Alabama 93%,
+     Nebraska 88%, Oregon 43%, Maryland 37%, Ohio St. 34%. Callers must check
+     coverage for the game in front of them, never assume it.
 
 ⚠ WHAT THIS MODULE IS NOT. It is a **verification and repair source, never a
 replacement**. ESPN stays primary. Nothing here writes to a game; the endpoints
@@ -207,7 +211,10 @@ def scoreboard(year, week, division="fbs", conf="all-conf") -> dict:
     return {"available": True, "games": games}
 
 
-def resolve_game(year, home, away, date=None, weeks=None, division="fbs") -> dict:
+DIVISIONS = ("fbs", "fcs", "d2", "d3")
+
+
+def resolve_game(year, home, away, date=None, weeks=None, division=None) -> dict:
     """Find the NCAA contest id for a game CAPP knows by team names.
 
     `date` is MM/DD/YYYY as NCAA writes it. Without it the search still works but
@@ -220,6 +227,21 @@ def resolve_game(year, home, away, date=None, weeks=None, division="fbs") -> dic
     containment), or "none". The caller must treat anything below "likely" as
     unresolved and fall back to manual - never guess a game.
     """
+    # ⚠ SEARCH EVERY DIVISION, NOT JUST FBS. Half of CAPP's clients are FCS
+    # (Albany, New Hampshire, Samford, Southern Illinois, North Dakota State,
+    # Tennessee State) and an FBS-only scan returned "unresolved" for every one
+    # of their games. NCAA publishes a separate scoreboard per division, so try
+    # them in order of how likely our clients are to be in them.
+    if division is None:
+        for div in DIVISIONS:
+            found = resolve_game(year, home, away, date=date, weeks=weeks, division=div)
+            if found.get("available"):
+                found["division"] = div
+                return found
+        return {"available": False, "ncaa_game_id": "", "confidence": "none",
+                "candidates": [],
+                "note": "no NCAA game matched those teams in any division"}
+
     weeks = weeks or [f"{w:02d}" for w in range(1, 17)]
     best = None
     candidates = []
@@ -248,7 +270,8 @@ def resolve_game(year, home, away, date=None, weeks=None, division="fbs") -> dic
         # The date the client has is ESPN's, in UTC - a 10pm ET kickoff is the
         # NEXT day there. Rather than guess a timezone, drop the constraint and
         # match on names alone; the ± confidence rules still apply.
-        loose = resolve_game(year, home, away, date=None, weeks=weeks, division=division)
+        loose = resolve_game(year, home, away, date=None, weeks=weeks,
+                             division=division)   # same division, no date
         if loose.get("available"):
             loose["note"] = "matched without the date filter"
             return loose
