@@ -1343,6 +1343,143 @@ def _fetch_historical_games(league, year, week, seasontype=2):
 # Play Fetching + Full Mapping Pipeline
 # ============================================================
 
+def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
+    """Rewrite timeout rows to say who they are actually charged to.
+
+    Returns (changed_count, examples, unresolved_count). Never raises: a second
+    source must not be able to break play delivery.
+    """
+    if league != "cfb":
+        return 0, [], 0            # the backup source has no NFL data
+
+    def _is_timeout(e):
+        return (str(e.get("home_time_out")) == "Yes"
+                or str(e.get("away_time_out")) == "Yes"
+                or str(e.get("down", "")).strip().upper() == "OTO")
+
+    rows = [(i, e) for i, e in enumerate(entries) if _is_timeout(e)]
+    if not rows:
+        return 0, [], 0
+
+    labels = {}
+    try:
+        import ncaa_live
+        found = ncaa_live.resolve_game(
+            _season_guess(game_date), home_name, away_name,
+            date=_ncaa_date(game_date) or None)
+        if found.get("available"):
+            for t in ncaa_live.timeouts(found["ncaa_game_id"]).get("timeouts", []):
+                labels[(str(t.get("quarter")), ncaa_live._norm_clock(t.get("clock")))] = t
+    except Exception as e:
+        print(f"WARNING: timeout classify: backup lookup failed "
+              f"({home_name} v {away_name}): {e}", flush=True)
+
+    changed, examples, unresolved = 0, [], 0
+    for i, e in rows:
+        key = (str(e.get("quarter")), _norm_clock_str(e.get("clock")))
+        lab = labels.get(key)
+        if lab is None:
+            # the clock written into the play text beats the clock FIELD when
+            # they disagree - measured on real rows where ESPN's field was wrong
+            m = re.search(r"clock\s+(\d{1,2}:\d{2})", str(e.get("play_text", "")), re.I)
+            if m:
+                lab = labels.get((str(e.get("quarter")), _norm_clock_str(m.group(1))))
+
+        verdict = why = None
+        if lab is not None:
+            ch = lab.get("charged")
+            if ch in ("home", "away"):
+                verdict, why = ch, "backup source"
+            elif ch is None:
+                verdict, why = "officials", "backup source"
+        if verdict is None:
+            ok, reason = _assume_officials(entries, i)
+            if ok:
+                verdict, why = "officials", reason
+        if verdict is None:
+            unresolved += 1
+            continue
+
+        before = (e.get("down"), e.get("home_time_out"), e.get("away_time_out"))
+        if verdict == "officials":
+            e["down"] = "OTO"
+            e["home_time_out"] = e["away_time_out"] = "No"
+        else:
+            if str(e.get("down", "")).strip().upper() == "OTO":
+                e["down"] = ""
+            e["home_time_out"] = "Yes" if verdict == "home" else "No"
+            e["away_time_out"] = "Yes" if verdict == "away" else "No"
+        if (e.get("down"), e.get("home_time_out"), e.get("away_time_out")) != before:
+            changed += 1
+            if len(examples) < 5:
+                examples.append("Q%s %s timeout -> %s (%s)"
+                                % (e.get("quarter"), e.get("clock"), verdict, why))
+    return changed, examples, unresolved
+
+
+def _norm_clock_str(c):
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(c or ""))
+    return "%d:%s" % (int(m.group(1)), m.group(2)) if m else str(c or "").strip()
+
+
+def _ncaa_date(game_date):
+    """ESPN's ISO stamp -> MM/DD/YYYY. The resolver retries without it anyway."""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(game_date or ""))
+    return "%s/%s/%s" % (m.group(2), m.group(3), m.group(1)) if m else ""
+
+
+def _season_guess(game_date):
+    m = re.match(r"(\d{4})", str(game_date or ""))
+    if m:
+        # January bowls belong to the previous season
+        y = int(m.group(1))
+        mm = re.match(r"\d{4}-(\d{2})", str(game_date))
+        return y - 1 if mm and mm.group(1) in ("01", "02") else y
+    import datetime as _dt
+    return _dt.date.today().year
+
+
+_TO_SCORING = re.compile(r"touchdown|field goal.*good|kick attempt good|extra point", re.I)
+_TO_KICKOFF = re.compile(r"\bkickoff\b|\bkicks off\b|\bkicks\b", re.I)
+
+
+def _assume_officials(entries, index):
+    """The measured fallback rules. (True, reason) or (False, "").
+
+    Validated against the backup source's own labels on 201 timeouts across 23
+    games: clock exactly 2:00 -> 26 of 27 right; after a score or kick, outside
+    OT and the last 2:00 of Q4 -> 28 of 29. "Start of quarter (15:00)" was tried
+    and REJECTED: it fired twice and was wrong both times.
+    """
+    e = entries[index]
+    try:
+        q = int(str(e.get("quarter", "0")).strip() or 0)
+    except (TypeError, ValueError):
+        q = 0
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(e.get("clock", "")))
+    cs = int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
+    if _norm_clock_str(e.get("clock")) == "2:00":
+        return True, "two-minute"
+
+    # A trailing team stops the clock right after a score late on - so this rule
+    # must not apply in the last two minutes or in overtime. That exclusion is
+    # what took it from 87% to 97%.
+    if q >= 5 or (q == 4 and cs is not None and cs <= 120):
+        return False, ""
+
+    for j in range(index - 1, -1, -1):
+        txt = str(entries[j].get("play_text", ""))
+        if txt.strip().lower().startswith(("timeout", "officials timeout")):
+            continue
+        if _TO_SCORING.search(txt):
+            return True, "after a score"
+        if _TO_KICKOFF.search(txt):
+            return True, "after a kick"
+        return False, ""
+    return False, ""
+
+
 def _fetch_game_plays_mapped(game_id, league="cfb"):
     url = NFL_SUMMARY_URL if league == "nfl" else CFB_SUMMARY_URL
     r = _session.get(url, params={"event": game_id}, timeout=REQUEST_TIMEOUT)
@@ -1430,12 +1567,32 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
     inserted_gap_count = _fill_scoring_gaps(entries, capp_home, capp_away)
 
+    # Say who each timeout is actually charged to. ESPN publishes a TV timeout
+    # and a team timeout identically, so without this every stoppage is charged
+    # and teams sit at zero by the second quarter.
+    to_changed, to_examples, to_unresolved = 0, [], 0
+    # Kickoff date, used to pin the game in the backup source's scoreboard. It is
+    # ESPN's UTC stamp, so a late kickoff reads as the next day - the resolver
+    # retries on team names alone when the date finds nothing.
+    game_date = ""
+    try:
+        for _c in (data.get("header", {}) or {}).get("competitions", [{}]):
+            game_date = _c.get("date", "") or game_date
+    except Exception:
+        game_date = ""
+    try:
+        to_changed, to_examples, to_unresolved = _classify_timeouts(
+            entries, capp_home, capp_away, league, game_date)
+    except Exception as e:
+        print(f"WARNING: timeout classify failed for {game_id}: {e}", flush=True)
+
     # QC-flag remaining issues — operator sees these as red rows in CAPP
     qc_flags = _qc_flag_entries(entries, capp_home, capp_away)
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
 
-    auto_fixed_examples = list(inferred_pat_fixes) + list(entry_fixes.values())
+    auto_fixed_examples = (list(inferred_pat_fixes) + list(entry_fixes.values())
+                           + list(to_examples))
     qc_examples = [msg for _, msg in list(qc_flags.items())[:5]]
 
     return {
