@@ -3184,7 +3184,10 @@ async def _broadcast_recipients(audience: str) -> list:
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{SUPABASE_URL}/rest/v1/capp_clients",
-            params={"select": "username,email,school,licensed,active,is_admin",
+            # ⚠ NO `school` COLUMN EXISTS on capp_clients. Selecting it made
+            # PostgREST answer 400 and the whole feature find nobody. The
+            # username IS the school handle here (Maryland1, Nebraska1...).
+            params={"select": "username,email,licensed,active,is_admin",
                     "order": "username.asc"},
             headers=_supabase_headers())
     if r.status_code != 200:
@@ -3203,7 +3206,7 @@ async def _broadcast_recipients(audience: str) -> list:
         out.append({
             "username": u.get("username"),
             "email": (u.get("email") or "").strip(),
-            "school": u.get("school") or u.get("username"),
+            "school": u.get("username"),
             "licensed": bool(u.get("licensed")),
         })
     return out
@@ -7527,7 +7530,18 @@ function api(method, path, body) {
     method,
     headers: { "x-admin-token": _token, "Content-Type": "application/json" },
     body: body !== undefined ? JSON.stringify(body) : undefined,
-  }).then(r => r.json());
+  }).then(function (r) {
+    // Every caller here has a .catch that shows the message. Without this
+    // check a failed request resolved as SUCCESS with an error body, so a
+    // 500 read as "No one matches that audience" and a failed send reported
+    // "Sent to undefined school(s)" when no mail had gone out at all.
+    return r.json().catch(function () { return {}; }).then(function (d) {
+      if (!r.ok) {
+        throw new Error((d && (d.detail || d.error)) || (r.status + " " + r.statusText));
+      }
+      return d;
+    });
+  });
 }
 
 function fmtBytes(bytes) {
