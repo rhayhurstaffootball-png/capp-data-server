@@ -32,6 +32,7 @@ from espn_fetcher import (
     is_game_watched,
 )
 import cfbd_live
+import ncaa_live
 from db_updater import run_update
 
 
@@ -936,6 +937,133 @@ def game_clock_repair(game_id: str):
         "available": bool(data.get("available")),
         "note": data.get("note", ""),
         "plays": data.get("plays") or [],
+    }
+
+
+# ── NCAA.com — the second source that LABELS a timeout ───────────────────────
+# ESPN publishes a TV timeout and a team timeout identically (type 21, both with
+# teamParticipants[].timeout = true), and CFBD is derived from the same rows. So
+# SBGEN charged every stoppage and teams sat at zero timeouts by the 2nd quarter.
+# NCAA.com writes it in words - "Timeout Hampton" vs "Timeout Other" - which is
+# the only labelled source we have found that does not need a pasted link.
+#
+# ⚠ VERIFICATION LAYER, NOT A REPLACEMENT. ESPN stays primary. These endpoints
+# return DATA; the coach reviews and applies it in SBENTRY. Nothing here writes
+# to a game, and nothing here is on the hot path of serving plays - if NCAA is
+# down, slow or malformed, normal play delivery is untouched.
+
+@app.get("/ncaa/resolve", dependencies=[Depends(verify_api_key)])
+def ncaa_resolve(
+    year: int = Query(..., description="Season, e.g. 2026"),
+    home: str = Query(..., description="CAPP home team name"),
+    away: str = Query(..., description="CAPP away team name"),
+    date: str = Query("", description="MM/DD/YYYY as NCAA writes it - narrows a rematch"),
+    week: str = Query("", description="Optional zero-padded week to search first"),
+):
+    """CAPP knows a game by ESPN id; NCAA has its own contest ids. Resolve by
+    team names + date. Returns confidence, and candidates when it is unsure -
+    the caller must not act on anything below 'likely'."""
+    try:
+        return ncaa_live.resolve_game(
+            year, home, away,
+            date=date or None,
+            weeks=[week.zfill(2)] if week else None,
+        )
+    except Exception as e:
+        print(f"WARNING: ncaa_resolve failed {home}/{away}: {e}", flush=True)
+        return {"available": False, "ncaa_game_id": "", "confidence": "none",
+                "candidates": [], "note": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/ncaa/game/{ncaa_game_id}/timeouts", dependencies=[Depends(verify_api_key)])
+def ncaa_timeouts(ncaa_game_id: str):
+    """Every timeout in the game, each charged to home/away or marked official.
+
+    'official' covers TV, officials, injury, replay and the two-minute timeout -
+    none of which may be charged against a team, which is all SBGEN needs to
+    know. Verified on Hampton @ Maryland: 14 timeouts, 3 charged, 11 official.
+    """
+    try:
+        return ncaa_live.timeouts(ncaa_game_id)
+    except Exception as e:
+        print(f"WARNING: ncaa_timeouts failed for {ncaa_game_id}: {e}", flush=True)
+        return {"available": False, "timeouts": [], "note": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/ncaa/game/{ncaa_game_id}/plays", dependencies=[Depends(verify_api_key)])
+def ncaa_plays(ncaa_game_id: str):
+    """Flat, ordered NCAA play list - quarter, clock, drive text, both scores.
+
+    ⚠ NCAA carries rows ESPN does not (drive-start markers, 'UMD ball on UMD35',
+    the coin toss), so its list is LONGER: 219 rows against our 182 on the same
+    game. Match on content, never by position - a positional walk drifts and
+    that is exactly how an earlier attempt paired a Q1 4:36 against a 2:58.
+    """
+    try:
+        return ncaa_live.play_by_play(ncaa_game_id)
+    except Exception as e:
+        print(f"WARNING: ncaa_plays failed for {ncaa_game_id}: {e}", flush=True)
+        return {"available": False, "plays": [], "note": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/ncaa/timeouts", dependencies=[Depends(verify_api_key)])
+def ncaa_timeouts_for_game(
+    year: int = Query(...),
+    home: str = Query(...),
+    away: str = Query(...),
+    date: str = Query(""),
+):
+    """Resolve + fetch in one round trip - what SBENTRY actually calls, so the
+    client never has to know an NCAA id exists."""
+    try:
+        found = ncaa_live.resolve_game(year, home, away, date=date or None)
+        if not found.get("available"):
+            return {"available": False, "timeouts": [], "resolve": found,
+                    "note": found.get("note", "could not identify the game on NCAA.com")}
+        out = ncaa_live.timeouts(found["ncaa_game_id"])
+        out["resolve"] = found
+        return out
+    except Exception as e:
+        print(f"WARNING: ncaa_timeouts_for_game failed {home}/{away}: {e}", flush=True)
+        return {"available": False, "timeouts": [], "note": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/ncaa/plays", dependencies=[Depends(verify_api_key)])
+def ncaa_plays_for_game(
+    year: int = Query(...),
+    home: str = Query(...),
+    away: str = Query(...),
+    date: str = Query(""),
+):
+    """Resolve + fetch the play list in one round trip (the Fix Clocks path)."""
+    try:
+        found = ncaa_live.resolve_game(year, home, away, date=date or None)
+        if not found.get("available"):
+            return {"available": False, "plays": [], "resolve": found,
+                    "note": found.get("note", "could not identify the game on NCAA.com")}
+        out = ncaa_live.play_by_play(found["ncaa_game_id"])
+        out["resolve"] = found
+        return out
+    except Exception as e:
+        print(f"WARNING: ncaa_plays_for_game failed {home}/{away}: {e}", flush=True)
+        return {"available": False, "plays": [], "note": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/ncaa/health", dependencies=[Depends(verify_api_key)])
+def ncaa_health():
+    """Is the NCAA source reachable, and are we on our own service or the demo?
+
+    The public host is rate limited (5 req/s per IP, shared by every school
+    through this backend) and is described by its author as a demo. Answer
+    honestly so the admin panel can show which one is in use.
+    """
+    sb = ncaa_live.scoreboard(2026, "01")
+    return {
+        "base": ncaa_live.NCAA_BASE,
+        "self_hosted": not ncaa_live.using_public_host(),
+        "key_configured": bool(ncaa_live._api_key()),
+        "reachable": bool(sb.get("available")),
+        "games_in_sample": len(sb.get("games", [])),
     }
 
 
