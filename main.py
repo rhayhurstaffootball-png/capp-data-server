@@ -3471,22 +3471,32 @@ async def broadcast_send(payload: dict = Body(...)):
         "active": True,
         "sent_at": _dtmod.datetime.now(_dtmod.timezone.utc).isoformat() if send_email else None,
         "sent_count": sent, "failed_count": failed,
-        "recipients": delivered,
+        # \u26a0 capp_broadcasts has NO `attachments` column. What was attached
+        # rides inside the existing `recipients` jsonb as a leading entry -
+        # names and sizes only, never the bytes, which would bloat every read
+        # of the broadcast list.
+        "recipients": ([{"attachments": [{"filename": a["filename"],
+                                          "bytes": len(a["bytes"])}
+                                         for a in attachments]}] + delivered
+                       if attachments else delivered),
         "notice_id": notice_id,
-        # Names and sizes only. Putting the file bytes in the history row would
-        # bloat every read of the broadcast list for no benefit.
-        "attachments": [{"filename": a["filename"], "bytes": len(a["bytes"])}
-                        for a in attachments] or None,
     }
     async with httpx.AsyncClient() as c:
         w = await c.post(f"{SUPABASE_URL}/rest/v1/capp_broadcasts",
                          json=row,
                          headers={**_supa_headers_json(), "Prefer": "return=representation"})
     if w.status_code not in (200, 201):
-        # The mail is already gone; say so rather than implying nothing happened.
-        raise HTTPException(
-            status_code=500,
-            detail=f"Sent to {sent} school(s), but the record could not be saved: {w.text[:200]}")
+        # \u26a0 THE MAIL HAS ALREADY GONE. Raising here made the panel report
+        # "Send failed" for a send that reached every school - the worst kind of
+        # wrong message, because the natural response is to send it again.
+        # The record is bookkeeping; the send is the irreversible part.
+        print(f"WARNING: broadcast sent to {sent} but history not saved: "
+              f"{w.text[:300]}", flush=True)
+        return {"ok": True, "sent": sent, "failed": failed,
+                "recipients": delivered, "id": None,
+                "warning": ("The emails were sent. The history record could not "
+                            "be saved, so this blast will not appear in the list "
+                            "below.")}
 
     return {"ok": True, "sent": sent, "failed": failed,
             "recipients": delivered, "id": (w.json() or [{}])[0].get("id")}
@@ -7492,6 +7502,7 @@ function sendBlast() {
       confirm_count: _bcPreviewCount })
     .then(d => {
       let out = "<b>Sent to " + d.sent + " school(s).</b>";
+      if (d.warning) { out += ' <span style="color:#e0a53b;">' + pbEsc(d.warning) + "</span>"; }
       if (d.failed) {
         const bad = (d.recipients || []).filter(r => !r.ok)
           .map(r => pbEsc(r.username)).join(", ");
