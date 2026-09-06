@@ -114,3 +114,63 @@ def live_play_count(game_id) -> dict:
     with _lock:
         _cache[gid] = (now, dict(out))
     return out
+
+
+def _fmt_clock(c) -> str:
+    """CFBD clocks arrive as {"minutes":m,"seconds":s} (and occasionally as a
+    plain string). Normalise to ESPN's own shape — "0:31", "13:24", no leading
+    zero on the minute — so a repaired cell is byte-identical in form to every
+    other clock in the tree."""
+    if isinstance(c, dict):
+        return "%d:%02d" % (int(c.get("minutes") or 0), int(c.get("seconds") or 0))
+    return str(c or "").strip()
+
+
+def live_play_clocks(game_id) -> dict:
+    """Every CFBD play for this game, as the second source's clock per play.
+
+    Feeds the SBENTRY "Fix Clock" repair: when a venue's stat crew never
+    advances the game clock, ESPN stamps a whole run of plays with one time.
+    CFBD is a separate transcription and frequently splits that run correctly
+    (measured Sep 5 2026, Hampton @ Maryland: ESPN had 10 straight plays at
+    0:31 where CFBD had two distinct stoppages).
+
+    ⚠ The CALLER matches these to tree rows by play TEXT and must ignore any
+    text that is not unique on BOTH sides. Duplicate play text mis-pairs, and a
+    mis-pair writes a confidently wrong clock — that produced apparent 800+
+    second discrepancies during the investigation that were pure artefact.
+
+    ⚠ NOT a bulk fixer. Healthy games disagree with CFBD on most rows by ~7s
+    (BYU and Middle Tennessee, same night: median 7s, max 10s) because the two
+    feeds time a play at slightly different moments. Only rows the coach has
+    actually selected should ever be rewritten.
+
+    Never raises. Returns {"available", "plays": [...], "note"}.
+    """
+    gid = str(game_id or "").strip()
+    if not gid:
+        return {"available": False, "plays": [], "note": "no game id"}
+    if not available():
+        return {"available": False, "plays": [], "note": "CFBD_API_KEY not set"}
+
+    status, body = _call(f"/live/plays?gameId={gid}")
+    if status == 200 and isinstance(body, dict):
+        out = []
+        for drive in (body.get("drives") or []):
+            for p in (drive.get("plays") or []):
+                out.append({
+                    "text": (p.get("playText") or "").strip(),
+                    "clock": _fmt_clock(p.get("clock")),
+                    "period": p.get("period"),
+                    "down": p.get("down"),
+                    "distance": p.get("distance"),
+                })
+        return {"available": True, "plays": out, "note": ""}
+
+    if status == 400 and isinstance(body, dict):
+        # "No plays found for game." — an answer, not a failure.
+        return {"available": True, "plays": [],
+                "note": str(body.get("message") or "no plays")}
+
+    return {"available": False, "plays": [],
+            "note": f"CFBD unreachable (HTTP {status})"}

@@ -897,6 +897,48 @@ def game_feed_health(game_id: str, league: str = Query("cfb", description="cfb o
         out["message"] = "This game has not been polled yet."
     return out
 
+
+@app.get("/game/{game_id}/clock-repair", dependencies=[Depends(verify_api_key)])
+def game_clock_repair(game_id: str):
+    """Second-source clock per play, for SBENTRY's "Fix Clock" repair.
+
+    WHY THIS EXISTS: when a venue's stat crew stops advancing the game clock,
+    ESPN stamps a whole run of plays with one time and SBGEN then renders that
+    time onto every board in the run. Measured Sep 5 2026 on Hampton @ Maryland:
+    ten consecutive plays at Q2 0:31 — completions, two incompletions, a false
+    start and a timeout, which cannot all share a timestamp. CFBD is a separate
+    transcription and had that run split across two real stoppages.
+
+    ⚠ DELIBERATELY RETURNS DATA, NOT A FIX. The client shows the coach old→new
+    for the rows THEY selected and writes nothing on its own. Two reasons that
+    is not timidity:
+      1. Healthy games disagree on most rows by ~7s (BYU, Middle Tennessee,
+         same night: median 7s, max 10s) — the feeds simply time a play at
+         slightly different moments. A bulk apply would churn good data.
+      2. Rows are matched by play TEXT, and duplicate text mis-pairs. During
+         the investigation that artefact alone produced apparent 800-second
+         discrepancies. The client drops any text that is not unique on BOTH
+         sides rather than guess.
+
+    ⚠ Needs CFBD_API_KEY on Render. Without it this answers available=false and
+    the client tells the coach the backup source is not configured — it never
+    presents an empty result as "no corrections available".
+
+    Never raises: CFBD is a convenience here, not a dependency.
+    """
+    try:
+        data = cfbd_live.live_play_clocks(game_id)
+    except Exception as e:                      # cfbd_live is already defensive
+        print(f"WARNING: clock-repair: cfbd_live raised for {game_id}: {e}", flush=True)
+        data = {"available": False, "plays": [], "note": "backup source error"}
+    return {
+        "game_id": game_id,
+        "available": bool(data.get("available")),
+        "note": data.get("note", ""),
+        "plays": data.get("plays") or [],
+    }
+
+
 @app.get("/game/{game_id}/version", dependencies=[Depends(verify_api_key)])
 def game_version(game_id: str):
     """Lightweight endpoint — returns only the fetched_at timestamp for the
