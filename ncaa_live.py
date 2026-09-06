@@ -244,6 +244,14 @@ def resolve_game(year, home, away, date=None, weeks=None, division="fbs") -> dic
         if best and best["score"] == 4:
             break            # both names exact - no later week can beat it
 
+    if not best and date:
+        # The date the client has is ESPN's, in UTC - a 10pm ET kickoff is the
+        # NEXT day there. Rather than guess a timezone, drop the constraint and
+        # match on names alone; the ± confidence rules still apply.
+        loose = resolve_game(year, home, away, date=None, weeks=weeks, division=division)
+        if loose.get("available"):
+            loose["note"] = "matched without the date filter"
+            return loose
     if not best:
         return {"available": False, "ncaa_game_id": "", "confidence": "none",
                 "candidates": [], "note": "no NCAA game matched those teams"}
