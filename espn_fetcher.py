@@ -1350,7 +1350,7 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
     source must not be able to break play delivery.
     """
     if league != "cfb":
-        return 0, [], 0            # the backup source has no NFL data
+        return 0, [], []           # the backup source has no NFL data
 
     def _is_timeout(e):
         return (str(e.get("home_time_out")) == "Yes"
@@ -1359,7 +1359,7 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
 
     rows = [(i, e) for i, e in enumerate(entries) if _is_timeout(e)]
     if not rows:
-        return 0, [], 0
+        return 0, [], []
 
     labels = {}
     try:
@@ -1374,7 +1374,7 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
         print(f"WARNING: timeout classify: backup lookup failed "
               f"({home_name} v {away_name}): {e}", flush=True)
 
-    changed, examples, unresolved = 0, [], 0
+    changed, examples, unresolved = 0, [], []
     for i, e in rows:
         key = (str(e.get("quarter")), _norm_clock_str(e.get("clock")))
         lab = labels.get(key)
@@ -1397,10 +1397,11 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
             if ok:
                 verdict, why = "officials", reason
         if verdict is None:
-            unresolved += 1
+            unresolved.append(i)
             continue
 
-        before = (e.get("down"), e.get("home_time_out"), e.get("away_time_out"))
+        before = (e.get("down"), e.get("home_time_out"), e.get("away_time_out"),
+                  e.get("play_text"))
         if verdict == "officials":
             e["down"] = "OTO"
             e["home_time_out"] = e["away_time_out"] = "No"
@@ -1409,12 +1410,36 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
                 e["down"] = ""
             e["home_time_out"] = "Yes" if verdict == "home" else "No"
             e["away_time_out"] = "Yes" if verdict == "away" else "No"
-        if (e.get("down"), e.get("home_time_out"), e.get("away_time_out")) != before:
+        # The text has to agree with the columns. A row reading "Timeout BYU"
+        # beside No/No looks broken to a coach, and play_text is a renderable
+        # scoreboard element, so the wrong wording can reach a board too.
+        e["play_text"] = _timeout_line(
+            verdict, home_name if verdict == "home" else away_name,
+            e.get("clock"), e.get("play_text"))
+        if (e.get("down"), e.get("home_time_out"), e.get("away_time_out"),
+                e.get("play_text")) != before:
             changed += 1
             if len(examples) < 5:
                 examples.append("Q%s %s timeout -> %s (%s)"
                                 % (e.get("quarter"), e.get("clock"), verdict, why))
     return changed, examples, unresolved
+
+
+def _timeout_line(verdict, team_name, clock, existing):
+    """What a timeout row should read once classified.
+
+    Only rewrites a line that ALREADY reads as a timeout, so an unrelated play
+    can never be overwritten, and keeps the feed's own shape
+    "Timeout <who>, clock MM:SS" so nothing downstream sees a new format.
+    """
+    existing = str(existing or "")
+    if not re.match(r"^\s*(officials\s+)?timeout\b", existing, re.I):
+        return existing
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(clock or ""))
+    tail = ", clock %02d:%s" % (int(m.group(1)), m.group(2)) if m else ""
+    if verdict == "officials":
+        return "Officials Timeout" + tail
+    return "Timeout %s%s" % (team_name, tail)
 
 
 def _norm_clock_str(c):
@@ -1570,7 +1595,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     # Say who each timeout is actually charged to. ESPN publishes a TV timeout
     # and a team timeout identically, so without this every stoppage is charged
     # and teams sit at zero by the second quarter.
-    to_changed, to_examples, to_unresolved = 0, [], 0
+    to_changed, to_examples, to_unresolved = 0, [], []
     # Kickoff date, used to pin the game in the backup source's scoreboard. It is
     # ESPN's UTC stamp, so a late kickoff reads as the next day - the resolver
     # retries on team names alone when the date finds nothing.
@@ -1588,6 +1613,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
 
     # QC-flag remaining issues — operator sees these as red rows in CAPP
     qc_flags = _qc_flag_entries(entries, capp_home, capp_away)
+    # A timeout no rule could settle is exactly the row worth a human look, so
+    # say so rather than leaving it indistinguishable from a confident one.
+    for _i in to_unresolved:
+        qc_flags.setdefault(_i, "Timeout not verified - check who it is charged to")
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
 
