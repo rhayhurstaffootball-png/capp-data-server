@@ -3241,11 +3241,65 @@ def _broadcast_email_html(school: str, subject: str, body: str) -> str:
     """
 
 
-def _send_broadcast_email(to_email: str, school: str, subject: str, body: str) -> None:
+# Email attachment limits. Most mail providers reject a message over ~25 MB and
+# base64 inflates by a third, so cap the decoded total well under that. The cap
+# is per MESSAGE, and every recipient gets their own copy of it.
+_ATTACH_MAX_TOTAL = 10 * 1024 * 1024
+_ATTACH_MAX_COUNT = 5
+
+
+def _decode_attachments(raw) -> list:
+    """[{filename, content_type, data_b64}] -> [{filename, content_type, bytes}].
+
+    Raises HTTPException with a message an admin can act on. Decoding happens
+    here, once, rather than inside the per-recipient send loop.
+    """
+    import base64
+    import re as _re
+
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="Attachments must be a list.")
+    if len(raw) > _ATTACH_MAX_COUNT:
+        raise HTTPException(status_code=400,
+                            detail=f"At most {_ATTACH_MAX_COUNT} attachments per message.")
+    out, total = [], 0
+    for item in raw:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Bad attachment entry.")
+        # Strip any directory part: the filename comes from a browser and is
+        # echoed into a mail header, so it must not carry a path or newline.
+        name = _re.sub(r'[\r\n]', '', str(item.get("filename", "")).strip())
+        name = name.replace("\\", "/").split("/")[-1] or "attachment"
+        try:
+            blob = base64.b64decode(str(item.get("data_b64", "")), validate=True)
+        except Exception:
+            raise HTTPException(status_code=400,
+                                detail=f"Could not read the attachment '{name}'.")
+        if not blob:
+            raise HTTPException(status_code=400, detail=f"'{name}' is empty.")
+        total += len(blob)
+        if total > _ATTACH_MAX_TOTAL:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Attachments total {total // 1024} KB, over the "
+                        f"{_ATTACH_MAX_TOTAL // (1024 * 1024)} MB limit for one message."))
+        out.append({"filename": name,
+                    "content_type": str(item.get("content_type") or
+                                        "application/octet-stream"),
+                    "bytes": blob})
+    return out
+
+
+def _send_broadcast_email(to_email: str, school: str, subject: str, body: str,
+                          attachments: list = None) -> None:
     """One message. Raises on failure so the caller can count it."""
     import smtplib
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders as _encoders
 
     smtp_host = os.environ.get("SMTP_HOST", "")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
@@ -3255,13 +3309,26 @@ def _send_broadcast_email(to_email: str, school: str, subject: str, body: str) -
     if not smtp_host or not smtp_user or not smtp_pass:
         raise RuntimeError("SMTP is not configured on the server.")
 
-    msg = MIMEMultipart("alternative")
+    # "mixed" once there are files to carry; "alternative" is only correct for a
+    # body that exists in more than one format, and a PDF is not another format
+    # of the message.
+    msg = MIMEMultipart("mixed" if attachments else "alternative")
     msg["Subject"] = subject
     msg["From"] = f"CAPP Video Coordinator Suite <{from_addr}>"
     msg["To"] = to_email
     # Sent individually rather than as one BCC blast: each school sees only its
     # own address, and one bad address cannot take down the whole send.
     msg.attach(MIMEText(_broadcast_email_html(school, subject, body), "html"))
+
+    for att in attachments or []:
+        main_type, _, sub_type = (att.get("content_type") or
+                                  "application/octet-stream").partition("/")
+        part = MIMEBase(main_type or "application", sub_type or "octet-stream")
+        part.set_payload(att["bytes"])
+        _encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment",
+                        filename=att["filename"])
+        msg.attach(part)
 
     with smtplib.SMTP(smtp_host, smtp_port) as srv:
         srv.starttls()
@@ -3307,7 +3374,8 @@ async def broadcast_test(payload: dict = Body(...)):
     if not subject or not body:
         raise HTTPException(status_code=400, detail="Subject and message are both required.")
     try:
-        await run_in_threadpool(_send_broadcast_email, to, "Test", subject, body)
+        atts = _decode_attachments(payload.get("attachments"))
+        await run_in_threadpool(_send_broadcast_email, to, "Test", subject, body, atts)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not send: {exc}")
     return {"ok": True, "sent_to": to}
@@ -3332,6 +3400,11 @@ async def broadcast_send(payload: dict = Body(...)):
 
     if not subject or not body:
         raise HTTPException(status_code=400, detail="Subject and message are both required.")
+
+    # Decoded ONCE here, not per recipient - a 20-school blast would otherwise
+    # decode the same PDF twenty times. Also means a bad attachment is rejected
+    # before a single message goes out.
+    attachments = _decode_attachments(payload.get("attachments"))
 
     people = await _broadcast_recipients(audience)
     if confirm_count is not None and int(confirm_count) != len(people):
@@ -3370,7 +3443,8 @@ async def broadcast_send(payload: dict = Body(...)):
         for person in people:
             try:
                 await run_in_threadpool(_send_broadcast_email, person["email"],
-                                        person["school"], subject, body)
+                                        person["school"], subject, body,
+                                        attachments)
                 sent += 1
                 delivered.append({"username": person["username"],
                                   "email": person["email"], "ok": True})
@@ -3390,6 +3464,10 @@ async def broadcast_send(payload: dict = Body(...)):
         "sent_count": sent, "failed_count": failed,
         "recipients": delivered,
         "notice_id": notice_id,
+        # Names and sizes only. Putting the file bytes in the history row would
+        # bloat every read of the broadcast list for no benefit.
+        "attachments": [{"filename": a["filename"], "bytes": len(a["bytes"])}
+                        for a in attachments] or None,
     }
     async with httpx.AsyncClient() as c:
         w = await c.post(f"{SUPABASE_URL}/rest/v1/capp_broadcasts",
@@ -6838,6 +6916,17 @@ _ADMIN_HTML = """<!DOCTYPE html>
             <button class="btn" onclick="testBlast()">Send test to me</button>
             <button class="btn btn-warning" onclick="sendBlast()">Send email now</button>
           </div>
+          <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <input type="file" id="bc-files" multiple onchange="bcFilesPicked()"
+                   style="max-width:420px;"/>
+            <button class="btn" onclick="bcClearFiles()">Clear files</button>
+          </div>
+          <div id="bc-files-info" class="small" style="margin-top:6px;"></div>
+          <p class="small" style="margin-top:6px;">
+            Attachments go out with the email only - an in-app notice cannot carry a file.
+            Up to 5 files, 10 MB total per message. Send yourself a test first: the
+            attachment goes with it.
+          </p>
           <div id="bc-preview" class="small" style="margin-top:12px;"></div>
           <div id="bc-msg" class="small" style="margin-top:8px;"></div>
         </div>
@@ -7286,6 +7375,72 @@ function previewBlast() {
     .catch(e => { box.innerHTML = "Could not load recipients: " + e; });
 }
 
+// Attachments are read once when picked, not on every send: a send should not
+// sit waiting on a file read, and the same bytes go to the test and the blast.
+let _bcAttachments = [];
+
+function bcFmtSize(n) {
+  return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB"
+                      : Math.max(1, Math.round(n / 1024)) + " KB";
+}
+
+function bcClearFiles() {
+  _bcAttachments = [];
+  const el = document.getElementById("bc-files");
+  if (el) el.value = "";
+  document.getElementById("bc-files-info").innerHTML = "";
+}
+
+function bcFilesPicked() {
+  const input = document.getElementById("bc-files");
+  const info  = document.getElementById("bc-files-info");
+  const files = Array.prototype.slice.call(input.files || []);
+  _bcAttachments = [];
+  if (!files.length) { info.innerHTML = ""; return; }
+  if (files.length > 5) {
+    info.innerHTML = '<span style="color:#f08a7e;">At most 5 files.</span>';
+    input.value = ""; return;
+  }
+  info.textContent = "Reading " + files.length + " file(s)...";
+  let total = 0;
+  const reads = files.map(function (f) {
+    total += f.size;
+    return new Promise(function (resolve, reject) {
+      const r = new FileReader();
+      r.onload = function () {
+        // readAsDataURL gives "data:<type>;base64,<payload>" - keep the payload.
+        const comma = String(r.result).indexOf(",");
+        resolve({ filename: f.name,
+                  content_type: f.type || "application/octet-stream",
+                  data_b64: String(r.result).slice(comma + 1),
+                  size: f.size });
+      };
+      r.onerror = function () { reject(f.name); };
+      r.readAsDataURL(f);
+    });
+  });
+  if (total > 10485760) {
+    info.innerHTML = '<span style="color:#f08a7e;">' + bcFmtSize(total) +
+                     " total - the limit is 10 MB for one message.</span>";
+    input.value = ""; _bcAttachments = []; return;
+  }
+  Promise.all(reads).then(function (list) {
+    _bcAttachments = list;
+    info.innerHTML = "<b>Attaching:</b> " + list.map(function (a) {
+      return pbEsc(a.filename) + " (" + bcFmtSize(a.size) + ")";
+    }).join(", ");
+  }).catch(function (name) {
+    _bcAttachments = [];
+    info.innerHTML = '<span style="color:#f08a7e;">Could not read ' + pbEsc(name) + '.</span>';
+  });
+}
+
+function bcAttachPayload() {
+  return _bcAttachments.map(function (a) {
+    return { filename: a.filename, content_type: a.content_type, data_b64: a.data_b64 };
+  });
+}
+
 function testBlast() {
   const title = document.getElementById("ntc-title").value.trim();
   const body  = document.getElementById("ntc-body").value.trim();
@@ -7294,7 +7449,8 @@ function testBlast() {
   const to = prompt("Send a test copy to which address?", "roger@cappvcs.com");
   if (!to) return;
   msg.textContent = "Sending test...";
-  api("POST", "/broadcast/test", { to: to, subject: title, body: body })
+  api("POST", "/broadcast/test", { to: to, subject: title, body: body,
+                                   attachments: bcAttachPayload() })
     .then(d => { msg.innerHTML = "<b>Test sent to " + pbEsc(d.sent_to) + ".</b> Check it before sending for real."; })
     .catch(e => { msg.textContent = "Test failed: " + e; });
 }
@@ -7311,7 +7467,11 @@ function sendBlast() {
   }
   // Single quotes and no escapes: this JS lives inside a Python string, so an
   // escaped double quote silently loses a level and breaks the whole script.
-  if (!confirm('Email: ' + title + ' -- send to ' + _bcPreviewCount +
+  const attNote = _bcAttachments.length
+    ? ' with ' + _bcAttachments.length + ' attachment(s): ' +
+      _bcAttachments.map(function (a) { return a.filename; }).join(', ')
+    : '';
+  if (!confirm('Email: ' + title + attNote + ' -- send to ' + _bcPreviewCount +
                ' school(s)? This cannot be undone.')) return;
   msg.textContent = "Sending to " + _bcPreviewCount + " school(s)...";
   // confirm_count makes the server refuse if the recipient list changed since
@@ -7319,6 +7479,7 @@ function sendBlast() {
   api("POST", "/broadcast/send", {
       subject: title, body: body, audience: aud,
       send_email: true, show_in_app: false,
+      attachments: bcAttachPayload(),
       confirm_count: _bcPreviewCount })
     .then(d => {
       let out = "<b>Sent to " + d.sent + " school(s).</b>";
