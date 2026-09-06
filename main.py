@@ -1019,7 +1019,7 @@ def ncaa_timeouts_for_game(
         found = ncaa_live.resolve_game(year, home, away, date=date or None)
         if not found.get("available"):
             return {"available": False, "timeouts": [], "resolve": found,
-                    "note": found.get("note", "could not identify the game on NCAA.com")}
+                    "note": found.get("note", "could not identify this game in the backup source")}
         out = ncaa_live.timeouts(found["ncaa_game_id"])
         out["resolve"] = found
         return out
@@ -1040,7 +1040,7 @@ def ncaa_plays_for_game(
         found = ncaa_live.resolve_game(year, home, away, date=date or None)
         if not found.get("available"):
             return {"available": False, "plays": [], "resolve": found,
-                    "note": found.get("note", "could not identify the game on NCAA.com")}
+                    "note": found.get("note", "could not identify this game in the backup source")}
         out = ncaa_live.play_by_play(found["ncaa_game_id"])
         out["resolve"] = found
         return out
@@ -1058,8 +1058,11 @@ def ncaa_health():
     honestly so the admin panel can show which one is in use.
     """
     sb = ncaa_live.scoreboard(2026, "01")
+    # ⚠ The hostname is deliberately NOT returned. Every school holds an API
+    # key, so anything this answers is effectively public to our own clients, and
+    # naming the upstream vendor is exactly what the no-vendor rule exists to
+    # prevent. self_hosted/reachable answer the operational question without it.
     return {
-        "base": ncaa_live.NCAA_BASE,
         "self_hosted": not ncaa_live.using_public_host(),
         "key_configured": bool(ncaa_live._api_key()),
         "reachable": bool(sb.get("available")),

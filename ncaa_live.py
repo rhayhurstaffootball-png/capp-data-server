@@ -190,7 +190,7 @@ def scoreboard(year, week, division="fbs", conf="all-conf") -> dict:
     path = f"/scoreboard/football/{division}/{year}/{wk}/{conf}"
     status, body = _call(path, ttl=_SCOREBOARD_CACHE_SECONDS)
     if status != 200 or not isinstance(body, dict):
-        return {"available": False, "games": [], "note": f"scoreboard HTTP {status}"}
+        return {"available": False, "games": [], "note": f"backup source HTTP {status}"}
     games = []
     for item in body.get("games", []):
         g = item.get("game", item)
@@ -240,7 +240,7 @@ def resolve_game(year, home, away, date=None, weeks=None, division=None) -> dict
                 return found
         return {"available": False, "ncaa_game_id": "", "confidence": "none",
                 "candidates": [],
-                "note": "no NCAA game matched those teams in any division"}
+                "note": "no matching game in the backup source"}
 
     weeks = weeks or [f"{w:02d}" for w in range(1, 17)]
     best = None
@@ -277,7 +277,7 @@ def resolve_game(year, home, away, date=None, weeks=None, division=None) -> dict
             return loose
     if not best:
         return {"available": False, "ncaa_game_id": "", "confidence": "none",
-                "candidates": [], "note": "no NCAA game matched those teams"}
+                "candidates": [], "note": "no matching game in the backup source"}
     confidence = "exact" if best["score"] == 4 else ("likely" if best["score"] == 3 else "weak")
     return {
         "available": confidence in ("exact", "likely"),
@@ -301,7 +301,7 @@ def play_by_play(ncaa_game_id) -> dict:
     status, body = _call(f"/game/{ncaa_game_id}/play-by-play")
     if status != 200 or not isinstance(body, dict):
         return {"available": False, "plays": [], "teams": {},
-                "note": f"play-by-play HTTP {status}"}
+                "note": f"backup source HTTP {status}"}
 
     teams = {}
     for t in body.get("teams", []):
@@ -338,7 +338,7 @@ def play_by_play(ncaa_game_id) -> dict:
         "period": body.get("period"),
         "teams": teams,
         "plays": plays,
-        "note": "public demo host" if using_public_host() else "",
+        "note": "shared host" if using_public_host() else "",
     }
 
 
