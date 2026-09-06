@@ -3217,6 +3217,12 @@ def _broadcast_email_html(school: str, subject: str, body: str) -> str:
     Same visual language as the registration and reset emails, so a blast looks
     like it came from CAPP rather than from a mailing tool.
 
+    NO GREETING AND NO NAME IN THE FOOTER. Roger, Sep 6 2026: addressing people
+    he knows personally as "Maryland" reads wrong, and the account handle
+    ("Maryland1") reads like a database row. Each school gets its own copy, so
+    naming the recipient inside it adds nothing. `school` is still taken so the
+    send log can record who each copy went to.
+
     The body is plain text from the compose box, escaped and turned into
     paragraphs - never raw HTML. A stray angle bracket in a message must not be
     able to break the email, and nothing typed in that box should be executable.
@@ -3235,7 +3241,7 @@ def _broadcast_email_html(school: str, subject: str, body: str) -> str:
         <h2 style="color:#e8edf5;font-size:1.2rem;font-weight:700;margin:0 0 18px;">{_html.escape(subject)}</h2>
         {paras}
         <p style="color:#6d7a8c;font-size:0.8rem;margin:26px 0 0;padding-top:16px;border-top:1px solid rgba(255,255,255,0.07);">
-          Sent to {_html.escape(school)} &middot; CAPP Video Coordinator Suite<br/>
+          CAPP Video Coordinator Suite<br/>
           Questions? Reply to this email or contact
           <a href="mailto:roger@cappvcs.com" style="color:#3a7ebf;">roger@cappvcs.com</a>.
         </p>
