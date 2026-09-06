@@ -1080,6 +1080,14 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
 
     is_timeout    = type_text_lower == "timeout" or type_id == 21
     is_punt       = "punt" in type_text_lower
+    # A turnover ends the offense's play; anything the defence does afterwards is
+    # a RETURN, not a gain. ESPN is inconsistent about this - statYardage carries
+    # the return yardage on some interceptions and 0 on others - so the column
+    # disagreed with itself game to game.
+    is_interception = ("interception" in type_text_lower
+                       or "intercepted" in description.lower())
+    is_defensive_return = ("fumble return" in type_text_lower
+                           or "fumble recovery" in type_text_lower)
     is_field_goal = "field goal" in type_text_lower
     is_extra_point = "extra point" in type_text_lower or "pat" in type_text_lower
     is_two_point  = "two-point" in type_text_lower or "two point" in type_text_lower or "2pt" in type_text_lower
@@ -1109,6 +1117,15 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         down = str(start_down) if start_down else "1"
         distance = start_distance if start_distance else 10
         gain = stat_yardage
+
+    # GAIN IS AN OFFENSIVE NUMBER. On a turnover the offense gained nothing, no
+    # matter how far the ball is carried back. Applied after the branches above
+    # so it covers whichever one the play fell into.
+    # NOTE: a rush or completion that ends in a fumble keeps its yardage - those
+    # yards were really gained before the ball was lost - so only interceptions
+    # and plays ESPN itself types as a defensive return are zeroed here.
+    if is_interception or is_defensive_return:
+        gain = 0
 
     run_clock = "No"
     if is_rush and not scoring and not is_kickoff:
