@@ -4743,6 +4743,14 @@ PB_WORKER_TOKEN = os.environ.get("PB_WORKER_TOKEN", "")
 _PB_CONVERT_EXTS = ("vsd", "vsdx", "vsdm", "ppt", "pptx", "doc", "docx", "docm",
                     "xls", "xlsx", "xlsm", "xlsb")
 
+# ⚠ IMAGES ARE NOT IN _PB_CONVERT_EXTS ON PURPOSE — they never touch a worker.
+# A photo needs no Office, so it takes the same server-side road a PDF takes
+# (_pb_pdf_inline + PyMuPDF): live in seconds, works for a coach whose converter
+# is switched off or was never installed, and needs no converter rebuild or
+# re-pair to roll out. Adding them to _PB_CONVERT_EXTS would send every photo to
+# a coach's PC to be handled by COM code that cannot open one.
+_PB_IMAGE_EXTS = ("jpg", "jpeg", "png")
+
 
 def _vtuple_pb(v: str) -> tuple:
     """Version compare for converter builds. NUMERIC, not lexical, so 1.10.0
@@ -5636,12 +5644,16 @@ async def coach_pb_sign_upload(payload: dict = Body(...), _u: dict = Depends(_re
     ext = (payload.get("ext") or "").lower().lstrip(".")
     if ext == "pdf":
         key = f"{team_id}/pdfs/{_uuid.uuid4().hex}.pdf"
-    elif ext in _PB_CONVERT_EXTS:
+    elif ext in _PB_CONVERT_EXTS or ext in _PB_IMAGE_EXTS:
+        # Both are SOURCE files that become a PDF, so both land in raw/ - the
+        # difference is only who does the work (a coach's PC for Office, this
+        # server for an image), which is decided at job-creation time.
         key = f"{team_id}/raw/{_uuid.uuid4().hex}.{ext}"
     else:
-        raise HTTPException(status_code=400, detail="Only PDF, Word, Excel, PowerPoint, or Visio files.")
+        raise HTTPException(status_code=400,
+                            detail="Only PDF, Word, Excel, PowerPoint, Visio, JPEG, or PNG files.")
     return {"key": key, "put_url": _r2_presign("PUT", key, expires=900),
-            "kind": "pdf" if ext == "pdf" else "convert"}
+            "kind": "pdf" if ext == "pdf" else ("image" if ext in _PB_IMAGE_EXTS else "convert")}
 
 
 @app.post("/coach/playbook/docs")
@@ -5843,6 +5855,61 @@ def _pdf_page_count(data: bytes) -> int:
         book.close()
 
 
+# US Letter, in points. The playbook is a mix of page sizes already (Excel
+# exports land at 22x17 landscape), so this is not an attempt to make everything
+# uniform - only to stop a photo being wildly out of family.
+_LETTER_W, _LETTER_H = 612.0, 792.0
+
+
+def _image_to_pdf(data: bytes, ext: str) -> bytes:
+    """One image -> a one-page PDF, fitted onto a Letter page.
+
+    ⚠ WHY NOT JUST convert_to_pdf(): PyMuPDF's own image->PDF makes the page the
+    IMAGE'S PIXEL SIZE. Measured on a real file: a 450x130 PNG becomes a 450x130
+    pt page. Dropped into a playbook that way, a phone photo is a vast page of a
+    shape nothing else shares, and the page-number pill - which is placed
+    relative to the page, at height-24 - lands somewhere meaningless.
+
+    So the image is placed ONTO a normal page instead: orientation follows the
+    photo (a sideline shot stays landscape), aspect ratio is preserved, and the
+    bottom margin is deliberately deeper than the others to leave the number
+    room to sit under the picture rather than on top of it.
+    """
+    import fitz
+    kind = "jpg" if ext in ("jpg", "jpeg") else ext
+    src = fitz.open(stream=data, filetype=kind)
+    try:
+        # Route through the image's own PDF form so the original bytes are
+        # placed, not re-encoded: show_pdf_page copies the image across.
+        one = fitz.open("pdf", src.convert_to_pdf())
+    finally:
+        src.close()
+    try:
+        r = one[0].rect
+        iw, ih = float(r.width), float(r.height)
+        if iw <= 0 or ih <= 0:
+            raise RuntimeError("the image has no usable size")
+
+        landscape = iw > ih
+        pw, ph = (_LETTER_H, _LETTER_W) if landscape else (_LETTER_W, _LETTER_H)
+        m, bottom = 36.0, 48.0          # deeper bottom margin = room for "1..N"
+        avail_w, avail_h = pw - 2 * m, ph - m - bottom
+        s = min(avail_w / iw, avail_h / ih)
+        w, h = iw * s, ih * s
+        x = (pw - w) / 2.0
+        y = m + (avail_h - h) / 2.0
+
+        out = fitz.open()
+        try:
+            page = out.new_page(width=pw, height=ph)
+            page.show_pdf_page(fitz.Rect(x, y, x + w, y + h), one, 0)
+            return out.tobytes(deflate=True, garbage=3)
+        finally:
+            out.close()
+    finally:
+        one.close()
+
+
 async def _pb_pdf_inline(job_id: str, job: dict) -> None:
     """
     Do a PDF job here and now - no local worker involved.
@@ -5863,6 +5930,15 @@ async def _pb_pdf_inline(job_id: str, job: dict) -> None:
         if g.status_code != 200:
             raise RuntimeError(f"could not read the uploaded file ({g.status_code})")
         data = g.content
+
+        # A photo becomes a one-page PDF first, then goes down the identical
+        # road as any other page - numbered, stored and registered the same way.
+        # Doing it here rather than in a branch of its own is the point: there is
+        # only one path that can register a document, so an image cannot drift
+        # away from how everything else behaves.
+        ext = (job.get("ext") or "").lower().lstrip(".")
+        if ext in _PB_IMAGE_EXTS:
+            data = await run_in_threadpool(_image_to_pdf, data, ext)
 
         # PyMuPDF is blocking and CPU-bound; on the event loop it would stall
         # every other request for the length of a big playbook.
@@ -6110,8 +6186,12 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
     option sends number=false to skip the stamp. team_id is always the coach's
     own (never client-supplied)."""
     ext = (payload.get("ext") or "").lower().lstrip(".")
-    if ext != "pdf" and ext not in _PB_CONVERT_EXTS:
+    if ext != "pdf" and ext not in _PB_CONVERT_EXTS and ext not in _PB_IMAGE_EXTS:
         raise HTTPException(status_code=400, detail="Not a convertible file.")
+    # PDFs and images are both finished here and now. The distinction that
+    # matters is NOT "which format" but "does this need a coach's Office", and
+    # only the _PB_CONVERT_EXTS group does.
+    server_side = ext == "pdf" or ext in _PB_IMAGE_EXTS
     row = {
         "team_id":     _u["team_id"],
         "raw_key":     (payload.get("key") or "").strip(),
@@ -6126,11 +6206,11 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
         "number_after": bool(payload.get("number", True)),
         "folder_path": (payload.get("folder") or "").strip().strip("/"),
         "title":       (payload.get("title") or "").strip(),
-        # A PDF is handled by the server immediately, so it must NOT be offered
-        # to a local worker: created straight into "converting" so the claim RPC
-        # (which only hands out `queued`) can never race it and have two things
-        # process the same file.
-        "status":      "converting" if ext == "pdf" else "queued",
+        # A PDF or an image is handled by the server immediately, so it must NOT
+        # be offered to a local worker: created straight into "converting" so the
+        # claim RPC (which only hands out `queued`) can never race it and have
+        # two things process the same file.
+        "status":      "converting" if server_side else "queued",
     }
     if not row["title"] or not row["raw_key"]:
         raise HTTPException(status_code=400, detail="title and key are required.")
@@ -6141,18 +6221,19 @@ async def coach_pb_create_job(payload: dict = Body(...), _u: dict = Depends(_req
         raise HTTPException(status_code=500, detail=r.text)
     created = (r.json() or [{}])[0]
 
-    # A PDF needs no Office, so it never needs the coach's PC. Doing it here
-    # means the file is live in seconds instead of waiting on a converter that
-    # may be switched off - which is exactly what made a 125 KB PDF take five
-    # minutes, and what made PDFs never appear at all for the three coaches
-    # whose converters were dead.
-    if ext == "pdf":
+    # A PDF or an image needs no Office, so neither ever needs the coach's PC.
+    # Doing it here means the file is live in seconds instead of waiting on a
+    # converter that may be switched off - which is exactly what made a 125 KB
+    # PDF take five minutes, and what made PDFs never appear at all for the
+    # three coaches whose converters were dead.
+    if server_side:
         job = dict(created)
         job.setdefault("team_id", _u["team_id"])
         job.setdefault("raw_key", row["raw_key"])
         job.setdefault("number", row["number"])
         job.setdefault("folder_path", row["folder_path"])
         job.setdefault("title", row["title"])
+        job.setdefault("ext", ext)          # _pb_pdf_inline needs it to spot an image
         asyncio.create_task(_pb_pdf_inline(created.get("id"), job))
         created["handled_by"] = "server"
 
