@@ -4642,12 +4642,21 @@ async def playbook_manifest(_u: dict = Depends(_require_player)):
         raise HTTPException(status_code=500, detail=r.text)
     # Folders are additive; if the table doesn't exist yet, just omit them.
     folders = ([x["folder_path"] for x in f.json()] if f.status_code == 200 else [])
+    # Coach-managed group visibility. Staff get (None, None) and are never
+    # filtered; for a player, a folder limited to groups they aren't in drops
+    # out of BOTH lists here, and /playbook/doc/{id}/url refuses it as well —
+    # so a doc id kept from before a restriction still can't be opened.
+    fmap, mine = await _pb_visibility_for(_u)
+    sections = r.json()
+    if fmap is not None:
+        sections = [d for d in sections if _pb_folder_visible(d.get("folder_path"), fmap, mine)]
+        folders = [p for p in folders if _pb_folder_visible(p, fmap, mine)]
     # "v" = the doc's r2_key: replacing a PDF always writes a new key, so the
     # portal's offline cache uses it as a version stamp to spot stale copies.
     return {"sections": [{"id": d["id"], "folder": d.get("folder_path", ""),
                           "title": d.get("title", ""), "pages": d.get("pages"),
                           "v": d.get("r2_key", "")}
-                         for d in r.json()],
+                         for d in sections],
             "folders": folders,
             "team": {"name": (team or {}).get("name", "CAPP Binder"),
                      "logo_r2_key": (team or {}).get("logo_r2_key"),
@@ -4666,10 +4675,17 @@ async def playbook_doc_url(doc_id: str, _u: dict = Depends(_require_player)):
     for a doc's content, and it always requires a real rostered login."""
     async with httpx.AsyncClient() as c:
         g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
-                        params={"select": "r2_key,team_id", "id": f"eq.{doc_id}", "limit": "1"},
+                        params={"select": "r2_key,team_id,folder_path", "id": f"eq.{doc_id}", "limit": "1"},
                         headers=_scoped_headers(_u["team_id"]))
     rows = g.json() if g.status_code == 200 else []
     if not rows or rows[0].get("team_id") != _u["team_id"]:
+        raise HTTPException(status_code=404, detail="Not found.")
+    # Group visibility, enforced HERE and not only in the manifest: this is the
+    # only endpoint that can hand out viewable content, and a player who saw a
+    # folder before it was restricted still holds its doc ids. Same 404 as a
+    # wrong-team doc — never confirm that a doc they can't have exists.
+    fmap, mine = await _pb_visibility_for(_u)
+    if fmap is not None and not _pb_folder_visible(rows[0].get("folder_path"), fmap, mine):
         raise HTTPException(status_code=404, detail="Not found.")
     try:
         async with httpx.AsyncClient() as c:
@@ -6459,6 +6475,348 @@ async def coach_pb_positions(_u: dict = Depends(_require_coach)):
     return {"positions": positions}
 
 
+# ── Coach-managed GROUPS + folder visibility ──────────────────────────────────
+# A coach creates named groups of players (Scout Team, Freshmen, OL + TE), puts
+# players in them, and can then limit a folder to one or more of those groups.
+#
+# THE VISIBILITY RULE, in one place so it can never drift between endpoints:
+#   * No assignment anywhere at-or-above a folder  → EVERYONE sees it. This is
+#     what makes the feature safe to switch on over a live playbook — nothing
+#     vanishes until a coach restricts something on purpose.
+#   * A restriction is INHERITED downward, and the NEAREST assignment wins, so
+#     a coach can open one subfolder back up inside a restricted parent.
+#   * Staff (coach / video / team admin) are never filtered.
+#
+# ⚠ IT FAILS OPEN, DELIBERATELY. If playbook_folder_groups is missing (the
+# migration hasn't been run) or Supabase errors, the map comes back empty and
+# every player sees everything — exactly what they see today. Failing closed
+# would blank an entire team's playbook on a bad read, which is far worse than
+# briefly showing a folder that should have been limited.
+_PB_GROUPS = "playbook_groups"
+_PB_GROUP_MEMBERS = "playbook_group_members"
+_PB_FOLDER_GROUPS = "playbook_folder_groups"
+
+
+def _pb_is_staff(u: dict) -> bool:
+    """Same test _require_coach uses. Staff bypass group filtering — a coach who
+    cannot see a folder cannot manage, replace or notify on it."""
+    pos = (u.get("position") or "").lower()
+    return "coach" in pos or "video" in pos or bool(u.get("is_admin"))
+
+
+async def _pb_group_in_team(group_id: str, team_id: str) -> bool:
+    """Same shape as _doc_in_team/_folder_in_team — one team can never touch
+    another's group by guessing an id."""
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_GROUPS}",
+                        params={"select": "id", "id": f"eq.{group_id}",
+                                "team_id": f"eq.{team_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+    return g.status_code == 200 and bool(g.json())
+
+
+async def _pb_folder_group_map(team_id: str) -> dict:
+    """{normalised folder_path: {group_id, ...}} for one team. Empty dict means
+    'nothing is restricted' — see the fail-open note above."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDER_GROUPS}",
+                            params={"select": "folder_path,group_id", "team_id": f"eq.{team_id}"},
+                            headers=_supa_headers_json())
+        if r.status_code != 200:
+            return {}
+        out: dict = {}
+        for row in r.json():
+            out.setdefault(_pb_norm_path(row.get("folder_path")), set()).add(str(row.get("group_id")))
+        return out
+    except Exception:
+        return {}
+
+
+async def _pb_user_group_ids(team_id: str, email: str) -> set:
+    """Which groups this player belongs to. Empty on any failure — combined with
+    the map above that still leaves unrestricted folders fully visible."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_GROUP_MEMBERS}",
+                            params={"select": "group_id", "team_id": f"eq.{team_id}",
+                                    "email": f"eq.{_norm_email(email)}"},
+                            headers=_supa_headers_json())
+        if r.status_code != 200:
+            return set()
+        return {str(row["group_id"]) for row in r.json() if row.get("group_id")}
+    except Exception:
+        return set()
+
+
+def _pb_folder_visible(folder_path, fmap: dict, my_groups: set) -> bool:
+    """The rule itself. Walks from the folder up to the top level and stops at
+    the FIRST level that carries an assignment — that one decides. A folder with
+    an assignment naming zero groups is treated as unrestricted (it is what a
+    coach gets by unticking everything, and it must mean 'open it back up')."""
+    if not fmap:
+        return True
+    parts = _pb_norm_path(folder_path).split("/") if _pb_norm_path(folder_path) else []
+    for i in range(len(parts), -1, -1):
+        key = "/".join(parts[:i])
+        if key in fmap:
+            assigned = fmap[key]
+            return (not assigned) or bool(assigned & my_groups)
+    return True
+
+
+async def _pb_visibility_for(u: dict):
+    """(folder-group map, this user's group ids) — or (None, None) for staff,
+    which every caller reads as 'show everything'."""
+    if _pb_is_staff(u):
+        return None, None
+    return (await _pb_folder_group_map(u["team_id"])), (await _pb_user_group_ids(u["team_id"], u["email"]))
+
+
+@app.get("/coach/playbook/roster")
+async def coach_pb_roster(_u: dict = Depends(_require_coach)):
+    """This team's roster — name, email, position only. A coach needs it to put
+    players in groups and to preview what one player sees, but roster POWER
+    (add, delete, promote) stays on the Team Admin routes, unchanged: this is
+    read-only and carries no password material."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "email,first_name,last_name,position",
+                                "team_id": f"eq.{_u['team_id']}",
+                                "order": "last_name.asc,first_name.asc"},
+                        headers=_scoped_headers(_u["team_id"]))
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"roster": [{"email": row["email"], "first_name": row.get("first_name", ""),
+                        "last_name": row.get("last_name", ""), "position": row.get("position", "")}
+                       for row in r.json()]}
+
+
+@app.get("/coach/playbook/groups")
+async def coach_pb_groups(_u: dict = Depends(_require_coach)):
+    """Every group on this team, with how many players are in it and how many
+    folders it gates. Returns [] (not a 500) when the migration hasn't run yet,
+    so the card renders empty instead of looking broken."""
+    team_id = _u["team_id"]
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_GROUPS}",
+                        params={"select": "id,name,created_at", "team_id": f"eq.{team_id}",
+                                "order": "name.asc"},
+                        headers=_supa_headers_json())
+        m = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_GROUP_MEMBERS}",
+                        params={"select": "group_id", "team_id": f"eq.{team_id}"},
+                        headers=_supa_headers_json())
+    if g.status_code != 200:
+        return {"groups": [], "ready": False}
+    counts: dict = {}
+    for row in (m.json() if m.status_code == 200 else []):
+        counts[str(row.get("group_id"))] = counts.get(str(row.get("group_id")), 0) + 1
+    fmap = await _pb_folder_group_map(team_id)
+    fcounts: dict = {}
+    for _path, gids in fmap.items():
+        for gid in gids:
+            fcounts[gid] = fcounts.get(gid, 0) + 1
+    return {"ready": True,
+            "groups": [{"id": row["id"], "name": row.get("name", ""),
+                        "members": counts.get(str(row["id"]), 0),
+                        "folders": fcounts.get(str(row["id"]), 0)}
+                       for row in g.json()]}
+
+
+@app.post("/coach/playbook/groups")
+async def coach_pb_group_create(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Create a group. The name is unique per team case-insensitively (DB index),
+    and a duplicate comes back as a plain 400 rather than a Postgres error."""
+    name = (payload.get("name") or "").strip()[:60]
+    if not name:
+        raise HTTPException(status_code=400, detail="Give the group a name.")
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_GROUPS}",
+                         json={"team_id": _u["team_id"], "name": name, "created_by": _u["email"]},
+                         headers={**_supa_headers_json(), "Prefer": "return=representation"})
+    if r.status_code == 409 or "duplicate key" in (r.text or ""):
+        raise HTTPException(status_code=400, detail=f'There is already a group called "{name}".')
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
+    return (r.json() or [{}])[0]
+
+
+@app.post("/coach/playbook/groups/{group_id}/rename")
+async def coach_pb_group_rename(group_id: str, payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Rename in place — memberships and folder assignments key off the id, so
+    nothing moves and no folder silently reopens."""
+    if not await _pb_group_in_team(group_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Group not found.")
+    name = (payload.get("name") or "").strip()[:60]
+    if not name:
+        raise HTTPException(status_code=400, detail="Give the group a name.")
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_GROUPS}",
+                          params={"id": f"eq.{group_id}"}, json={"name": name},
+                          headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code == 409 or "duplicate key" in (r.text or ""):
+        raise HTTPException(status_code=400, detail=f'There is already a group called "{name}".')
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True, "name": name}
+
+
+@app.delete("/coach/playbook/groups/{group_id}")
+async def coach_pb_group_delete(group_id: str, _u: dict = Depends(_require_coach)):
+    """Delete a group. Members and folder assignments go with it via ON DELETE
+    CASCADE — which means any folder gated ONLY by this group becomes visible to
+    the whole team again. The UI says so before it asks."""
+    if not await _pb_group_in_team(group_id, _u["team_id"]):
+        raise HTTPException(status_code=404, detail="Group not found.")
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_GROUPS}",
+                           params={"id": f"eq.{group_id}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=r.text)
+    return {"ok": True}
+
+
+@app.get("/coach/playbook/groups/{group_id}")
+async def coach_pb_group_detail(group_id: str, _u: dict = Depends(_require_coach)):
+    """The group, its members, and the WHOLE roster in one call — the picker
+    needs both halves and a second round trip would only let them disagree."""
+    team_id = _u["team_id"]
+    if not await _pb_group_in_team(group_id, team_id):
+        raise HTTPException(status_code=404, detail="Group not found.")
+    async with httpx.AsyncClient() as c:
+        g = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_GROUPS}",
+                        params={"select": "id,name", "id": f"eq.{group_id}", "limit": "1"},
+                        headers=_supa_headers_json())
+        m = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_GROUP_MEMBERS}",
+                        params={"select": "email", "group_id": f"eq.{group_id}"},
+                        headers=_supa_headers_json())
+        u = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "email,first_name,last_name,position",
+                                "team_id": f"eq.{team_id}",
+                                "order": "last_name.asc,first_name.asc"},
+                        headers=_scoped_headers(team_id))
+    members = {(row.get("email") or "").lower() for row in (m.json() if m.status_code == 200 else [])}
+    roster = [{"email": row["email"], "first_name": row.get("first_name", ""),
+               "last_name": row.get("last_name", ""), "position": row.get("position", ""),
+               "in_group": (row["email"] or "").lower() in members}
+              for row in (u.json() if u.status_code == 200 else [])]
+    return {"group": (g.json() or [{}])[0], "roster": roster,
+            "members": sorted(members)}
+
+
+@app.post("/coach/playbook/groups/{group_id}/members")
+async def coach_pb_group_members_set(group_id: str, payload: dict = Body(...),
+                                     _u: dict = Depends(_require_coach)):
+    """Replace the membership with exactly the emails sent (`emails`).
+
+    A whole-list replace, not add/remove deltas: the picker shows every player
+    with a tick, so what the coach is looking at IS the answer. Deltas would
+    need the page and the DB to agree about a starting point they can't both
+    see. Emails not on this team's roster are ignored — a group can never pull
+    in another team's player."""
+    team_id = _u["team_id"]
+    if not await _pb_group_in_team(group_id, team_id):
+        raise HTTPException(status_code=404, detail="Group not found.")
+    wanted = {_norm_email(e) for e in (payload.get("emails") or []) if e}
+    async with httpx.AsyncClient() as c:
+        u = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "email", "team_id": f"eq.{team_id}"},
+                        headers=_scoped_headers(team_id))
+        on_roster = {(row.get("email") or "").lower() for row in (u.json() if u.status_code == 200 else [])}
+        keep = sorted(wanted & on_roster)
+        d = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_GROUP_MEMBERS}",
+                           params={"group_id": f"eq.{group_id}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if d.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=d.text)
+        if keep:
+            ins = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_GROUP_MEMBERS}",
+                               json=[{"team_id": team_id, "group_id": group_id, "email": e} for e in keep],
+                               headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+            if ins.status_code not in (200, 201, 204):
+                raise HTTPException(status_code=500, detail=ins.text)
+    return {"ok": True, "members": len(keep),
+            "ignored": sorted(wanted - on_roster)}
+
+
+@app.get("/coach/playbook/folder-access")
+async def coach_pb_folder_access(_u: dict = Depends(_require_coach)):
+    """Every folder that is currently limited, and to which groups. Folders not
+    listed here are open to the whole team."""
+    fmap = await _pb_folder_group_map(_u["team_id"])
+    return {"access": [{"folder_path": p, "group_ids": sorted(g)} for p, g in sorted(fmap.items())]}
+
+
+@app.post("/coach/playbook/folder-access")
+async def coach_pb_folder_access_set(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Set which groups can see one folder. An EMPTY group list clears the
+    restriction — that is how a coach reopens a folder, and it is also why the
+    rows are deleted rather than left behind as an empty assignment."""
+    team_id = _u["team_id"]
+    path = _pb_norm_path(payload.get("path"))
+    if not path:
+        raise HTTPException(status_code=400, detail="Pick a folder first.")
+    gids = [str(g) for g in (payload.get("group_ids") or []) if g]
+    for gid in gids:
+        if not await _pb_group_in_team(gid, team_id):
+            raise HTTPException(status_code=404, detail="Group not found.")
+    async with httpx.AsyncClient() as c:
+        d = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDER_GROUPS}",
+                           params={"team_id": f"eq.{team_id}", "folder_path": f"eq.{path}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if d.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=d.text)
+        if gids:
+            ins = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDER_GROUPS}",
+                               json=[{"team_id": team_id, "folder_path": path, "group_id": g} for g in gids],
+                               headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+            if ins.status_code not in (200, 201, 204):
+                raise HTTPException(status_code=500, detail=ins.text)
+    return {"ok": True, "folder_path": path, "group_ids": gids,
+            "restricted": bool(gids)}
+
+
+@app.get("/coach/playbook/group-preview")
+async def coach_pb_group_preview(email: str = "", _u: dict = Depends(_require_coach)):
+    """What ONE player would see. A coach restricting folders cannot otherwise
+    check their own work — every coach account bypasses the filter, so the tree
+    they look at is never the tree the player gets."""
+    team_id = _u["team_id"]
+    email = _norm_email(email)
+    if not email:
+        raise HTTPException(status_code=400, detail="Pick a player.")
+    async with httpx.AsyncClient() as c:
+        u = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_TABLE}",
+                        params={"select": "email,first_name,last_name", "email": f"eq.{email}",
+                                "team_id": f"eq.{team_id}", "limit": "1"},
+                        headers=_scoped_headers(team_id))
+        d = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
+                        params={"select": "folder_path,title", "team_id": f"eq.{team_id}",
+                                "order": "folder_path.asc,sort_order.asc,title.asc"},
+                        headers=_scoped_headers(team_id))
+        f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
+                        params={"select": "folder_path", "team_id": f"eq.{team_id}"},
+                        headers=_scoped_headers(team_id))
+    if u.status_code != 200 or not u.json():
+        raise HTTPException(status_code=404, detail="That player isn't on this roster.")
+    fmap = await _pb_folder_group_map(team_id)
+    mine = await _pb_user_group_ids(team_id, email)
+    paths = {(row.get("folder_path") or "").strip() for row in (d.json() if d.status_code == 200 else [])}
+    paths |= {(row.get("folder_path") or "").strip() for row in (f.json() if f.status_code == 200 else [])}
+    visible, hidden = [], []
+    for p in sorted(paths):
+        (visible if _pb_folder_visible(p, fmap, mine) else hidden).append(p or "(top level)")
+    sections = [row for row in (d.json() if d.status_code == 200 else [])
+                if _pb_folder_visible(row.get("folder_path"), fmap, mine)]
+    return {"email": email, "groups": sorted(mine),
+            "visible_folders": visible, "hidden_folders": hidden,
+            "visible_sections": len(sections),
+            "total_sections": len(d.json() if d.status_code == 200 else [])}
+
+
+
+
 @app.post("/coach/playbook/notify")
 async def coach_pb_notify(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
     """Manually-triggered notification (email + push) — a coach picks target
@@ -6469,11 +6827,12 @@ async def coach_pb_notify(payload: dict = Body(...), _u: dict = Depends(_require
     permission — the one part of this that can't be made fully automatic)."""
     team_id = _u["team_id"]
     positions = [p.strip() for p in (payload.get("positions") or []) if p and p.strip()]
+    group_ids = [str(g) for g in (payload.get("group_ids") or []) if g]
     all_team = bool(payload.get("all_team"))
     folder_path = (payload.get("folder_path") or "").strip()
     message = (payload.get("message") or "").strip()[:500]
-    if not all_team and not positions:
-        raise HTTPException(status_code=400, detail="Pick at least one position, or All Team.")
+    if not all_team and not positions and not group_ids:
+        raise HTTPException(status_code=400, detail="Pick at least one position or group, or All Team.")
 
     team = await _team_get(team_id=team_id)
     team_name = (team or {}).get("name", "Your team")
@@ -6488,8 +6847,22 @@ async def coach_pb_notify(payload: dict = Body(...), _u: dict = Depends(_require
     if all_team:
         recipients = all_users
     else:
+        # Positions and groups are a UNION, and a player in both is sent one
+        # message — the dedupe is by email, not by which target matched.
         wanted = {p.lower() for p in positions}
-        recipients = [u for u in all_users if (u.get("position") or "").strip().lower() in wanted]
+        emails_in_groups = set()
+        for gid in group_ids:
+            if not await _pb_group_in_team(gid, team_id):
+                raise HTTPException(status_code=404, detail="Group not found.")
+            async with httpx.AsyncClient() as c:
+                gm = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_GROUP_MEMBERS}",
+                                 params={"select": "email", "group_id": f"eq.{gid}"},
+                                 headers=_supa_headers_json())
+            emails_in_groups |= {(row.get("email") or "").lower()
+                                 for row in (gm.json() if gm.status_code == 200 else [])}
+        recipients = [u for u in all_users
+                      if (u.get("position") or "").strip().lower() in wanted
+                      or (u.get("email") or "").lower() in emails_in_groups]
     if not recipients:
         return {"ok": True, "recipients": 0, "emails_sent": 0, "push_sent": 0, "push_failed": 0}
 
