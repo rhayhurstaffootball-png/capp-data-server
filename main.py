@@ -44,6 +44,26 @@ REQUEST_TOTAL = 0
 REQUEST_ERRORS = 0
 REQUEST_PATH_COUNTS: dict = defaultdict(int)
 RECENT_LATENCY_MS = deque(maxlen=500)
+
+# ⚠ BACKGROUND POLLS MUST NOT DECIDE THE LATENCY HEALTH SIGNAL.
+# Sep 12 2026: p95 read 1963 ms on a healthy game-day morning and Roger opened
+# Server Check to a WARN with nothing actually wrong. The cause was that
+# RECENT_LATENCY_MS is path-blind, and 97% of all traffic is machines polling:
+# /playbook/worker/claim 72.8%, /nodes/register 13.3%, /nodes/active_relay 11.0%
+# (one idle Binder converter at POLL_SECONDS=5 is ~73% of the server's traffic
+# on its own). So p95 was reporting how fast Supabase answers robots, not what
+# any coach experiences — measured the same morning, user-facing endpoints were
+# ~150 ms and CPU was 3%.
+# This is the SAME correction capp_server_check.py already applies to the error
+# rate, where counting /playbook/worker/claim "makes the error rate meaningless
+# as a health signal". Latency needed it too.
+# ⚠ Keep these as NORMALISED paths — they are compared against _norm_path().
+_BACKGROUND_POLL_PATHS = frozenset({
+    "/playbook/worker/claim",
+    "/nodes/register",
+    "/nodes/active_relay",
+})
+RECENT_LATENCY_USER_MS = deque(maxlen=500)
 GAME_REQUEST_STATS: dict = defaultdict(
     lambda: {
         "plays_requests": 0,
@@ -136,8 +156,11 @@ def _process_memory_bytes() -> int:
     return 0
 
 
-def _latency_summary() -> dict:
-    values = list(RECENT_LATENCY_MS)
+def _latency_summary(source=None) -> dict:
+    """Summary of a latency deque. Defaults to ALL traffic for backward
+    compatibility; pass RECENT_LATENCY_USER_MS for the signal that actually
+    reflects a coach's experience."""
+    values = list(RECENT_LATENCY_MS if source is None else source)
     if not values:
         return {"count": 0, "avg_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
     values.sort()
@@ -253,7 +276,10 @@ def _build_gameday_payload() -> dict:
         merged_games.append(merged)
 
     alerts = []
-    recent_latency = health.get("requests", {}).get("recent_latency", {})
+    # Background pollers excluded: alerting on the all-traffic number fires
+    # permanently while nothing is wrong. Falls back if the key is absent.
+    _reqs = health.get("requests", {})
+    recent_latency = _reqs.get("recent_latency_user") or _reqs.get("recent_latency", {})
     fetcher = health.get("fetcher", {})
     if not fetcher.get("poller_alive"):
         alerts.append({"level": "red", "kind": "poller", "message": "Poller is not alive."})
@@ -325,7 +351,11 @@ def _build_health_payload() -> dict:
             "total": REQUEST_TOTAL,
             "errors": REQUEST_ERRORS,
             "by_path": dict(REQUEST_PATH_COUNTS),
+            # All traffic, kept so nothing reading this key breaks.
             "recent_latency": _latency_summary(),
+            # Background pollers excluded — THIS is the health signal. See
+            # _BACKGROUND_POLL_PATHS for why the two differ so much.
+            "recent_latency_user": _latency_summary(RECENT_LATENCY_USER_MS),
         },
         "fetcher": fetcher,
     }
@@ -450,6 +480,8 @@ async def _metrics_middleware(request: Request, call_next):
 
     elapsed_ms = (time.perf_counter() - started) * 1000
     RECENT_LATENCY_MS.append(elapsed_ms)
+    if _norm_path(request.url.path) not in _BACKGROUND_POLL_PATHS:
+        RECENT_LATENCY_USER_MS.append(elapsed_ms)
     if response.status_code >= 400:
         REQUEST_ERRORS += 1
     return response
@@ -8066,14 +8098,14 @@ function loadGameDayStatus() {
     }
     const platform = data.platform || {};
     const requests = (platform.requests || {});
-    const recent = (requests.recent_latency || {});
+    const recent = (requests.recent_latency_user || requests.recent_latency || {});
     const fetcher = (platform.fetcher || {});
     const memory = ((platform.memory || {}).rss_bytes || 0);
     document.getElementById("gameday-summary").innerHTML = `
       <div class="kpi-grid">
         <div class="kpi"><div class="label">Server Status</div><div class="value">${platform.status || "unknown"}</div><div class="sub">ready=${platform.ready}</div></div>
         <div class="kpi"><div class="label">Memory RSS</div><div class="value">${fmtBytes(memory)}</div><div class="sub">process memory</div></div>
-        <div class="kpi"><div class="label">Req P95</div><div class="value">${recent.p95_ms || 0} ms</div><div class="sub">recent server latency</div></div>
+        <div class="kpi"><div class="label">Req P95</div><div class="value">${recent.p95_ms || 0} ms</div><div class="sub">recent latency, coach-facing</div></div>
         <div class="kpi"><div class="label">Tracked Games</div><div class="value">${data.summary.tracked_games || 0}</div><div class="sub">live=${data.summary.live_games || 0}</div></div>
         <div class="kpi"><div class="label">Poller</div><div class="value">${fetcher.poller_alive ? "Alive" : "Down"}</div><div class="sub">last poll ${fetcher.last_poll_duration_ms || 0} ms</div></div>
         <div class="kpi"><div class="label">Auto-Fixed</div><div class="value">${data.summary.auto_fix_total || 0}</div><div class="sub">${data.summary.games_with_auto_fixes || 0} games had fixes</div></div>
