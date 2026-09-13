@@ -1057,6 +1057,7 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
             "play_text":      description or "Officials Timeout",
             "wallclock":      play.get("wallclock", ""),
             "espn_play_id":   play.get("espn_play_id", ""),
+            "espn_seq":       play.get("sequence_number"),
             "qc_issue":       "",
         }]
 
@@ -1199,6 +1200,9 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         "play_text": description,
         "wallclock": play.get("wallclock", ""),
         "espn_play_id": play.get("espn_play_id", ""),
+        # ESPN's slot for this play. A crew-inserted play shares its predecessor's number, so order is
+        # (espn_seq, espn_play_id). Clients save it with the play so a reopened game keeps its order.
+        "espn_seq": play.get("sequence_number"),
     }
     results.append(entry)
 
@@ -1222,6 +1226,7 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
             "play_text": pat.get("text", ""),
             "wallclock": play.get("wallclock", ""),
             "espn_play_id": play.get("espn_play_id", ""),
+            "espn_seq": play.get("sequence_number"),
         }
         results.append(pat_entry)
 
