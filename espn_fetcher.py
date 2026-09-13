@@ -481,9 +481,8 @@ def apply_text_snap_clocks(plays):
     "(09:08) Shotgun ..." - so:
       1. a play whose text carries a snap time gets exactly that clock, and is never
          moved by anything after this;
-      2. a play without one is kept inside the window of its neighbours (never later
-         than the play before it, never earlier than the play after it) - and two snap
-         times out of order (a misfiled play) are left alone for the NCAA check to place.
+      2. a play without one follows Roger's order below: ESPN's own clock when it moved,
+         then NCAA, then an even spread between trusted clocks (never a copied, stuck clock).
     Returns the number of clocks changed.
     """
     changed = 0
@@ -505,42 +504,82 @@ def apply_text_snap_clocks(plays):
 
     # ⚠ Roger, Sep 13 2026 - the order for every clock: "The Snap Time should be used when its there..
     # the first one after that should be ESPNs Feed, If that is Messed up its NCAA and if that doesnt
-    # work its Best Guess". So a play with no time in its text gets ESPN's OWN clock (as it arrived,
-    # before fix_clock_anomalies / estimate_snap_clocks touched it) whenever that clock fits between
-    # the text-timed plays around it. Outside that window it is "messed up" and the guess below stays.
-    # Measured on Sep 12's five games (analyze_clock_sources.py): ESPN's own clock matched the
-    # hand-fixed key on 27 of 151 such plays, our guesses on 19.
-    # NCAA (step 3) is not in this pipeline yet - it comes with the NCAA check.
+    # work its Best Guess" - and stuck clocks are fixed under the same rule.
+    #
+    # STUCK CLOCKS. ESPN often leaves its clock field at the last time the crew typed (Fresno, Sep 12:
+    # a kickoff and five plays all "15:00", then six all "10:27"). Taking that as-is gave 27 stuck
+    # runs / 139 plays. So ESPN's clock only counts when it fits (not above the trusted clock before
+    # it, not below the next text time) and is not the THIRD play in a row on one clock.
+    # Anything else is "messed up".
+    # NCAA (3) is not in this pipeline yet - it comes with the NCAA check.
+    # BEST GUESS (4): plays still without a trusted clock are spread evenly between the trusted
+    # clocks on either side - never copied from a neighbour, which is what made clocks stick.
     for period in {p.get("period", 1) for p in plays}:
         idx = [i for i, p in enumerate(plays) if p.get("period", 1) == period]
-        hi = 15 * 60
+        if not idx:
+            continue
+        if period <= 4:
+            start = 15 * 60
+        else:
+            start = max((_clock_to_seconds(plays[i].get("_espn_clock") or "0:00") for i in idx), default=0)
+            if start <= 0:
+                continue                                    # untimed overtime - leave it
+        text_at = [(n, _clock_to_seconds(plays[i]["clock"])) for n, i in enumerate(idx) if plays[i]["_snap_from_text"]]
+        # Two plays in a row on the same clock is normal (false start, touchback, incomplete pass);
+        # a THIRD on the same clock is a stuck feed clock. `same` counts trusted plays at `last`.
+        known = {}
+        last, same = start, 0
         for n, i in enumerate(idx):
             p = plays[i]
             if p["_snap_from_text"]:
-                hi = _clock_to_seconds(p["clock"])
+                s = _clock_to_seconds(p["clock"])
+                same = same + 1 if s == last else 1
+                known[i] = last = s
                 continue
+            is_ko = "kickoff" in str(p.get("play_type_text") or "").lower()
+            if is_ko and n == 0:
+                known[i] = last = start                     # opening kickoff of the period
+                same = 1
+                continue
+            if is_ko:
+                # a kickoff after a score starts when the score ended: "... TOUCHDOWN, clock 04:12"
+                m_end = re.search(r"clock\s+(\d{1,2}):(\d{2})", str(plays[idx[n - 1]].get("description") or ""), re.I)
+                if m_end:
+                    s = int(m_end.group(1)) * 60 + int(m_end.group(2))
+                    if s <= last:
+                        same = same + 1 if s == last else 1
+                        known[i] = last = s
+                        continue
             raw = p.get("_espn_clock")
-            if not raw:
+            if raw:
+                rs = _clock_to_seconds(raw)
+                lo = next((s for nn, s in text_at if nn > n), 0)
+                if lo <= rs < last or (rs == last and same < 2):
+                    same = same + 1 if rs == last else 1
+                    known[i] = last = rs
+        for i, s in known.items():                          # trusted clocks go on the play
+            new = _seconds_to_clock(s)
+            if plays[i]["clock"] != new:
+                plays[i]["clock"] = new
+                changed += 1
+        k = 0
+        while k < len(idx):
+            if idx[k] in known:
+                k += 1
                 continue
-            lo = next((_clock_to_seconds(plays[j]["clock"]) for j in idx[n + 1:] if plays[j]["_snap_from_text"]), 0)
-            rs = _clock_to_seconds(raw)
-            if lo <= rs <= hi:
-                new = _seconds_to_clock(rs)
-                if p.get("clock") != new:
-                    p["clock"] = new
+            j = k
+            while j < len(idx) and idx[j] not in known:
+                j += 1
+            hi = known[idx[k - 1]] if k > 0 else start
+            gap = idx[k:j]
+            lo = min(known[idx[j]], hi) if j < len(idx) else 0     # nothing trusted after: spread toward 0:00
+            new_secs = [round(hi - (hi - lo) * t / (len(gap) + 1)) for t in range(1, len(gap) + 1)]
+            for i, s in zip(gap, new_secs):
+                new = _seconds_to_clock(s)
+                if plays[i]["clock"] != new:
+                    plays[i]["clock"] = new
                     changed += 1
-
-    # Best guess: keep text-less plays inside their neighbours' window, one period at a time.
-    for period in {p.get("period", 1) for p in plays}:
-        idx = [i for i, p in enumerate(plays) if p.get("period", 1) == period]
-        for a, b in zip(reversed(idx[:-1]), reversed(idx[1:])):      # backward: not below the play after
-            pa, pb = plays[a], plays[b]
-            if not pa["_snap_from_text"] and _clock_to_seconds(pa["clock"]) < _clock_to_seconds(pb["clock"]):
-                pa["clock"] = pb["clock"]; changed += 1
-        for a, b in zip(idx[:-1], idx[1:]):                          # forward: not above the play before
-            pa, pb = plays[a], plays[b]
-            if not pb["_snap_from_text"] and _clock_to_seconds(pb["clock"]) > _clock_to_seconds(pa["clock"]):
-                pb["clock"] = pa["clock"]; changed += 1
+            k = j
     return changed
 
 
