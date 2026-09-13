@@ -454,7 +454,10 @@ _ADMIN_LINE = re.compile(
     r"|.*\binjured on the play\b"
     # NCAA writes a disqualification as its own line ("Air Force C.Paterson has been disqualified") after the
     # penalty play. Not a play: the live NCAA check added two of them to Air Force as boards (Sep 13 2026).
-    r"|.*\bhas been disqualified\b"
+    # ⚠ ONLY a line that is nothing but "<team> <player> has been disqualified". NCAA also appends the same words
+    # to the end of the real penalty PLAY ("(13:05) Shotgun ... NO PLAY. Air Force C.Paterson has been
+    # disqualified"), and that play must stay a play - so no digits or brackets are allowed before the words.
+    r"|[A-Za-z .'\-]+\bhas been disqualified\b\.?\s*$"
     r"|score gap at period boundary"
     r")", re.I)
 
