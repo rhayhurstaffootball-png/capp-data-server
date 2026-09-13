@@ -465,6 +465,55 @@ def estimate_snap_clocks(plays):
         play["clock"] = _seconds_to_clock(snap_secs)
         prev_espn_secs = espn_secs
 
+_TEXT_SNAP_RE = re.compile(r"^\s*\((\d{1,2}):(\d{2})\)")
+
+
+def apply_text_snap_clocks(plays):
+    """The snap time the stat crew typed into the play text is the clock. Final say.
+
+    ⚠ WHY (Sep 12-13 2026). ESPN's clock FIELD is often the clock after the play,
+    or frozen for a whole run (Fresno: five plays at 7:36), and our estimates on top
+    of it drifted 3-7s on ~60 Air Force plays. Worse, fix_clock_anomalies assumes the
+    clock never goes up inside a quarter, so ONE misfiled play (SMU Q2) dragged every
+    later clock down to its time. Most ESPN play lines start with the real snap -
+    "(09:08) Shotgun ..." - so:
+      1. a play whose text carries a snap time gets exactly that clock, and is never
+         moved by anything after this;
+      2. a play without one is kept inside the window of its neighbours (never later
+         than the play before it, never earlier than the play after it) - and two snap
+         times out of order (a misfiled play) are left alone for the NCAA check to place.
+    Returns the number of clocks changed.
+    """
+    changed = 0
+    for play in plays:
+        m = _TEXT_SNAP_RE.match(str(play.get("description") or ""))
+        if not m:
+            play["_snap_from_text"] = False
+            continue
+        secs = int(m.group(1)) * 60 + int(m.group(2))
+        if secs > 15 * 60:
+            play["_snap_from_text"] = False
+            continue
+        new = _seconds_to_clock(secs)
+        if play.get("clock") != new:
+            changed += 1
+        play["clock"] = new
+        play["_snap_from_text"] = True
+
+    # Keep text-less plays inside their neighbours' window, one period at a time.
+    for period in {p.get("period", 1) for p in plays}:
+        idx = [i for i, p in enumerate(plays) if p.get("period", 1) == period]
+        for a, b in zip(reversed(idx[:-1]), reversed(idx[1:])):      # backward: not below the play after
+            pa, pb = plays[a], plays[b]
+            if not pa["_snap_from_text"] and _clock_to_seconds(pa["clock"]) < _clock_to_seconds(pb["clock"]):
+                pa["clock"] = pb["clock"]; changed += 1
+        for a, b in zip(idx[:-1], idx[1:]):                          # forward: not above the play before
+            pa, pb = plays[a], plays[b]
+            if not pb["_snap_from_text"] and _clock_to_seconds(pb["clock"]) > _clock_to_seconds(pa["clock"]):
+                pb["clock"] = pa["clock"]; changed += 1
+    return changed
+
+
 def fix_clock_anomalies(plays, default_elapsed=30, min_streak=6):
     if len(plays) < min_streak:
         return
@@ -1210,10 +1259,15 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         pat_text = pat.get("text", "").lower()
         pat_value = pat.get("value", 0)
         is_two_point_pat = "two" in pat_text or "2pt" in pat_text or "2-point" in pat_text or pat_value == 2
+        # The try happens AFTER the touchdown ends, so it takes the TD's END time, which the crew writes
+        # into the TD line ("... TOUCHDOWN, clock 00:24"). The TD row itself now carries its SNAP time
+        # (apply_text_snap_clocks), which would put the PAT 5 seconds early (SMU Q2 replay, Sep 13 2026).
+        _end = re.search(r"clock\s+(\d{1,2}):(\d{2})", str(description or ""), re.I)
+        pat_clock = f"{int(_end.group(1))}:{_end.group(2)}" if _end else clock
         pat_entry = {
             "home_score": home_score,
             "away_score": away_score,
-            "clock": clock,
+            "clock": pat_clock,
             "quarter": quarter,
             "down": "2PT" if is_two_point_pat else "EP",
             "distance": 3,
@@ -1605,6 +1659,8 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     # Fix clocks, estimate snap times
     fix_clock_anomalies(all_plays)
     estimate_snap_clocks(all_plays)
+    # The snap time typed into the play text wins over both - see apply_text_snap_clocks.
+    apply_text_snap_clocks(all_plays)
 
     # Map to CAPP format
     entries = []
