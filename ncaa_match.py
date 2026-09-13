@@ -452,6 +452,9 @@ _ADMIN_LINE = re.compile(
     r"|.*\bend of (game|half|regulation)\b|.*\bstart of (game|half|overtime)\b"
     r"|timeout\b|officials timeout\b"
     r"|.*\binjured on the play\b"
+    # NCAA writes a disqualification as its own line ("Air Force C.Paterson has been disqualified") after the
+    # penalty play. Not a play: the live NCAA check added two of them to Air Force as boards (Sep 13 2026).
+    r"|.*\bhas been disqualified\b"
     r"|score gap at period boundary"
     r")", re.I)
 
