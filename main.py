@@ -2077,6 +2077,103 @@ def _supa_headers_json():
     }
 
 
+# ── Backup Data (Bleacher Report) ─────────────────────────────────────────────
+# Roger, Sep 13 2026: "What if We Uploaded it.. and then when the coach Clicks 'Resolve Backup Data' it Automatically
+# Fixes Things... No Sending no Coach uploading." Roger builds a game's backup data in the Utilities Hub (Backup Data
+# Builder, _dev_tools/capp_backup_data_builder.py) and uploads it here; SBENTRY asks whether a game has one and pulls it.
+# Stored in Supabase Storage like layouts (Render's disk is wiped on every deploy):
+#     backup_data/<espn_game_id>/current.json   what coaches get
+#     backup_data/<espn_game_id>/upload_<n>.json every upload kept - a re-upload never destroys the one before it
+
+_BACKUP_FORMAT = "capp-backup-data"
+
+
+def _backup_game_id(espn_game_id: str) -> str:
+    import re as _re
+    gid = str(espn_game_id or "").strip()
+    if not _re.fullmatch(r"\d{6,12}", gid):
+        raise HTTPException(status_code=400, detail="espn_game_id must be the ESPN game number.")
+    return gid
+
+
+def _backup_url(gid: str, name: str) -> str:
+    return f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/backup_data/{gid}/{name}"
+
+
+async def _backup_read_current(client, gid: str):
+    r = await client.get(_backup_url(gid, "current.json"), headers=_supabase_headers(), timeout=20)
+    if r.status_code in (400, 404):          # Supabase answers a missing object with 400 or 404
+        return None
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Could not read backup data: {r.text[:200]}")
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Stored backup data is not valid JSON.")
+
+
+@app.put("/admin/backup-data/{espn_game_id}", dependencies=[Depends(_require_admin)])
+async def admin_backup_data_put(espn_game_id: str, data: dict = Body(...)):
+    """Roger's upload. Refuses anything the builder would not have let him save."""
+    _require_supabase()
+    gid = _backup_game_id(espn_game_id)
+    problems = []
+    if data.get("format") != _BACKUP_FORMAT or data.get("version") != 1:
+        problems.append("not backup data from the Backup Data Builder (format/version)")
+    if str(data.get("espn_game_id", "")) != gid:
+        problems.append(f"the data is for game {data.get('espn_game_id')!r}, not {gid}")
+    if not isinstance(data.get("items"), list) or not data["items"]:
+        problems.append("no plays in it")
+    if data.get("errors"):
+        problems.append("it still has errors")
+    if data.get("unparsed"):
+        problems.append("it has lines that were not understood")
+    if problems:
+        raise HTTPException(status_code=400, detail="Backup data refused: " + "; ".join(problems))
+    async with httpx.AsyncClient() as client:
+        current = await _backup_read_current(client, gid)
+        number = int(((current or {}).get("upload") or {}).get("number") or 0) + 1
+        stored = dict(data)
+        stored["upload"] = {"number": number, "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        body = json.dumps(stored).encode()
+        if len(body) > 5_000_000:
+            raise HTTPException(status_code=413, detail="Backup data is larger than 5 MB.")
+        headers = {**_supabase_headers(), "Content-Type": "application/json", "x-upsert": "true"}
+        for name in (f"upload_{number}.json", "current.json"):      # the kept copy first, then the live one
+            r = await client.put(_backup_url(gid, name), content=body, headers=headers, timeout=30)
+            if r.status_code not in (200, 201):
+                raise HTTPException(status_code=502, detail=f"Could not store backup data ({name}): {r.text[:200]}")
+    return {"status": "stored", "espn_game_id": gid, "upload_number": number,
+            "uploaded_at": stored["upload"]["uploaded_at"],
+            "plays": (data.get("summary") or {}).get("plays")}
+
+
+@app.get("/backup-data/{espn_game_id}/status", dependencies=[Depends(verify_api_key)])
+async def backup_data_status(espn_game_id: str):
+    """Small answer for SBENTRY's "Backup data available" notice - no plays in it."""
+    _require_supabase()
+    gid = _backup_game_id(espn_game_id)
+    async with httpx.AsyncClient() as client:
+        current = await _backup_read_current(client, gid)
+    if not current:
+        return {"available": False, "espn_game_id": gid}
+    up = current.get("upload") or {}
+    return {"available": True, "espn_game_id": gid, "upload_number": up.get("number"),
+            "uploaded_at": up.get("uploaded_at"), "plays": (current.get("summary") or {}).get("plays")}
+
+
+@app.get("/backup-data/{espn_game_id}", dependencies=[Depends(verify_api_key)])
+async def backup_data_get(espn_game_id: str):
+    """The game's current backup data, for SBENTRY's Resolve Backup Data."""
+    _require_supabase()
+    gid = _backup_game_id(espn_game_id)
+    async with httpx.AsyncClient() as client:
+        current = await _backup_read_current(client, gid)
+    if not current:
+        raise HTTPException(status_code=404, detail=f"No backup data for game {gid}.")
+    return current
+
+
 # ── Binder Wall #2 — Row-Level Security enforcement ─────────────────────────
 # _supa_headers_json() above uses the SERVICE-ROLE key, which BYPASSES Postgres
 # RLS by design (Supabase grants service_role the BYPASSRLS attribute). That's
