@@ -466,6 +466,8 @@ def estimate_snap_clocks(plays):
         prev_espn_secs = espn_secs
 
 _TEXT_SNAP_RE = re.compile(r"^\s*\((\d{1,2}):(\d{2})\)")
+# A timeout line carries its own time: "Timeout Air Force, clock 07:52".
+_TEXT_TO_RE = re.compile(r"^\s*(?:officials\s+)?timeout\b[^()]*?clock\s+(\d{1,2}):(\d{2})", re.I)
 
 
 def apply_text_snap_clocks(plays):
@@ -486,7 +488,8 @@ def apply_text_snap_clocks(plays):
     """
     changed = 0
     for play in plays:
-        m = _TEXT_SNAP_RE.match(str(play.get("description") or ""))
+        _desc = str(play.get("description") or "")
+        m = _TEXT_SNAP_RE.match(_desc) or _TEXT_TO_RE.match(_desc)
         if not m:
             play["_snap_from_text"] = False
             continue
@@ -500,7 +503,34 @@ def apply_text_snap_clocks(plays):
         play["clock"] = new
         play["_snap_from_text"] = True
 
-    # Keep text-less plays inside their neighbours' window, one period at a time.
+    # ⚠ Roger, Sep 13 2026 - the order for every clock: "The Snap Time should be used when its there..
+    # the first one after that should be ESPNs Feed, If that is Messed up its NCAA and if that doesnt
+    # work its Best Guess". So a play with no time in its text gets ESPN's OWN clock (as it arrived,
+    # before fix_clock_anomalies / estimate_snap_clocks touched it) whenever that clock fits between
+    # the text-timed plays around it. Outside that window it is "messed up" and the guess below stays.
+    # Measured on Sep 12's five games (analyze_clock_sources.py): ESPN's own clock matched the
+    # hand-fixed key on 27 of 151 such plays, our guesses on 19.
+    # NCAA (step 3) is not in this pipeline yet - it comes with the NCAA check.
+    for period in {p.get("period", 1) for p in plays}:
+        idx = [i for i, p in enumerate(plays) if p.get("period", 1) == period]
+        hi = 15 * 60
+        for n, i in enumerate(idx):
+            p = plays[i]
+            if p["_snap_from_text"]:
+                hi = _clock_to_seconds(p["clock"])
+                continue
+            raw = p.get("_espn_clock")
+            if not raw:
+                continue
+            lo = next((_clock_to_seconds(plays[j]["clock"]) for j in idx[n + 1:] if plays[j]["_snap_from_text"]), 0)
+            rs = _clock_to_seconds(raw)
+            if lo <= rs <= hi:
+                new = _seconds_to_clock(rs)
+                if p.get("clock") != new:
+                    p["clock"] = new
+                    changed += 1
+
+    # Best guess: keep text-less plays inside their neighbours' window, one period at a time.
     for period in {p.get("period", 1) for p in plays}:
         idx = [i for i, p in enumerate(plays) if p.get("period", 1) == period]
         for a, b in zip(reversed(idx[:-1]), reversed(idx[1:])):      # backward: not below the play after
@@ -1656,7 +1686,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     # Annotate which team scored each TD (uses score deltas, not drive_team_id)
     _annotate_td_scoring_teams(all_plays)
 
-    # Fix clocks, estimate snap times
+    # Fix clocks, estimate snap times. ESPN's own clock is kept first - it outranks our guesses
+    # (see apply_text_snap_clocks).
+    for _p in all_plays:
+        _p["_espn_clock"] = _p.get("clock")
     fix_clock_anomalies(all_plays)
     estimate_snap_clocks(all_plays)
     # The snap time typed into the play text wins over both - see apply_text_snap_clocks.
