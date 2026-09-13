@@ -501,6 +501,7 @@ def apply_text_snap_clocks(plays):
             changed += 1
         play["clock"] = new
         play["_snap_from_text"] = True
+        play["_clock_src"] = "text"
 
     # ⚠ Roger, Sep 13 2026 - the order for every clock: "The Snap Time should be used when its there..
     # the first one after that should be ESPNs Feed, If that is Messed up its NCAA and if that doesnt
@@ -540,6 +541,7 @@ def apply_text_snap_clocks(plays):
             if is_ko and n == 0:
                 known[i] = last = start                     # opening kickoff of the period
                 same = 1
+                p["_clock_src"] = "kickoff"
                 continue
             if is_ko:
                 # a kickoff after a score starts when the score ended: "... TOUCHDOWN, clock 04:12"
@@ -549,6 +551,7 @@ def apply_text_snap_clocks(plays):
                     if s <= last:
                         same = same + 1 if s == last else 1
                         known[i] = last = s
+                        p["_clock_src"] = "kickoff"
                         continue
             raw = p.get("_espn_clock")
             if raw:
@@ -557,6 +560,7 @@ def apply_text_snap_clocks(plays):
                 if lo <= rs < last or (rs == last and same < 2):
                     same = same + 1 if rs == last else 1
                     known[i] = last = rs
+                    p["_clock_src"] = "espn"
         for i, s in known.items():                          # trusted clocks go on the play
             new = _seconds_to_clock(s)
             if plays[i]["clock"] != new:
@@ -576,6 +580,7 @@ def apply_text_snap_clocks(plays):
             new_secs = [round(hi - (hi - lo) * t / (len(gap) + 1)) for t in range(1, len(gap) + 1)]
             for i, s in zip(gap, new_secs):
                 new = _seconds_to_clock(s)
+                plays[i]["_clock_src"] = "guess"
                 if plays[i]["clock"] != new:
                     plays[i]["clock"] = new
                     changed += 1
@@ -1652,7 +1657,7 @@ def _assign_entry_keys(entries):
     """
     seen = {}
     for i, entry in enumerate(entries):
-        base = str(entry.get("espn_play_id") or "")
+        base = str(entry.get("espn_play_id") or entry.get("_forced_key") or "")
         if not base:
             nxt = next((str(e["espn_play_id"]) for e in entries[i + 1:]
                         if e.get("espn_play_id")), "end")
@@ -1733,6 +1738,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     estimate_snap_clocks(all_plays)
     # The snap time typed into the play text wins over both - see apply_text_snap_clocks.
     apply_text_snap_clocks(all_plays)
+    clock_src = {str(p.get("espn_play_id")): p.get("_clock_src") for p in all_plays}
 
     # Map to CAPP format
     entries = []
@@ -1753,6 +1759,26 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     # Insert placeholder entries for scoring plays missing from the feed
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
     inserted_gap_count = _fill_scoring_gaps(entries, capp_home, capp_away)
+
+    # NCAA check - ESPN is the play data, NCAA verifies every play (Roger, Sep 13 2026). See ncaa_check.py.
+    ncaa_summary = {"available": False, "review_count": 0}
+    if league == "cfb":
+        try:
+            import ncaa_live
+            import ncaa_check
+            _gd = ""
+            for _c in (data.get("header", {}) or {}).get("competitions", [{}]):
+                _gd = _c.get("date", "") or _gd
+            _found = ncaa_live.resolve_game(_season_guess(_gd), capp_home, capp_away,
+                                            date=_ncaa_date(_gd) or None)
+            if _found.get("available"):
+                _pbp = ncaa_live.play_by_play(_found["ncaa_game_id"])
+                if _pbp.get("available"):
+                    ncaa_summary = ncaa_check.verify_entries(entries, _pbp, capp_home, capp_away,
+                                                             clock_src=clock_src)
+                    ncaa_summary["ncaa_game_id"] = _found["ncaa_game_id"]
+        except Exception as e:
+            print(f"WARNING: NCAA check failed for {game_id}: {type(e).__name__}: {e}", flush=True)
 
     # Stable identity per row, AFTER every step that adds rows. Live clients
     # take new plays by this key instead of by count - see _assign_entry_keys.
@@ -1785,6 +1811,9 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
         qc_flags.setdefault(_i, "Timeout not verified - check who it is charged to")
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
+        if entry.get("ncaa_status") == "added" and not entry["qc_issue"]:
+            entry["qc_issue"] = "Added from NCAA - not in the ESPN feed yet"
+        entry.pop("_forced_key", None)
 
     auto_fixed_examples = (list(inferred_pat_fixes) + list(entry_fixes.values())
                            + list(to_examples))
@@ -1810,6 +1839,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
             "flagged_issue_count": len(qc_flags),
             "flagged_issue_examples": qc_examples,
             "manual_gap_count": inserted_gap_count,
+            "ncaa_check": ncaa_summary,
         },
         "fetched_at": time.time(),   # unix timestamp — clients poll this to detect changes
     }

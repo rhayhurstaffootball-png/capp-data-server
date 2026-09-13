@@ -779,6 +779,7 @@ def plays(
     game_id: str,
     league: str = Query("cfb", description="cfb or nfl"),
     force_refresh: bool = Query(False, description="Bypass cache and re-fetch from API"),
+    ncaa_rows: bool = Query(False, description="Client takes plays by key and can show rows the NCAA check added"),
 ):
     started = time.perf_counter()
     # Heartbeat: a client asking for plays means a user has this game open, which
@@ -786,6 +787,13 @@ def plays(
     mark_game_active(game_id, league)
     try:
         payload = get_game_plays(game_id, league=league, force_refresh=force_refresh)
+        # ⚠ A row the NCAA check ADDED goes only to clients that take plays by key (SBENTRY sends ncaa_rows=1 from
+        # the Sep 13 2026 update). The installed CAPP takes new plays by COUNT, so one extra row earlier in the game
+        # would redraw its last play, and the row dropping out later would skip one - Saturday's failure again.
+        # Field fixes change no row count, so every client gets those.
+        if not ncaa_rows:
+            import ncaa_check
+            payload = ncaa_check.without_added_rows(payload)
         latency_ms = (time.perf_counter() - started) * 1000
         try:
             payload_bytes = len(json.dumps(payload).encode("utf-8"))
