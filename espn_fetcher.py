@@ -1056,6 +1056,7 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
             "away_time_out":  "No",
             "play_text":      description or "Officials Timeout",
             "wallclock":      play.get("wallclock", ""),
+            "espn_play_id":   play.get("espn_play_id", ""),
             "qc_issue":       "",
         }]
 
@@ -1197,6 +1198,7 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         "away_time_out": away_time_out,
         "play_text": description,
         "wallclock": play.get("wallclock", ""),
+        "espn_play_id": play.get("espn_play_id", ""),
     }
     results.append(entry)
 
@@ -1219,6 +1221,7 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
             "away_time_out": "No",
             "play_text": pat.get("text", ""),
             "wallclock": play.get("wallclock", ""),
+            "espn_play_id": play.get("espn_play_id", ""),
         }
         results.append(pat_entry)
 
@@ -1505,6 +1508,32 @@ def _assume_officials(entries, index):
     return False, ""
 
 
+def _assign_entry_keys(entries):
+    """Give every entry an `entry_key` that stays the same from poll to poll.
+
+    ⚠ WHY. The live client used to take new plays by COUNT (`entries[already:]`),
+    which assumes the stat crew only ever adds plays at the end. They don't - on
+    SMU vs UC Davis (Sep 12 2026) they slotted 11 plays in behind plays already
+    published. Each time, the client never showed the inserted play and drew the
+    old last play a second time. A key lets the client see exactly which plays
+    are new and where they belong.
+
+    Key = the ESPN play id. A PAT row shares its TD's id, so the second row from
+    one play is "<id>:2". A score-gap placeholder has no ESPN play, so it is
+    anchored to the next real play ("gap:<id>") and survives as long as that does.
+    """
+    seen = {}
+    for i, entry in enumerate(entries):
+        base = str(entry.get("espn_play_id") or "")
+        if not base:
+            nxt = next((str(e["espn_play_id"]) for e in entries[i + 1:]
+                        if e.get("espn_play_id")), "end")
+            base = f"gap:{nxt}"
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        entry["entry_key"] = base if n == 1 else f"{base}:{n}"
+
+
 def _fetch_game_plays_mapped(game_id, league="cfb"):
     url = NFL_SUMMARY_URL if league == "nfl" else CFB_SUMMARY_URL
     r = _session.get(url, params={"event": game_id}, timeout=REQUEST_TIMEOUT)
@@ -1591,6 +1620,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
     # Insert placeholder entries for scoring plays missing from the feed
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
     inserted_gap_count = _fill_scoring_gaps(entries, capp_home, capp_away)
+
+    # Stable identity per row, AFTER every step that adds rows. Live clients
+    # take new plays by this key instead of by count - see _assign_entry_keys.
+    _assign_entry_keys(entries)
 
     # Say who each timeout is actually charged to. ESPN publishes a TV timeout
     # and a team timeout identically, so without this every stoppage is charged
