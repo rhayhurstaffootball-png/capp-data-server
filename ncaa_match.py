@@ -457,7 +457,8 @@ _ADMIN_LINE = re.compile(
     # ⚠ ONLY a line that is nothing but "<team> <player> has been disqualified". NCAA also appends the same words
     # to the end of the real penalty PLAY ("(13:05) Shotgun ... NO PLAY. Air Force C.Paterson has been
     # disqualified"), and that play must stay a play - so no digits or brackets are allowed before the words.
-    r"|[A-Za-z .'\-]+\bhas been disqualified\b\.?\s*$"
+    # NCAA's raw line is LAST,FIRST ("Air Force Paterson,Cade has been disqualified") - hence the comma.
+    r"|[A-Za-z .,'\-]+\bhas been disqualified\b\.?\s*$"
     r"|score gap at period boundary"
     r")", re.I)
 
