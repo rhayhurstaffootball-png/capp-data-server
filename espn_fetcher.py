@@ -1817,7 +1817,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
         if entry.get("ncaa_status") == "added" and not entry["qc_issue"]:
-            entry["qc_issue"] = "Added from NCAA - not in the ESPN feed yet"
+            entry["qc_issue"] = "Auto-added - check this play"   # Roger, Sep 13 2026: no vendor names on screen
         entry.pop("_forced_key", None)
 
     auto_fixed_examples = (list(inferred_pat_fixes) + list(entry_fixes.values())
