@@ -116,6 +116,13 @@ def _already_have(entries, q, t):
         if (theirs is not None and mine is not None and abs(theirs - mine) <= 30
                 and difflib.SequenceMatcher(None, their_plain, _plain(txt)).ratio() >= 0.9):
             return True
+        # ⚠ Neither side typed a time, so ESPN's copy can sit anywhere in the quarter: SMU Q2 (Sep 12) ESPN typed the
+        # Fisher run late, 76s from where NCAA lists it, and a second copy was added. Same wording AND the very same
+        # numbers (yards, spot) - two different plays don't share those. Measured on Sep 12's 5 games: blocks only that.
+        if (M.clock_secs(M.text_clock(txt)) is None
+                and re.findall(r"\d+", their_plain) == re.findall(r"\d+", _plain(txt))
+                and difflib.SequenceMatcher(None, their_plain, _plain(txt)).ratio() >= 0.9):
+            return True
     return False
 
 
