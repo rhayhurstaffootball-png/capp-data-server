@@ -409,8 +409,11 @@ _GAP = -2          # cost of leaving a row unpaired
 _MIN_SIM = 4       # below this, two rows are not the same play at any price
 
 
-def _align_quarter(ours, theirs):
-    """Needleman-Wunsch. Returns [(i or None, j or None)] in play order."""
+def _align_quarter(ours, theirs, score=None):
+    """Needleman-Wunsch. Returns [(i or None, j or None)] in play order.
+    score: a pair scorer in score_pair's shape - Resolve passes one that also refuses two different written snap
+    times (backup_resolve._pair_score). Every other caller uses score_pair, unchanged."""
+    score = score or score_pair
     n, m = len(ours), len(theirs)
     F = [[0] * (m + 1) for _ in range(n + 1)]
     # Each pair is scored ONCE and reused by the walk back. score_pair is the whole cost of this function, and
@@ -422,7 +425,7 @@ def _align_quarter(ours, theirs):
         F[0][j] = F[0][j - 1] + _GAP
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            sim = S[i][j] = score_pair(ours[i - 1], theirs[j - 1])
+            sim = S[i][j] = score(ours[i - 1], theirs[j - 1])
             diag = F[i - 1][j - 1] + (sim if sim >= _MIN_SIM else 2 * _GAP)
             F[i][j] = max(diag, F[i - 1][j] + _GAP, F[i][j - 1] + _GAP)
 

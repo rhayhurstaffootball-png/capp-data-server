@@ -1852,6 +1852,12 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                                             date=_ncaa_date(_gd) or None)
             if _found.get("available"):
                 _pbp = ncaa_live.play_by_play(_found["ncaa_game_id"])
+                if _pbp.get("available") and summary is None:
+                    # Primary Backup (Roger, Sep 14 2026): keep NCAA's copy while the game is played - NCAA rewrites a
+                    # game later and drops the team from every spot. Never from a replay (summary given). Never raises,
+                    # stores on its own thread. See primary_backup.py.
+                    import primary_backup
+                    primary_backup.note_pbp(game_id, _found["ncaa_game_id"], _pbp)
                 if _pbp.get("available"):
                     ncaa_summary = ncaa_check.verify_entries(entries, _pbp, capp_home, capp_away,
                                                              clock_src=clock_src)

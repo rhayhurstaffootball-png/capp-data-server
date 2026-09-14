@@ -2207,6 +2207,65 @@ async def backup_data_get(espn_game_id: str):
     return current
 
 
+# ── Primary Backup (NCAA, kept by the server) ─────────────────────────────────
+# Roger, Sep 14 2026: ESPN is primary, CBS compares, NCAA is the PRIMARY BACKUP behind SBENTRY's "PRIMARY BACKUP
+# AVAILABLE - RESOLVE" button; Roger's Bleacher Report upload (/backup-data above) is the SECONDARY. The live play feed
+# saves NCAA's copies (primary_backup.note_pbp, called from espn_fetcher); these routes only read them.
+
+def _primary_url(gid: str, name: str) -> str:
+    return f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/primary_backup/{gid}/{name}"
+
+
+async def _primary_read(client, gid: str, name: str):
+    r = await client.get(_primary_url(gid, name), headers=_supabase_headers(), timeout=20)
+    if r.status_code in (400, 404):          # Supabase answers a missing object with 400 or 404
+        return None
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Could not read the primary backup: {r.text[:200]}")
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="The stored primary backup is not valid JSON.")
+
+
+@app.get("/primary-backup/{espn_game_id}/status", dependencies=[Depends(verify_api_key)])
+async def primary_backup_status(espn_game_id: str):
+    """Small answer for SBENTRY's PRIMARY BACKUP notice: available once the 1st quarter is finished, and how far
+    (1st Quarter / Half / 3rd Quarter / Full Game)."""
+    _require_supabase()
+    gid = _backup_game_id(espn_game_id)
+    async with httpx.AsyncClient() as client:
+        st = await _primary_read(client, gid, "status.json")
+    if not st:
+        return {"available": False, "espn_game_id": gid, "ready_through": 0}
+    through = int(st.get("ready_through") or 0)
+    return {"available": through >= 1, "espn_game_id": gid, "ready_through": through, "label": st.get("label", ""),
+            "saved_at": st.get("saved_at"), "plays": st.get("plays")}
+
+
+@app.get("/primary-backup/{espn_game_id}", dependencies=[Depends(verify_api_key)])
+async def primary_backup_get(espn_game_id: str, league: str = Query("cfb", description="cfb or nfl")):
+    """The primary backup as Resolve reads it (the Backup Data Builder's format): the finished quarters only."""
+    _require_supabase()
+    gid = _backup_game_id(espn_game_id)
+    import primary_backup
+    async with httpx.AsyncClient() as client:
+        latest = await _primary_read(client, gid, "latest.json")
+        coded = await _primary_read(client, gid, "coded.json")
+    kept = primary_backup.choose_copy(latest, coded)
+    if not kept:
+        raise HTTPException(status_code=404, detail="The primary backup has no plays for this game yet.")
+    if int(kept.get("ready_through") or 0) < 1:
+        raise HTTPException(status_code=404, detail="The primary backup is not ready - the 1st quarter is not finished yet.")
+    from espn_fetcher import get_game_plays
+    try:
+        feed = await asyncio.to_thread(get_game_plays, gid, league)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not load the game's plays: {type(e).__name__}: {e}")
+    return primary_backup.to_backup(kept, feed.get("entries") or [], feed.get("home_name", ""),
+                                    feed.get("away_name", ""), gid)
+
+
 # ── Binder Wall #2 — Row-Level Security enforcement ─────────────────────────
 # _supa_headers_json() above uses the SERVICE-ROLE key, which BYPASSES Postgres
 # RLS by design (Supabase grants service_role the BYPASSRLS attribute). That's
