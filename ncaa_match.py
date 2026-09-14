@@ -448,6 +448,8 @@ _ADMIN_LINE = re.compile(
     r".*\bdrive start\b"
     r"|.*\bball on\b"
     r"|.*\bwins toss\b|.*\bdefer(s|red)?\b|.*\bwill receive\b"
+    # "ORE will kickoff; OSU will defend East end-zone." - added as a Q3 play on Sep 12 (Oregon @ Oklahoma State).
+    r"|.*\bwill kick ?off\b|.*\bwill defend\b"
     r"|start of \w+ (quarter|period)\b|end of \w+ (quarter|period)\b"
     r"|.*\bend of (game|half|regulation)\b|.*\bstart of (game|half|overtime)\b"
     r"|timeout\b|officials timeout\b"

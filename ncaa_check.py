@@ -121,7 +121,9 @@ def _already_have(entries, q, t):
         # numbers (yards, spot) - two different plays don't share those. Measured on Sep 12's 5 games: blocks only that.
         if (M.clock_secs(M.text_clock(txt)) is None
                 and re.findall(r"\d+", their_plain) == re.findall(r"\d+", _plain(txt))
-                and difflib.SequenceMatcher(None, their_plain, _plain(txt)).ratio() >= 0.9):
+                # 0.80, not 0.90: NCAA's "Rogers,Lazaro" vs ESPN's "#21 L.Rogers" scores 0.82-0.89 on plain copies
+                # (Sep 12, 125 games: 0.80 blocks exactly those 5; the same-numbers test does the real work).
+                and difflib.SequenceMatcher(None, their_plain, _plain(txt)).ratio() >= 0.8):
             return True
     return False
 
