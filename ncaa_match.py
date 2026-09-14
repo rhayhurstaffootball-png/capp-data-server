@@ -450,10 +450,12 @@ _ADMIN_LINE = re.compile(
     r"|.*\bwins toss\b|.*\bdefer(s|red)?\b|.*\bwill receive\b"
     # "ORE will kickoff; OSU will defend East end-zone." - added as a Q3 play on Sep 12 (Oregon @ Oklahoma State).
     r"|.*\bwill kick ?off\b|.*\bwill defend\b"
-    # Referee statements (Roger, Sep 14 2026) - their own line, never their own board: "PENALTY OSU Delay Of Game
-    # declined, TURNOVER ON DOWNS." / "J.Johnson rush attempt failed." / "M.Thomas pass attempt Successful." NOT "kick
-    # attempt good" (NCAA's extra point, paired with ESPN's EP row) and NOT a declined penalty that carries yardage.
-    r"|PENALTY\s+\S+.*\bdeclined\b(?!.*\byards?\b)[^a-z]*(TURNOVER ON DOWNS)?\.?\s*$"
+    # The two-point try result, written as its own line ("J.Johnson rush attempt failed." / "M.Thomas pass attempt
+    # Successful."). ESPN writes the same try at the END of the touchdown's play text ("... TOUCHDOWN, clock 05:58,
+    # 1ST DOWN #7 J.Wright rush attempt failed") and CAPP builds the try's board from that, so NCAA's line would be a
+    # second board for one try. NOT "kick attempt good" (NCAA's extra point, paired with ESPN's EP row).
+    # ⚠ A DECLINED PENALTY IS A PLAY (Roger, Sep 14 2026: "Even a declined penalty is still a play") - never list
+    # "PENALTY ... declined" here.
     r"|[A-Za-z .,'\-]+\b(rush|pass|run)\s+attempt\s+(failed|successful)\b"
     r"|start of \w+ (quarter|period)\b|end of \w+ (quarter|period)\b"
     r"|.*\bend of (game|half|regulation)\b|.*\bstart of (game|half|overtime)\b"
