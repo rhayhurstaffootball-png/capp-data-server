@@ -450,6 +450,11 @@ _ADMIN_LINE = re.compile(
     r"|.*\bwins toss\b|.*\bdefer(s|red)?\b|.*\bwill receive\b"
     # "ORE will kickoff; OSU will defend East end-zone." - added as a Q3 play on Sep 12 (Oregon @ Oklahoma State).
     r"|.*\bwill kick ?off\b|.*\bwill defend\b"
+    # Referee statements (Roger, Sep 14 2026) - their own line, never their own board: "PENALTY OSU Delay Of Game
+    # declined, TURNOVER ON DOWNS." / "J.Johnson rush attempt failed." / "M.Thomas pass attempt Successful." NOT "kick
+    # attempt good" (NCAA's extra point, paired with ESPN's EP row) and NOT a declined penalty that carries yardage.
+    r"|PENALTY\s+\S+.*\bdeclined\b(?!.*\byards?\b)[^a-z]*(TURNOVER ON DOWNS)?\.?\s*$"
+    r"|[A-Za-z .,'\-]+\b(rush|pass|run)\s+attempt\s+(failed|successful)\b"
     r"|start of \w+ (quarter|period)\b|end of \w+ (quarter|period)\b"
     r"|.*\bend of (game|half|regulation)\b|.*\bstart of (game|half|overtime)\b"
     r"|timeout\b|officials timeout\b"
