@@ -471,6 +471,10 @@ _TEXT_SNAP_RE = re.compile(r"^\s*\((\d{1,2}):(\d{2})\)")
 _TEXT_TO_RE = re.compile(r"^\s*(?:officials\s+)?timeout\b[^()]*?clock\s+(\d{1,2}):(\d{2})", re.I)
 # The end time a crew writes into a scoring line: "... TOUCHDOWN, clock 00:59".
 _TEXT_END_RE = re.compile(r"\bclock\s+(\d{1,2}):(\d{2})", re.I)
+# The two-point try as the crew writes it at the END of the touchdown line: "... TOUCHDOWN, clock 05:58, 1ST DOWN #7
+# J.Wright rush attempt failed" / "#3 L.Brooks pass attempt Successful" / "(Gio Lopez Run for Two-Point Conversion)".
+# A kick try never reads "rush/pass attempt" (Sep 14 2026, 125 games checked).
+_TWO_POINT_TRY_TEXT = re.compile(r"\b(?:rush|pass|run)\s+attempt\s+(?:failed|successful)\b|\btwo[- ]point\b", re.I)
 
 
 def _typed_secs(play):
@@ -1396,6 +1400,12 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         pat_text = pat.get("text", "").lower()
         pat_value = pat.get("value", 0)
         is_two_point_pat = "two" in pat_text or "2pt" in pat_text or "2-point" in pat_text or pat_value == 2
+        # ⚠ A FAILED RUSH two-point try comes from ESPN as pointAfterAttempt "Not Available", value 0 - nothing says
+        # "two", so it became an EP row (Sep 12: 6 of 125 games, e.g. Buffalo @ FIU "... TOUCHDOWN, clock 05:58, 1ST
+        # DOWN #7 J.Wright rush attempt failed"). The touchdown's own text names the try; a kick never reads
+        # "rush/pass attempt". Roger, Sep 14 2026: "Fix the failed rush two-point tries to be 2PT We need That as a play".
+        if not is_two_point_pat and _TWO_POINT_TRY_TEXT.search(str(description or "")):
+            is_two_point_pat = True
         # The try happens AFTER the touchdown ends, so it takes the TD's END time, which the crew writes
         # into the TD line ("... TOUCHDOWN, clock 00:24"). The TD row itself now carries its SNAP time
         # (apply_text_snap_clocks), which would put the PAT 5 seconds early (SMU Q2 replay, Sep 13 2026).
