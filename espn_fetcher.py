@@ -5,6 +5,7 @@ returns fully CAPP-ready play entries to clients.
 """
 
 import re
+from collections import Counter
 import requests
 import threading
 import time
@@ -1840,6 +1841,9 @@ def _fetch_game_plays_mapped(game_id, league="cfb"):
             "flagged_issue_examples": qc_examples,
             "manual_gap_count": inserted_gap_count,
             "ncaa_check": ncaa_summary,
+            # Where each play's clock came from (apply_text_snap_clocks): text / espn / kickoff / guess.
+            # Roger's Gameday Report alerts when most are guesses - the game needs a Bleacher Report upload.
+            "clock_sources": dict(Counter(v or "none" for v in clock_src.values())),
         },
         "fetched_at": time.time(),   # unix timestamp — clients poll this to detect changes
     }
@@ -2124,6 +2128,30 @@ def _maybe_alert(game_id, state, payload):
         threading.Thread(target=cb, args=(game_id, state, payload), daemon=True).start()
     except Exception as e:
         print(f"feed alert dispatch failed ({game_id}): {e}")
+
+
+def get_play_data_summary(game_id) -> dict:
+    """How good this game's play data is, from the plays ALREADY in the cache - never fetches, never marks the game
+    active. For Roger's Gameday Report (Sep 13 2026): review count, NCAA available, how many clocks are guesses."""
+    with _lock:
+        cached = _plays_cache.get(game_id)
+    if not cached:
+        return {"cached": False}
+    qc = cached.get("qc_summary") or {}
+    nc = qc.get("ncaa_check") or {}
+    cs = qc.get("clock_sources") or {}
+    return {
+        "cached": True,
+        "status": cached.get("status", ""),
+        "plays": len(cached.get("entries") or []),
+        "ncaa_available": bool(nc.get("available")),
+        "review_count": int(nc.get("review_count") or 0),
+        "ncaa_fixed": int(nc.get("fixed") or 0),
+        "ncaa_added": int(nc.get("added") or 0),
+        "clocks_guessed": int(cs.get("guess") or 0),
+        "clocks_total": int(sum(cs.values())) if cs else 0,
+        "fetched_at": cached.get("fetched_at"),
+    }
 
 
 def get_feed_health(game_id) -> dict:

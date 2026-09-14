@@ -910,6 +910,12 @@ def game_feed_health(game_id: str, league: str = Query("cfb", description="cfb o
     state = health.get("state", "unknown")
     out = {"game_id": game_id, "espn": health, "cfbd": None,
            "state": state, "message": ""}
+    # Play-data quality from the cached plays (never fetches): review count, NCAA available, guessed clocks.
+    try:
+        from espn_fetcher import get_play_data_summary
+        out["play_data"] = get_play_data_summary(game_id)
+    except Exception as e:
+        out["play_data"] = {"cached": False, "error": f"{type(e).__name__}: {e}"}
 
     if state in ("dark", "stalled"):
         cfbd = cfbd_live.live_play_count(game_id)
