@@ -484,7 +484,8 @@ def _typed_secs(play):
 
 
 def reslot_late_timeouts(plays):
-    """Move a timeout the stat crew typed in LATE back to where its typed time belongs. Returns the moves made.
+    """Move a timeout - or a play - that sits after plays typed well BELOW its own typed time back to where that time
+    belongs. Returns the moves made.
 
     ⚠ Sep 12 2026, SMU Q2: "Timeout UC Davis, clock 06:36" was entered at halftime and ESPN numbered it after the
     last kneel-down (0:24); "Timeout UC Davis, clock 02:00" was entered 9 minutes late and numbered after SMU's 0:54
@@ -499,7 +500,10 @@ def reslot_late_timeouts(plays):
     while i < len(plays):
         t = plays[i]
         d = str(t.get("description") or "")
-        tsecs = _typed_secs(t) if _TEXT_TO_RE.match(d) else None
+        # Timeouts AND plays (Roger, Sep 13 2026). SMU Q2: ESPN numbered "(06:21)" pass (entered 21:13) AFTER the
+        # "(05:39)" run (entered 21:14) - the typed times prove the order. Measured on Sep 12's 5 games: this moves
+        # exactly that one play; nothing else.
+        tsecs = _typed_secs(t)
         if tsecs is None:
             i += 1
             continue
