@@ -469,6 +469,59 @@ def estimate_snap_clocks(plays):
 _TEXT_SNAP_RE = re.compile(r"^\s*\((\d{1,2}):(\d{2})\)")
 # A timeout line carries its own time: "Timeout Air Force, clock 07:52".
 _TEXT_TO_RE = re.compile(r"^\s*(?:officials\s+)?timeout\b[^()]*?clock\s+(\d{1,2}):(\d{2})", re.I)
+# The end time a crew writes into a scoring line: "... TOUCHDOWN, clock 00:59".
+_TEXT_END_RE = re.compile(r"\bclock\s+(\d{1,2}):(\d{2})", re.I)
+
+
+def _typed_secs(play):
+    """The time the crew typed into a play's text - its "(MM:SS)" snap, or a timeout's "clock MM:SS" - or None."""
+    d = str(play.get("description") or "")
+    m = _TEXT_SNAP_RE.match(d) or _TEXT_TO_RE.match(d)
+    if not m:
+        return None
+    s = int(m.group(1)) * 60 + int(m.group(2))
+    return s if s <= 15 * 60 else None
+
+
+def reslot_late_timeouts(plays):
+    """Move a timeout the stat crew typed in LATE back to where its typed time belongs. Returns the moves made.
+
+    ⚠ Sep 12 2026, SMU Q2: "Timeout UC Davis, clock 06:36" was entered at halftime and ESPN numbered it after the
+    last kneel-down (0:24); "Timeout UC Davis, clock 02:00" was entered 9 minutes late and numbered after SMU's 0:54
+    timeout. Ordered by sequence number they sat at the end of the quarter and the clock ran backwards
+    (0:24 -> 6:36). NCAA had both in the right place - the typed times were right, the sequence was not.
+    A timeout is only moved when it is plainly out of place: the nearest earlier play with a typed time has a time
+    BELOW the timeout's. It goes in front of the first play in the quarter typed below its time. Only timeouts move -
+    never plays - and only within their quarter.
+    """
+    moves = []
+    i = 0
+    while i < len(plays):
+        t = plays[i]
+        d = str(t.get("description") or "")
+        tsecs = _typed_secs(t) if _TEXT_TO_RE.match(d) else None
+        if tsecs is None:
+            i += 1
+            continue
+        period = t.get("period", 1)
+        prev = next((plays[k] for k in range(i - 1, -1, -1)
+                     if plays[k].get("period", 1) == period and _typed_secs(plays[k]) is not None), None)
+        # MEASURED Sep 12: crews type a timeout ONE second above the play it follows ("(07:54)" then "Timeout UC Davis,
+        # clock 07:55") - that timeout is already in the right place. The ones typed in late sat 66s and 372s out of
+        # place. Only more than 5 seconds counts as out of place.
+        if prev is None or _typed_secs(prev) + 5 >= tsecs:
+            i += 1
+            continue
+        target = next((k for k in range(i) if plays[k].get("period", 1) == period
+                       and _TEXT_SNAP_RE.match(str(plays[k].get("description") or ""))
+                       and _typed_secs(plays[k]) < tsecs), None)
+        if target is None:
+            i += 1
+            continue
+        plays.insert(target, plays.pop(i))
+        moves.append({"text": d[:60], "period": period, "from": i, "to": target})
+        i += 1
+    return moves
 
 
 def apply_text_snap_clocks(plays):
@@ -497,6 +550,15 @@ def apply_text_snap_clocks(plays):
         if secs > 15 * 60:
             play["_snap_from_text"] = False
             continue
+        # ⚠ A play cannot end AFTER it snapped. Crews type a touchdown's snap one second below its own end time:
+        # "(00:58) ... TOUCHDOWN, clock 00:59" (Sep 12: SMU x4, Air Force x1), and the extra point + kickoff that
+        # follow at 0:59 then make the clock run UP. Roger, Sep 13 2026: use the end time - "that seems closer to
+        # what really happened" (Bleacher Report had that SMU touchdown at 1:05; no source has the real snap).
+        _end = _TEXT_END_RE.search(_desc)
+        if _end and _TEXT_SNAP_RE.match(_desc):
+            end_secs = int(_end.group(1)) * 60 + int(_end.group(2))
+            if secs < end_secs <= 15 * 60:
+                secs = end_secs
         new = _seconds_to_clock(secs)
         if play.get("clock") != new:
             changed += 1
@@ -1737,6 +1799,8 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
 
     # Fix clocks, estimate snap times. ESPN's own clock is kept first - it outranks our guesses
     # (see apply_text_snap_clocks).
+    # A timeout typed in late goes back where its typed time belongs, before any clock work (see reslot_late_timeouts).
+    reslot_late_timeouts(all_plays)
     for _p in all_plays:
         _p["_espn_clock"] = _p.get("clock")
     fix_clock_anomalies(all_plays)
