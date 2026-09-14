@@ -806,6 +806,28 @@ def plays(
         _record_game_request(game_id, "plays", latency_ms, 500, error=f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
+@app.get("/game/{game_id}/replay", dependencies=[Depends(verify_api_key)])
+def game_replay(
+    game_id: str,
+    step: int = Query(1, ge=1, description="Typed plays so far (1 = the first play)"),
+    league: str = Query("cfb", description="cfb or nfl"),
+    ncaa_rows: bool = Query(False, description="Client takes plays by key (see /plays)"),
+):
+    """Simulate, the live way (Step 4, Sep 13 2026): a finished game as a live client saw it after `step` plays.
+    Does NOT mark the game active - a simulation must never start live polling."""
+    from espn_fetcher import get_replay_step
+    try:
+        payload = get_replay_step(game_id, step, league)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    if not ncaa_rows:
+        import ncaa_check
+        payload = ncaa_check.without_added_rows(payload)
+    return payload
+
+
 # ── Live-feed alerting ────────────────────────────────────────────────────────
 # Roger, Sep 3 2026: *"Still makes me nervous that I may have to tell clients
 # 'Oh well, no data for this game'."* The gap is not the outage itself - nothing

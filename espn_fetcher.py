@@ -1668,11 +1668,15 @@ def _assign_entry_keys(entries):
         entry["entry_key"] = base if n == 1 else f"{base}:{n}"
 
 
-def _fetch_game_plays_mapped(game_id, league="cfb"):
+def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
+    """summary: an ESPN game summary to map instead of fetching one (get_replay_step passes a cut-down copy)."""
     url = NFL_SUMMARY_URL if league == "nfl" else CFB_SUMMARY_URL
-    r = _session.get(url, params={"event": game_id}, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
+    if summary is None:
+        r = _session.get(url, params={"event": game_id}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    else:
+        data = summary
 
     home_team_id = away_team_id = None
     home_team_name = away_team_name = ""
@@ -2354,6 +2358,73 @@ def get_game_version(game_id):
     with _lock:
         cached = _plays_cache.get(game_id)
     return cached.get("fetched_at", 0) if cached else 0
+
+# ── Replay: Simulate a finished game the LIVE way (Step 4, Sep 13 2026) ───────
+# The old Simulate drip-fed the FINAL play list, so it never exercised what broke on Sep 12: plays arriving in the order
+# the stat crew typed them, late inserts, edits to plays already drawn, NCAA fixes landing later, Refresh. A replay step
+# is the game cut off after N typed plays (ESPN play-id order) run through the REAL pipeline - what a live client
+# would have received after that play. Same method as _dev_tools/game_replay_test.
+# Never marks the game active, never touches the live plays cache or feed-health alerts.
+_replay_summaries = {}
+_REPLAY_TTL = 3600
+_REPLAY_MAX = 20
+
+
+def _replay_summary(game_id, league):
+    now = time.time()
+    with _lock:
+        hit = _replay_summaries.get((game_id, league))
+    if hit and now - hit[0] < _REPLAY_TTL:
+        return hit[1]
+    url = NFL_SUMMARY_URL if league == "nfl" else CFB_SUMMARY_URL
+    r = _session.get(url, params={"event": game_id}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    with _lock:
+        if len(_replay_summaries) >= _REPLAY_MAX:
+            _replay_summaries.clear()
+        _replay_summaries[(game_id, league)] = (now, data)
+    return data
+
+
+def get_replay_step(game_id, step, league="cfb"):
+    """The play list a live client would have had after the step-th typed play. Raises ValueError if the game is
+    not final (a replay only exists for a finished game)."""
+    import copy as _copy
+    from datetime import datetime as _dt
+    summ = _replay_summary(game_id, league)
+    comps = (summ.get("header") or {}).get("competitions") or [{}]
+    if comps[0].get("status", {}).get("type", {}).get("state") != "post":
+        raise ValueError("This game is not final yet - a replay is only for a finished game.")
+    drives = summ.get("drives", {}) or {}
+    all_drives = list(drives.get("previous", []) or []) + ([drives["current"]] if drives.get("current") else [])
+    plays = [p for d in all_drives for p in (d.get("plays") or []) if p.get("id")]
+    typed = sorted({str(p["id"]) for p in plays}, key=int)
+    total = len(typed)
+    if not total:
+        raise ValueError("This game has no plays to replay.")
+    step = max(1, min(int(step), total))
+    keep = set(typed[:step])
+    trimmed = dict(summ)
+    trimmed["drives"] = {"previous": [dict(d, plays=[p for p in (d.get("plays") or []) if str(p.get("id")) in keep])
+                                      for d in all_drives]}
+    hdr = _copy.deepcopy(summ["header"])
+    if step < total:
+        hdr["competitions"][0]["status"]["type"]["state"] = "in"
+    trimmed["header"] = hdr
+    out = _fetch_game_plays_mapped(game_id, league, summary=trimmed)
+    gap = 0.0
+    if step < total:
+        wall = {str(p["id"]): p.get("wallclock") for p in plays}
+        try:
+            a = _dt.fromisoformat(str(wall[typed[step - 1]]).rstrip("Z"))
+            b = _dt.fromisoformat(str(wall[typed[step]]).rstrip("Z"))
+            gap = max(0.0, (b - a).total_seconds())
+        except Exception:
+            gap = 0.0
+    out["replay"] = {"step": step, "total": total, "next_gap_s": gap}
+    return out
+
 
 def get_game_plays(game_id, league="cfb", force_refresh=False):
     if force_refresh:
