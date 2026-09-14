@@ -791,9 +791,12 @@ def plays(
         # the Sep 13 2026 update). The installed CAPP takes new plays by COUNT, so one extra row earlier in the game
         # would redraw its last play, and the row dropping out later would skip one - Saturday's failure again.
         # Field fixes change no row count, so every client gets those.
+        import ncaa_check
         if not ncaa_rows:
-            import ncaa_check
             payload = ncaa_check.without_added_rows(payload)
+        else:
+            # Key-based clients also lose rows a crew replaced (Sep 14 2026) and are told which keys to take down.
+            payload = ncaa_check.for_keyed_client(payload)
         latency_ms = (time.perf_counter() - started) * 1000
         try:
             payload_bytes = len(json.dumps(payload).encode("utf-8"))
@@ -822,9 +825,11 @@ def game_replay(
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    import ncaa_check
     if not ncaa_rows:
-        import ncaa_check
         payload = ncaa_check.without_added_rows(payload)
+    else:
+        payload = ncaa_check.for_keyed_client(payload)
     return payload
 
 

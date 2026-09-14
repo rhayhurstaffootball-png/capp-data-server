@@ -158,6 +158,20 @@ def _aligned(mine_rows, their_plays):
     return hit
 
 
+def for_keyed_client(payload):
+    """The play payload for a client that takes plays by KEY (SBENTRY, ncaa_rows=1): rows a crew replaced are removed
+    and their keys listed in "withdrawn_keys" so a row already drawn can come off the screen. Returns a NEW dict - the
+    cached payload is shared by every client and must not change."""
+    entries = (payload or {}).get("entries") or []
+    gone = [e for e in entries if e.get("ncaa_status") == "superseded"]
+    if not gone:
+        return payload
+    out = dict(payload)
+    out["entries"] = [e for e in entries if e.get("ncaa_status") != "superseded"]
+    out["withdrawn_keys"] = [str(e.get("entry_key") or e.get("espn_play_id")) for e in gone]
+    return out
+
+
 def without_added_rows(payload):
     """The play payload minus rows the NCAA check ADDED, for clients that take new plays by count (see main.py
     /game/{id}/plays). Returns a NEW dict - the cached payload is shared by every client and must not change."""
@@ -285,6 +299,45 @@ def verify_entries(entries, pbp, home_name, away_name, clock_src=None):
                     change(i, "clock", "%d:%02d" % divmod(ns, 60), "NCAA clock")
         e["ncaa_status"] = "fixed" if e["ncaa_changes"] else "verified"
         summary["fixed" if e["ncaa_changes"] else "verified"] += 1
+
+    # ⚠ Superseded crew entries (Roger, Sep 14 2026: "we only keep the corrected version"). ESPN keeps the entry a crew
+    # replaced as its own play under the SAME sequence number - Buffalo @ FIU "(05:59) Burch rush 8 yards" then
+    # "(04:28) Burch rush 2 yards"; Penn State @ Temple five Peoples runs for NCAA's one. A shared number alone proves
+    # nothing (a play and its timeout, a last snap and its "55 Yd Field Goal" line), so NCAA decides: a play NCAA could
+    # not match is the leftover when NCAA matched another play in its group by the same player. The row stays in
+    # `entries` - clients that take plays by COUNT must keep their count - and for_keyed_client() removes it.
+    summary["superseded"] = 0
+    groups = {}
+    for i, e in enumerate(entries):
+        text = str(e.get("play_text") or "")
+        low = text.lower()
+        if (e.get("espn_seq") is None or not e.get("espn_play_id") or M.is_admin_line(text) or _TIMEOUT.match(text)
+                or low.startswith("end of") or "kickoff" in low or "extra point" in low
+                or str(e.get("down", "")).strip().upper() in ("EP", "2PT")):
+            continue
+        groups.setdefault((M._quarter(e.get("quarter")), str(e.get("espn_seq"))), []).append(i)
+    for idxs in groups.values():
+        ids = {str(entries[i].get("espn_play_id")) for i in idxs}
+        if len(ids) < 2:
+            continue
+        matched = [i for i in idxs if entries[i].get("ncaa_status") in ("verified", "fixed")]
+        if not matched:
+            continue
+        for i in idxs:
+            e = entries[i]
+            if e.get("ncaa_status") != "unverified":
+                continue
+            names = M._surnames(e.get("play_text"))
+            keep = next((k for k in matched if names & M._surnames(entries[k].get("play_text"))), None)
+            if keep is None:
+                continue
+            e["ncaa_status"] = "superseded"
+            e["superseded_by"] = str(entries[keep].get("espn_play_id"))
+            summary["unverified"] -= 1
+            summary["superseded"] += 1
+            if len(summary["examples"]) < 8:
+                summary["examples"].append("Q%s %s superseded by a corrected entry: %s"
+                                           % (e.get("quarter"), e.get("clock"), str(e.get("play_text"))[:60]))
 
     # Add NCAA's extra plays, last first so earlier positions stay valid.
     inserts = []
