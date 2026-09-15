@@ -2,8 +2,10 @@
 
 Roger, Sep 14 2026: "ESPN = Primary CBS = Primary Backup for Comparison NCAA = Secondary Backup for ESPN Bad Plays and
 CBS not Posting Play By Play." His rules for the check:
-  clocks      "Clocks are ESPN - CBS - NCAA - GUESS". A play keeps ESPN's clock (the "(MM:SS)" typed in the text, then
-              ESPN's own clock) unless it is messed up: "If there is a stuck Clock, no Clock, A Clock that is Crazy off
+  clocks      "ESPN Typed Data > ESPN Auto Data > CBS Data > NCAA Data" - "ESPN First ... we dont Automaticall just go to
+              CBS... CBS is a backup and to be used mostly for Backup, Replacement and Repair". A play keeps ESPN's clock
+              (the "(MM:SS)" typed in the text, then ESPN's own clock) unless it is messed up: "If there is a stuck
+              Clock, no Clock, A Clock that is Crazy off
               then We Check CBS" / "If we get a stuck Clock error we check CBS to See if the clock is stuck for real".
               Checked: a clock the server had to GUESS (ESPN's was missing / stuck / did not fit) and every play of a
               stuck run (the "Clock stuck" QC error, typed snaps included). CBS's clock, else NCAA's (when NCAA's
@@ -34,6 +36,7 @@ MEASURED Sep 14 2026 before building (_dev_tools/game_replay_test/measure_cbs.py
 """
 import copy
 import hashlib
+import json
 import re
 from collections import Counter
 
@@ -401,10 +404,27 @@ def _added_key(q, text):
 
 # ── the check ─────────────────────────────────────────────────────────────────
 
+# The check is a pure function of what goes in. Roger, Sep 14 2026: "We need to have everything done before THursday".
+# MEASURED (measure_poll_cost.py): one poll of a finished game took 1.2-3.3 s cold with the CBS check (NCAA alone
+# 0.5-1.3 s), and the live poller fetches every open game one after another every ~10 s. ESPN, CBS (20 s cache) and
+# NCAA (45 s cache) are unchanged on most polls, so the last answer per game is kept and reused while nothing changed.
+_MEMO = {}
+_MEMO_MAX = 300
+
+
 def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_pbp=None, cbs_game_id=""):
     """Check ESPN's entries against CBS IN PLACE. Returns a summary. All the work is done on a copy and written back
     at the very end, so an error part-way leaves ESPN's entries exactly as they were (the caller catches it)."""
     clock_src = clock_src or {}
+    memo_key, memo_sig = (str(cbs_game_id) if cbs_game_id else None), None
+    if memo_key:
+        memo_sig = hashlib.sha1(json.dumps([entries, (backup or {}).get("items"), (ncaa_pbp or {}).get("plays"),
+                                            clock_src, home_name, away_name], sort_keys=True, default=str)
+                                .encode("utf-8")).hexdigest()
+        hit = _MEMO.get(memo_key)
+        if hit and hit[0] == memo_sig:
+            entries[:] = copy.deepcopy(hit[1])
+            return copy.deepcopy(hit[2])
     plays = [it for it in ((backup or {}).get("items") or []) if it.get("text") and it.get("kind") in PLAY_KINDS]
     summary = {"available": bool(plays), "source": "cbs", "cbs_game_id": str(cbs_game_id or ""), "verified": 0,
                "fixed": 0, "added": 0, "unverified": 0, "superseded": 0, "skipped_scoring_adds": 0,
@@ -696,5 +716,9 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
 
     summary["duplicate_reasons"] = dict(reasons)
     summary["review_count"] = summary["fixed"] + summary["added"]
+    if memo_key:
+        if len(_MEMO) >= _MEMO_MAX:
+            _MEMO.clear()
+        _MEMO[memo_key] = (memo_sig, copy.deepcopy(work), copy.deepcopy(summary))
     entries[:] = work
     return summary
