@@ -1,0 +1,1317 @@
+{
+ "built_from_until": "20260914",
+ "codes": {
+  "ABIL": {
+   "espn_abbr": "ACU",
+   "espn_location": "Abilene Christian",
+   "espn_team_id": "2000",
+   "games": 1
+  },
+  "AF": {
+   "espn_abbr": "AFA",
+   "espn_location": "Air Force",
+   "espn_team_id": "2005",
+   "games": 2
+  },
+  "AKRON": {
+   "espn_abbr": "AKR",
+   "espn_location": "Akron",
+   "espn_team_id": "2006",
+   "games": 2
+  },
+  "ALBANY": {
+   "espn_abbr": "ALB",
+   "espn_location": "UAlbany",
+   "espn_team_id": "399",
+   "games": 1
+  },
+  "ALCORN": {
+   "espn_abbr": "ALCN",
+   "espn_location": "Alcorn State",
+   "espn_team_id": "2016",
+   "games": 1
+  },
+  "ALST": {
+   "espn_abbr": "ALST",
+   "espn_location": "Alabama State",
+   "espn_team_id": "2011",
+   "games": 1
+  },
+  "AP": {
+   "espn_abbr": "APSU",
+   "espn_location": "Austin Peay",
+   "espn_team_id": "2046",
+   "games": 1
+  },
+  "APLST": {
+   "espn_abbr": "APP",
+   "espn_location": "App State",
+   "espn_team_id": "2026",
+   "games": 2
+  },
+  "ARIZ": {
+   "espn_abbr": "ARIZ",
+   "espn_location": "Arizona",
+   "espn_team_id": "12",
+   "games": 2
+  },
+  "ARIZST": {
+   "espn_abbr": "ASU",
+   "espn_location": "Arizona State",
+   "espn_team_id": "9",
+   "games": 2
+  },
+  "ARK": {
+   "espn_abbr": "ARK",
+   "espn_location": "Arkansas",
+   "espn_team_id": "8",
+   "games": 2
+  },
+  "ARKST": {
+   "espn_abbr": "ARST",
+   "espn_location": "Arkansas State",
+   "espn_team_id": "2032",
+   "games": 2
+  },
+  "ARMY": {
+   "espn_abbr": "ARMY",
+   "espn_location": "Army",
+   "espn_team_id": "349",
+   "games": 2
+  },
+  "ARPB": {
+   "espn_abbr": "UAPB",
+   "espn_location": "Arkansas-Pine Bluff",
+   "espn_team_id": "2029",
+   "games": 1
+  },
+  "AUBURN": {
+   "espn_abbr": "AUB",
+   "espn_location": "Auburn",
+   "espn_team_id": "2",
+   "games": 2
+  },
+  "BALLST": {
+   "espn_abbr": "BALL",
+   "espn_location": "Ball State",
+   "espn_team_id": "2050",
+   "games": 2
+  },
+  "BAMA": {
+   "espn_abbr": "ALA",
+   "espn_location": "Alabama",
+   "espn_team_id": "333",
+   "games": 2
+  },
+  "BAYLOR": {
+   "espn_abbr": "BAY",
+   "espn_location": "Baylor",
+   "espn_team_id": "239",
+   "games": 2
+  },
+  "BC": {
+   "espn_abbr": "BC",
+   "espn_location": "Boston College",
+   "espn_team_id": "103",
+   "games": 2
+  },
+  "BGREEN": {
+   "espn_abbr": "BGSU",
+   "espn_location": "Bowling Green",
+   "espn_team_id": "189",
+   "games": 2
+  },
+  "BOISE": {
+   "espn_abbr": "BOIS",
+   "espn_location": "Boise State",
+   "espn_team_id": "68",
+   "games": 2
+  },
+  "BRY": {
+   "espn_abbr": "BRY",
+   "espn_location": "Bryant",
+   "espn_team_id": "2803",
+   "games": 1
+  },
+  "BTHN": {
+   "espn_abbr": "BCU",
+   "espn_location": "Bethune-Cookman",
+   "espn_team_id": "2065",
+   "games": 1
+  },
+  "BUFF": {
+   "espn_abbr": "BUFF",
+   "espn_location": "Buffalo",
+   "espn_team_id": "2084",
+   "games": 2
+  },
+  "BYU": {
+   "espn_abbr": "BYU",
+   "espn_location": "BYU",
+   "espn_team_id": "252",
+   "games": 2
+  },
+  "CAL": {
+   "espn_abbr": "CAL",
+   "espn_location": "California",
+   "espn_team_id": "25",
+   "games": 2
+  },
+  "CAMP": {
+   "espn_abbr": "CAM",
+   "espn_location": "Campbell",
+   "espn_team_id": "2097",
+   "games": 1
+  },
+  "CCTST": {
+   "espn_abbr": "CCSU",
+   "espn_location": "Central Connecticut",
+   "espn_team_id": "2115",
+   "games": 1
+  },
+  "CHARLO": {
+   "espn_abbr": "CLT",
+   "espn_location": "Charlotte",
+   "espn_team_id": "2429",
+   "games": 2
+  },
+  "CHARSO": {
+   "espn_abbr": "CHSO",
+   "espn_location": "Charleston Southern",
+   "espn_team_id": "2127",
+   "games": 1
+  },
+  "CINCY": {
+   "espn_abbr": "CIN",
+   "espn_location": "Cincinnati",
+   "espn_team_id": "2132",
+   "games": 2
+  },
+  "CIT": {
+   "espn_abbr": "CIT",
+   "espn_location": "The Citadel",
+   "espn_team_id": "2643",
+   "games": 1
+  },
+  "CLEM": {
+   "espn_abbr": "CLEM",
+   "espn_location": "Clemson",
+   "espn_team_id": "228",
+   "games": 2
+  },
+  "CMICH": {
+   "espn_abbr": "CMU",
+   "espn_location": "Central Michigan",
+   "espn_team_id": "2117",
+   "games": 2
+  },
+  "COLG": {
+   "espn_abbr": "COLG",
+   "espn_location": "Colgate",
+   "espn_team_id": "2142",
+   "games": 1
+  },
+  "COLO": {
+   "espn_abbr": "COLO",
+   "espn_location": "Colorado",
+   "espn_team_id": "38",
+   "games": 2
+  },
+  "COLOST": {
+   "espn_abbr": "CSU",
+   "espn_location": "Colorado State",
+   "espn_team_id": "36",
+   "games": 2
+  },
+  "CPOLY": {
+   "espn_abbr": "CP",
+   "espn_location": "Cal Poly",
+   "espn_team_id": "13",
+   "games": 1
+  },
+  "CSTCAR": {
+   "espn_abbr": "CCU",
+   "espn_location": "Coastal Carolina",
+   "espn_team_id": "324",
+   "games": 2
+  },
+  "CUSE": {
+   "espn_abbr": "SYR",
+   "espn_location": "Syracuse",
+   "espn_team_id": "183",
+   "games": 2
+  },
+  "DAVIS": {
+   "espn_abbr": "UCD",
+   "espn_location": "UC Davis",
+   "espn_team_id": "302",
+   "games": 1
+  },
+  "DE": {
+   "espn_abbr": "DEL",
+   "espn_location": "Delaware",
+   "espn_team_id": "48",
+   "games": 2
+  },
+  "DUKE": {
+   "espn_abbr": "DUKE",
+   "espn_location": "Duke",
+   "espn_team_id": "150",
+   "games": 2
+  },
+  "DUQ": {
+   "espn_abbr": "DUQ",
+   "espn_location": "Duquesne",
+   "espn_team_id": "2184",
+   "games": 1
+  },
+  "ECU": {
+   "espn_abbr": "ECU",
+   "espn_location": "East Carolina",
+   "espn_team_id": "151",
+   "games": 2
+  },
+  "EIL": {
+   "espn_abbr": "EIU",
+   "espn_location": "Eastern Illinois",
+   "espn_team_id": "2197",
+   "games": 1
+  },
+  "EKY": {
+   "espn_abbr": "EKU",
+   "espn_location": "Eastern Kentucky",
+   "espn_team_id": "2198",
+   "games": 1
+  },
+  "EMICH": {
+   "espn_abbr": "EMU",
+   "espn_location": "Eastern Michigan",
+   "espn_team_id": "2199",
+   "games": 3
+  },
+  "ETNST": {
+   "espn_abbr": "ETSU",
+   "espn_location": "East Tennessee State",
+   "espn_team_id": "2193",
+   "games": 1
+  },
+  "FAMU": {
+   "espn_abbr": "FAMU",
+   "espn_location": "Florida A&M",
+   "espn_team_id": "50",
+   "games": 1
+  },
+  "FAU": {
+   "espn_abbr": "FAU",
+   "espn_location": "Florida Atlantic",
+   "espn_team_id": "2226",
+   "games": 2
+  },
+  "FIU": {
+   "espn_abbr": "FIU",
+   "espn_location": "Florida International",
+   "espn_team_id": "2229",
+   "games": 2
+  },
+  "FLA": {
+   "espn_abbr": "FLA",
+   "espn_location": "Florida",
+   "espn_team_id": "57",
+   "games": 2
+  },
+  "FORD": {
+   "espn_abbr": "FOR",
+   "espn_location": "Fordham",
+   "espn_team_id": "2230",
+   "games": 2
+  },
+  "FRESNO": {
+   "espn_abbr": "FRES",
+   "espn_location": "Fresno State",
+   "espn_team_id": "278",
+   "games": 2
+  },
+  "FSU": {
+   "espn_abbr": "FSU",
+   "espn_location": "Florida State",
+   "espn_team_id": "52",
+   "games": 2
+  },
+  "FUR": {
+   "espn_abbr": "FUR",
+   "espn_location": "Furman",
+   "espn_team_id": "231",
+   "games": 1
+  },
+  "GAS": {
+   "espn_abbr": "GASO",
+   "espn_location": "Georgia Southern",
+   "espn_team_id": "290",
+   "games": 2
+  },
+  "GAST": {
+   "espn_abbr": "GAST",
+   "espn_location": "Georgia State",
+   "espn_team_id": "2247",
+   "games": 2
+  },
+  "GATECH": {
+   "espn_abbr": "GT",
+   "espn_location": "Georgia Tech",
+   "espn_team_id": "59",
+   "games": 2
+  },
+  "GRAM": {
+   "espn_abbr": "GRAM",
+   "espn_location": "Grambling",
+   "espn_team_id": "2755",
+   "games": 1
+  },
+  "GRDWB": {
+   "espn_abbr": "GWEB",
+   "espn_location": "Gardner-Webb",
+   "espn_team_id": "2241",
+   "games": 1
+  },
+  "HAMP": {
+   "espn_abbr": "HAMP",
+   "espn_location": "Hampton",
+   "espn_team_id": "2261",
+   "games": 1
+  },
+  "HAWAII": {
+   "espn_abbr": "HAW",
+   "espn_location": "Hawai'i",
+   "espn_team_id": "62",
+   "games": 2
+  },
+  "HOLY": {
+   "espn_abbr": "HC",
+   "espn_location": "Holy Cross",
+   "espn_team_id": "107",
+   "games": 1
+  },
+  "HOU": {
+   "espn_abbr": "HOU",
+   "espn_location": "Houston",
+   "espn_team_id": "248",
+   "games": 2
+  },
+  "HOUBP": {
+   "espn_abbr": "HCU",
+   "espn_location": "Houston Christian",
+   "espn_team_id": "2277",
+   "games": 1
+  },
+  "HOW": {
+   "espn_abbr": "HOW",
+   "espn_location": "Howard",
+   "espn_team_id": "47",
+   "games": 1
+  },
+  "IDAHO": {
+   "espn_abbr": "IDHO",
+   "espn_location": "Idaho",
+   "espn_team_id": "70",
+   "games": 1
+  },
+  "IDST": {
+   "espn_abbr": "IDST",
+   "espn_location": "Idaho State",
+   "espn_team_id": "304",
+   "games": 1
+  },
+  "ILL": {
+   "espn_abbr": "ILL",
+   "espn_location": "Illinois",
+   "espn_team_id": "356",
+   "games": 2
+  },
+  "ILST": {
+   "espn_abbr": "ILST",
+   "espn_location": "Illinois State",
+   "espn_team_id": "2287",
+   "games": 1
+  },
+  "IND": {
+   "espn_abbr": "IU",
+   "espn_location": "Indiana",
+   "espn_team_id": "84",
+   "games": 2
+  },
+  "INST": {
+   "espn_abbr": "INST",
+   "espn_location": "Indiana State",
+   "espn_team_id": "282",
+   "games": 1
+  },
+  "IOWA": {
+   "espn_abbr": "IOWA",
+   "espn_location": "Iowa",
+   "espn_team_id": "2294",
+   "games": 2
+  },
+  "IOWAST": {
+   "espn_abbr": "ISU",
+   "espn_location": "Iowa State",
+   "espn_team_id": "66",
+   "games": 2
+  },
+  "JAXST": {
+   "espn_abbr": "JVST",
+   "espn_location": "Jacksonville State",
+   "espn_team_id": "55",
+   "games": 3
+  },
+  "JMAD": {
+   "espn_abbr": "JMU",
+   "espn_location": "James Madison",
+   "espn_team_id": "256",
+   "games": 2
+  },
+  "KANSAS": {
+   "espn_abbr": "KU",
+   "espn_location": "Kansas",
+   "espn_team_id": "2305",
+   "games": 2
+  },
+  "KENSAW": {
+   "espn_abbr": "KENN",
+   "espn_location": "Kennesaw State",
+   "espn_team_id": "338",
+   "games": 2
+  },
+  "KENTST": {
+   "espn_abbr": "KENT",
+   "espn_location": "Kent State",
+   "espn_team_id": "2309",
+   "games": 2
+  },
+  "KSTATE": {
+   "espn_abbr": "KSU",
+   "espn_location": "Kansas State",
+   "espn_team_id": "2306",
+   "games": 2
+  },
+  "LAF": {
+   "espn_abbr": "LAF",
+   "espn_location": "Lafayette",
+   "espn_team_id": "322",
+   "games": 1
+  },
+  "LAMAR": {
+   "espn_abbr": "LAM",
+   "espn_location": "Lamar",
+   "espn_team_id": "2320",
+   "games": 1
+  },
+  "LAMON": {
+   "espn_abbr": "ULM",
+   "espn_location": "UL Monroe",
+   "espn_team_id": "2433",
+   "games": 2
+  },
+  "LATECH": {
+   "espn_abbr": "LT",
+   "espn_location": "Louisiana Tech",
+   "espn_team_id": "2348",
+   "games": 2
+  },
+  "LIB": {
+   "espn_abbr": "LIB",
+   "espn_location": "Liberty",
+   "espn_team_id": "2335",
+   "games": 2
+  },
+  "LINDEN": {
+   "espn_abbr": "LIN",
+   "espn_location": "Lindenwood",
+   "espn_team_id": "2815",
+   "games": 1
+  },
+  "LIUPOST": {
+   "espn_abbr": "LIU",
+   "espn_location": "Long Island University",
+   "espn_team_id": "2341",
+   "games": 1
+  },
+  "LSU": {
+   "espn_abbr": "LSU",
+   "espn_location": "LSU",
+   "espn_team_id": "99",
+   "games": 2
+  },
+  "LVILLE": {
+   "espn_abbr": "LOU",
+   "espn_location": "Louisville",
+   "espn_team_id": "97",
+   "games": 2
+  },
+  "MD": {
+   "espn_abbr": "MD",
+   "espn_location": "Maryland",
+   "espn_team_id": "120",
+   "games": 2
+  },
+  "ME": {
+   "espn_abbr": "ME",
+   "espn_location": "Maine",
+   "espn_team_id": "311",
+   "games": 1
+  },
+  "MEMP": {
+   "espn_abbr": "MEM",
+   "espn_location": "Memphis",
+   "espn_team_id": "235",
+   "games": 3
+  },
+  "MERCYH": {
+   "espn_abbr": "MERC",
+   "espn_location": "Mercyhurst",
+   "espn_team_id": "2385",
+   "games": 2
+  },
+  "MERMAK": {
+   "espn_abbr": "MRMK",
+   "espn_location": "Merrimack",
+   "espn_team_id": "2771",
+   "games": 1
+  },
+  "MIAMI": {
+   "espn_abbr": "MIA",
+   "espn_location": "Miami",
+   "espn_team_id": "2390",
+   "games": 2
+  },
+  "MIAOH": {
+   "espn_abbr": "M-OH",
+   "espn_location": "Miami (OH)",
+   "espn_team_id": "193",
+   "games": 2
+  },
+  "MICH": {
+   "espn_abbr": "MICH",
+   "espn_location": "Michigan",
+   "espn_team_id": "130",
+   "games": 2
+  },
+  "MICHST": {
+   "espn_abbr": "MSU",
+   "espn_location": "Michigan State",
+   "espn_team_id": "127",
+   "games": 2
+  },
+  "MINN": {
+   "espn_abbr": "MINN",
+   "espn_location": "Minnesota",
+   "espn_team_id": "135",
+   "games": 2
+  },
+  "MISS": {
+   "espn_abbr": "MISS",
+   "espn_location": "Ole Miss",
+   "espn_team_id": "145",
+   "games": 2
+  },
+  "MISSST": {
+   "espn_abbr": "MSST",
+   "espn_location": "Mississippi State",
+   "espn_team_id": "344",
+   "games": 2
+  },
+  "MIZZOU": {
+   "espn_abbr": "MIZ",
+   "espn_location": "Missouri",
+   "espn_team_id": "142",
+   "games": 2
+  },
+  "MONNJ": {
+   "espn_abbr": "MONM",
+   "espn_location": "Monmouth",
+   "espn_team_id": "2405",
+   "games": 1
+  },
+  "MOST": {
+   "espn_abbr": "MOST",
+   "espn_location": "Missouri State",
+   "espn_team_id": "2623",
+   "games": 2
+  },
+  "MRGNST": {
+   "espn_abbr": "MORG",
+   "espn_location": "Morgan State",
+   "espn_team_id": "2415",
+   "games": 1
+  },
+  "MRSHL": {
+   "espn_abbr": "MRSH",
+   "espn_location": "Marshall",
+   "espn_team_id": "276",
+   "games": 2
+  },
+  "MSVALST": {
+   "espn_abbr": "MVSU",
+   "espn_location": "Mississippi Valley State",
+   "espn_team_id": "2400",
+   "games": 1
+  },
+  "MTST": {
+   "espn_abbr": "MTST",
+   "espn_location": "Montana State",
+   "espn_team_id": "147",
+   "games": 1
+  },
+  "MTSU": {
+   "espn_abbr": "MTSU",
+   "espn_location": "Middle Tennessee",
+   "espn_team_id": "2393",
+   "games": 2
+  },
+  "MURYST": {
+   "espn_abbr": "MUR",
+   "espn_location": "Murray State",
+   "espn_team_id": "93",
+   "games": 1
+  },
+  "NAL": {
+   "espn_abbr": "UNA",
+   "espn_location": "North Alabama",
+   "espn_team_id": "2453",
+   "games": 1
+  },
+  "NAVY": {
+   "espn_abbr": "NAVY",
+   "espn_location": "Navy",
+   "espn_team_id": "2426",
+   "games": 2
+  },
+  "NAZ": {
+   "espn_abbr": "NAU",
+   "espn_location": "Northern Arizona",
+   "espn_team_id": "2464",
+   "games": 1
+  },
+  "NCAT": {
+   "espn_abbr": "NCAT",
+   "espn_location": "North Carolina A&T",
+   "espn_team_id": "2448",
+   "games": 1
+  },
+  "NCO": {
+   "espn_abbr": "UNCO",
+   "espn_location": "Northern Colorado",
+   "espn_team_id": "2458",
+   "games": 1
+  },
+  "NCST": {
+   "espn_abbr": "NCSU",
+   "espn_location": "NC State",
+   "espn_team_id": "152",
+   "games": 2
+  },
+  "ND": {
+   "espn_abbr": "ND",
+   "espn_location": "Notre Dame",
+   "espn_team_id": "87",
+   "games": 2
+  },
+  "NDST": {
+   "espn_abbr": "NDSU",
+   "espn_location": "North Dakota State",
+   "espn_team_id": "2449",
+   "games": 3
+  },
+  "NEB": {
+   "espn_abbr": "NEB",
+   "espn_location": "Nebraska",
+   "espn_team_id": "158",
+   "games": 2
+  },
+  "NEVADA": {
+   "espn_abbr": "NEV",
+   "espn_location": "Nevada",
+   "espn_team_id": "2440",
+   "games": 2
+  },
+  "NH": {
+   "espn_abbr": "UNH",
+   "espn_location": "New Hampshire",
+   "espn_team_id": "160",
+   "games": 1
+  },
+  "NICHST": {
+   "espn_abbr": "NICH",
+   "espn_location": "Nicholls",
+   "espn_team_id": "2447",
+   "games": 1
+  },
+  "NILL": {
+   "espn_abbr": "NIU",
+   "espn_location": "Northern Illinois",
+   "espn_team_id": "2459",
+   "games": 2
+  },
+  "NMEX": {
+   "espn_abbr": "UNM",
+   "espn_location": "New Mexico",
+   "espn_team_id": "167",
+   "games": 2
+  },
+  "NMEXST": {
+   "espn_abbr": "NMSU",
+   "espn_location": "New Mexico State",
+   "espn_team_id": "166",
+   "games": 2
+  },
+  "NOVA": {
+   "espn_abbr": "VILL",
+   "espn_location": "Villanova",
+   "espn_team_id": "222",
+   "games": 1
+  },
+  "NRFST": {
+   "espn_abbr": "NORF",
+   "espn_location": "Norfolk State",
+   "espn_team_id": "2450",
+   "games": 2
+  },
+  "NTEXAS": {
+   "espn_abbr": "UNT",
+   "espn_location": "North Texas",
+   "espn_team_id": "249",
+   "games": 2
+  },
+  "NWEST": {
+   "espn_abbr": "NU",
+   "espn_location": "Northwestern",
+   "espn_team_id": "77",
+   "games": 1
+  },
+  "NWST": {
+   "espn_abbr": "NWST",
+   "espn_location": "Northwestern State",
+   "espn_team_id": "2466",
+   "games": 1
+  },
+  "ODU": {
+   "espn_abbr": "ODU",
+   "espn_location": "Old Dominion",
+   "espn_team_id": "295",
+   "games": 2
+  },
+  "OHIO": {
+   "espn_abbr": "OHIO",
+   "espn_location": "Ohio",
+   "espn_team_id": "195",
+   "games": 2
+  },
+  "OHIOST": {
+   "espn_abbr": "OSU",
+   "espn_location": "Ohio State",
+   "espn_team_id": "194",
+   "games": 2
+  },
+  "OKLA": {
+   "espn_abbr": "OU",
+   "espn_location": "Oklahoma",
+   "espn_team_id": "201",
+   "games": 2
+  },
+  "OKLAST": {
+   "espn_abbr": "OKST",
+   "espn_location": "Oklahoma State",
+   "espn_team_id": "197",
+   "games": 2
+  },
+  "OREG": {
+   "espn_abbr": "ORE",
+   "espn_location": "Oregon",
+   "espn_team_id": "2483",
+   "games": 2
+  },
+  "OREGST": {
+   "espn_abbr": "ORST",
+   "espn_location": "Oregon State",
+   "espn_team_id": "204",
+   "games": 2
+  },
+  "PITT": {
+   "espn_abbr": "PITT",
+   "espn_location": "Pittsburgh",
+   "espn_team_id": "221",
+   "games": 2
+  },
+  "PORTST": {
+   "espn_abbr": "PRST",
+   "espn_location": "Portland State",
+   "espn_team_id": "2502",
+   "games": 1
+  },
+  "PRARIE": {
+   "espn_abbr": "PV",
+   "espn_location": "Prairie View A&M",
+   "espn_team_id": "2504",
+   "games": 1
+  },
+  "PSU": {
+   "espn_abbr": "PSU",
+   "espn_location": "Penn State",
+   "espn_team_id": "213",
+   "games": 2
+  },
+  "PURDUE": {
+   "espn_abbr": "PUR",
+   "espn_location": "Purdue",
+   "espn_team_id": "2509",
+   "games": 2
+  },
+  "RI": {
+   "espn_abbr": "URI",
+   "espn_location": "Rhode Island",
+   "espn_team_id": "227",
+   "games": 1
+  },
+  "RICE": {
+   "espn_abbr": "RICE",
+   "espn_location": "Rice",
+   "espn_team_id": "242",
+   "games": 2
+  },
+  "RICH": {
+   "espn_abbr": "RICH",
+   "espn_location": "Richmond",
+   "espn_team_id": "257",
+   "games": 1
+  },
+  "ROB": {
+   "espn_abbr": "RMU",
+   "espn_location": "Robert Morris",
+   "espn_team_id": "2523",
+   "games": 1
+  },
+  "RUT": {
+   "espn_abbr": "RUTG",
+   "espn_location": "Rutgers",
+   "espn_team_id": "164",
+   "games": 2
+  },
+  "SACHRT": {
+   "espn_abbr": "SHU",
+   "espn_location": "Sacred Heart",
+   "espn_team_id": "2529",
+   "games": 1
+  },
+  "SACST": {
+   "espn_abbr": "SAC",
+   "espn_location": "Sacramento State",
+   "espn_team_id": "16",
+   "games": 3
+  },
+  "SALA": {
+   "espn_abbr": "USA",
+   "espn_location": "South Alabama",
+   "espn_team_id": "6",
+   "games": 2
+  },
+  "SAMST": {
+   "espn_abbr": "SHSU",
+   "espn_location": "Sam Houston",
+   "espn_team_id": "2534",
+   "games": 2
+  },
+  "SC": {
+   "espn_abbr": "SC",
+   "espn_location": "South Carolina",
+   "espn_team_id": "2579",
+   "games": 2
+  },
+  "SDGST": {
+   "espn_abbr": "SDSU",
+   "espn_location": "San Diego State",
+   "espn_team_id": "21",
+   "games": 2
+  },
+  "SDST": {
+   "espn_abbr": "SDST",
+   "espn_location": "South Dakota State",
+   "espn_team_id": "2571",
+   "games": 1
+  },
+  "SELOU": {
+   "espn_abbr": "SELA",
+   "espn_location": "SE Louisiana",
+   "espn_team_id": "2545",
+   "games": 1
+  },
+  "SEMOST": {
+   "espn_abbr": "SEMO",
+   "espn_location": "Southeast Missouri State",
+   "espn_team_id": "2546",
+   "games": 1
+  },
+  "SFLA": {
+   "espn_abbr": "USF",
+   "espn_location": "South Florida",
+   "espn_team_id": "58",
+   "games": 2
+  },
+  "SJST": {
+   "espn_abbr": "SJSU",
+   "espn_location": "San Jos\u00e9 State",
+   "espn_team_id": "23",
+   "games": 3
+  },
+  "SMU": {
+   "espn_abbr": "SMU",
+   "espn_location": "SMU",
+   "espn_team_id": "2567",
+   "games": 2
+  },
+  "SO": {
+   "espn_abbr": "SOU",
+   "espn_location": "Southern",
+   "espn_team_id": "2582",
+   "games": 1
+  },
+  "STNFRD": {
+   "espn_abbr": "STAN",
+   "espn_location": "Stanford",
+   "espn_team_id": "24",
+   "games": 2
+  },
+  "STONYBRK": {
+   "espn_abbr": "STBK",
+   "espn_location": "Stony Brook",
+   "espn_team_id": "2619",
+   "games": 1
+  },
+  "SUT": {
+   "espn_abbr": "SUU",
+   "espn_location": "Southern Utah",
+   "espn_team_id": "253",
+   "games": 1
+  },
+  "TCU": {
+   "espn_abbr": "TCU",
+   "espn_location": "TCU",
+   "espn_team_id": "2628",
+   "games": 2
+  },
+  "TEMPLE": {
+   "espn_abbr": "TEM",
+   "espn_location": "Temple",
+   "espn_team_id": "218",
+   "games": 2
+  },
+  "TENN": {
+   "espn_abbr": "TENN",
+   "espn_location": "Tennessee",
+   "espn_team_id": "2633",
+   "games": 2
+  },
+  "TEXAS": {
+   "espn_abbr": "TEX",
+   "espn_location": "Texas",
+   "espn_team_id": "251",
+   "games": 2
+  },
+  "TNMART": {
+   "espn_abbr": "UTM",
+   "espn_location": "UT Martin",
+   "espn_team_id": "2630",
+   "games": 1
+  },
+  "TNST": {
+   "espn_abbr": "TNST",
+   "espn_location": "Tennessee State",
+   "espn_team_id": "2634",
+   "games": 1
+  },
+  "TOLEDO": {
+   "espn_abbr": "TOL",
+   "espn_location": "Toledo",
+   "espn_team_id": "2649",
+   "games": 2
+  },
+  "TRLST": {
+   "espn_abbr": "TAR",
+   "espn_location": "Tarleton State",
+   "espn_team_id": "2627",
+   "games": 1
+  },
+  "TROY": {
+   "espn_abbr": "TROY",
+   "espn_location": "Troy",
+   "espn_team_id": "2653",
+   "games": 2
+  },
+  "TULANE": {
+   "espn_abbr": "TULN",
+   "espn_location": "Tulane",
+   "espn_team_id": "2655",
+   "games": 2
+  },
+  "TULSA": {
+   "espn_abbr": "TLSA",
+   "espn_location": "Tulsa",
+   "espn_team_id": "202",
+   "games": 2
+  },
+  "TWST": {
+   "espn_abbr": "TOW",
+   "espn_location": "Towson",
+   "espn_team_id": "119",
+   "games": 2
+  },
+  "TXAM": {
+   "espn_abbr": "TA&M",
+   "espn_location": "Texas A&M",
+   "espn_team_id": "245",
+   "games": 2
+  },
+  "TXSA": {
+   "espn_abbr": "UTSA",
+   "espn_location": "UTSA",
+   "espn_team_id": "2636",
+   "games": 2
+  },
+  "TXSO": {
+   "espn_abbr": "TXSO",
+   "espn_location": "Texas Southern",
+   "espn_team_id": "2640",
+   "games": 1
+  },
+  "TXSTSM": {
+   "espn_abbr": "TXST",
+   "espn_location": "Texas State",
+   "espn_team_id": "326",
+   "games": 2
+  },
+  "TXTECH": {
+   "espn_abbr": "TTU",
+   "espn_location": "Texas Tech",
+   "espn_team_id": "2641",
+   "games": 2
+  },
+  "UAB": {
+   "espn_abbr": "UAB",
+   "espn_location": "UAB",
+   "espn_team_id": "5",
+   "games": 2
+  },
+  "UCF": {
+   "espn_abbr": "UCF",
+   "espn_location": "UCF",
+   "espn_team_id": "2116",
+   "games": 2
+  },
+  "UCLA": {
+   "espn_abbr": "UCLA",
+   "espn_location": "UCLA",
+   "espn_team_id": "26",
+   "games": 2
+  },
+  "UCONN": {
+   "espn_abbr": "CONN",
+   "espn_location": "UConn",
+   "espn_team_id": "41",
+   "games": 2
+  },
+  "UGA": {
+   "espn_abbr": "UGA",
+   "espn_location": "Georgia",
+   "espn_team_id": "61",
+   "games": 2
+  },
+  "UK": {
+   "espn_abbr": "UK",
+   "espn_location": "Kentucky",
+   "espn_team_id": "96",
+   "games": 2
+  },
+  "UL": {
+   "espn_abbr": "UL",
+   "espn_location": "Louisiana",
+   "espn_team_id": "309",
+   "games": 2
+  },
+  "UMASS": {
+   "espn_abbr": "MASS",
+   "espn_location": "Massachusetts",
+   "espn_team_id": "113",
+   "games": 2
+  },
+  "UNC": {
+   "espn_abbr": "UNC",
+   "espn_location": "North Carolina",
+   "espn_team_id": "153",
+   "games": 2
+  },
+  "UNLV": {
+   "espn_abbr": "UNLV",
+   "espn_location": "UNLV",
+   "espn_team_id": "2439",
+   "games": 3
+  },
+  "USC": {
+   "espn_abbr": "USC",
+   "espn_location": "USC",
+   "espn_team_id": "30",
+   "games": 3
+  },
+  "USM": {
+   "espn_abbr": "USM",
+   "espn_location": "Southern Miss",
+   "espn_team_id": "2572",
+   "games": 2
+  },
+  "UTAH": {
+   "espn_abbr": "UTAH",
+   "espn_location": "Utah",
+   "espn_team_id": "254",
+   "games": 2
+  },
+  "UTAHST": {
+   "espn_abbr": "USU",
+   "espn_location": "Utah State",
+   "espn_team_id": "328",
+   "games": 2
+  },
+  "UTEP": {
+   "espn_abbr": "UTEP",
+   "espn_location": "UTEP",
+   "espn_team_id": "2638",
+   "games": 2
+  },
+  "UTRGV": {
+   "espn_abbr": "RGV",
+   "espn_location": "UT Rio Grande Valley",
+   "espn_team_id": "292",
+   "games": 1
+  },
+  "UTTCH": {
+   "espn_abbr": "UTU",
+   "espn_location": "Utah Tech",
+   "espn_team_id": "3101",
+   "games": 1
+  },
+  "UVA": {
+   "espn_abbr": "UVA",
+   "espn_location": "Virginia",
+   "espn_team_id": "258",
+   "games": 2
+  },
+  "VANDY": {
+   "espn_abbr": "VAN",
+   "espn_location": "Vanderbilt",
+   "espn_team_id": "238",
+   "games": 2
+  },
+  "VATECH": {
+   "espn_abbr": "VT",
+   "espn_location": "Virginia Tech",
+   "espn_team_id": "259",
+   "games": 2
+  },
+  "VMI": {
+   "espn_abbr": "VMI",
+   "espn_location": "VMI",
+   "espn_team_id": "2678",
+   "games": 1
+  },
+  "WAG": {
+   "espn_abbr": "WAG",
+   "espn_location": "Wagner",
+   "espn_team_id": "2681",
+   "games": 1
+  },
+  "WAKE": {
+   "espn_abbr": "WAKE",
+   "espn_location": "Wake Forest",
+   "espn_team_id": "154",
+   "games": 2
+  },
+  "WASH": {
+   "espn_abbr": "WASH",
+   "espn_location": "Washington",
+   "espn_team_id": "264",
+   "games": 2
+  },
+  "WASHST": {
+   "espn_abbr": "WSU",
+   "espn_location": "Washington State",
+   "espn_team_id": "265",
+   "games": 2
+  },
+  "WBRST": {
+   "espn_abbr": "WEB",
+   "espn_location": "Weber State",
+   "espn_team_id": "2692",
+   "games": 1
+  },
+  "WCAR": {
+   "espn_abbr": "WCU",
+   "espn_location": "Western Carolina",
+   "espn_team_id": "2717",
+   "games": 1
+  },
+  "WESTGA": {
+   "espn_abbr": "WES",
+   "espn_location": "West Georgia",
+   "espn_team_id": "2698",
+   "games": 2
+  },
+  "WIL": {
+   "espn_abbr": "WIU",
+   "espn_location": "Western Illinois",
+   "espn_team_id": "2710",
+   "games": 1
+  },
+  "WISC": {
+   "espn_abbr": "WIS",
+   "espn_location": "Wisconsin",
+   "espn_team_id": "275",
+   "games": 2
+  },
+  "WKY": {
+   "espn_abbr": "WKU",
+   "espn_location": "Western Kentucky",
+   "espn_team_id": "98",
+   "games": 2
+  },
+  "WMICH": {
+   "espn_abbr": "WMU",
+   "espn_location": "Western Michigan",
+   "espn_team_id": "2711",
+   "games": 2
+  },
+  "WOFF": {
+   "espn_abbr": "WOF",
+   "espn_location": "Wofford",
+   "espn_team_id": "2747",
+   "games": 1
+  },
+  "WVU": {
+   "espn_abbr": "WVU",
+   "espn_location": "West Virginia",
+   "espn_team_id": "277",
+   "games": 2
+  },
+  "WYO": {
+   "espn_abbr": "WYO",
+   "espn_location": "Wyoming",
+   "espn_team_id": "2751",
+   "games": 2
+  },
+  "YST": {
+   "espn_abbr": "YSU",
+   "espn_location": "Youngstown State",
+   "espn_team_id": "2754",
+   "games": 1
+  }
+ },
+ "conflicts": {},
+ "unmatched_games": [
+  "20260913 NMEXST@HAWAII 29-19 candidates 0"
+ ]
+}

@@ -1839,15 +1839,19 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
     inserted_gap_count = _fill_scoring_gaps(entries, capp_home, capp_away)
 
-    # NCAA check - ESPN is the play data, NCAA verifies every play (Roger, Sep 13 2026). See ncaa_check.py.
+    # The live check (Roger, Sep 14 2026): "ESPN = Primary CBS = Primary Backup for Comparison NCAA = Secondary Backup
+    # for ESPN Bad Plays and CBS not Posting Play By Play". ESPN is the play data. When CBS has play-by-play for the
+    # game, CBS checks it (cbs_check.py); otherwise NCAA does, exactly as before (ncaa_check.py). NCAA's copy is fetched
+    # either way: the server keeps it for the PRIMARY BACKUP button, and it is CBS's check's next clock source.
+    # The summary keeps the key "ncaa_check" - every client and test reads that key; "source" says which one ran.
     ncaa_summary = {"available": False, "review_count": 0}
     if league == "cfb":
+        _gd = ""
+        for _c in (data.get("header", {}) or {}).get("competitions", [{}]):
+            _gd = _c.get("date", "") or _gd
+        _pbp, _found = None, {}
         try:
             import ncaa_live
-            import ncaa_check
-            _gd = ""
-            for _c in (data.get("header", {}) or {}).get("competitions", [{}]):
-                _gd = _c.get("date", "") or _gd
             _found = ncaa_live.resolve_game(_season_guess(_gd), capp_home, capp_away,
                                             date=_ncaa_date(_gd) or None)
             if _found.get("available"):
@@ -1858,12 +1862,38 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                     # stores on its own thread. See primary_backup.py.
                     import primary_backup
                     primary_backup.note_pbp(game_id, _found["ncaa_game_id"], _pbp)
-                if _pbp.get("available"):
-                    ncaa_summary = ncaa_check.verify_entries(entries, _pbp, capp_home, capp_away,
-                                                             clock_src=clock_src)
-                    ncaa_summary["ncaa_game_id"] = _found["ncaa_game_id"]
         except Exception as e:
-            print(f"WARNING: NCAA check failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+            print(f"WARNING: NCAA fetch failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+        _pbp_ok = bool(_pbp and _pbp.get("available"))
+        cbs_ran = False
+        try:
+            import cbs_live
+            import cbs_check
+            _cg = cbs_live.find_game(_gd, home_team_id, away_team_id)
+            if _cg.get("available"):
+                _cp = cbs_live.play_by_play(_cg["cbs_game_id"])
+                if _cp.get("available"):
+                    cbs_ran = True                      # CBS is this game's check even if a replay step has no CBS play yet
+                    _cplays = _cp["plays"]
+                    if summary is not None:
+                        # A replay (Simulate) is a finished game cut back to a step: give CBS as it stood then, never
+                        # the finished game (that is what made Simulate's NCAA check add plays early).
+                        _cut = max((str(e.get("wallclock") or "") for e in entries), default="")
+                        _cplays = [p for p in _cplays if _cut and str(p.get("real_clock") or "") <= _cut]
+                    _items = cbs_live.to_items(_cplays, _cg["home_code"], _cg["away_code"], _cg["swapped"])
+                    ncaa_summary = cbs_check.verify_entries(entries, _items, capp_home, capp_away, clock_src=clock_src,
+                                                            ncaa_pbp=_pbp if _pbp_ok else None,
+                                                            cbs_game_id=_cg["cbs_game_id"])
+        except Exception as e:
+            print(f"WARNING: CBS check failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+        if not cbs_ran and _pbp_ok:
+            try:
+                import ncaa_check
+                ncaa_summary = ncaa_check.verify_entries(entries, _pbp, capp_home, capp_away, clock_src=clock_src)
+                ncaa_summary["ncaa_game_id"] = _found["ncaa_game_id"]
+                ncaa_summary["source"] = "ncaa"
+            except Exception as e:
+                print(f"WARNING: NCAA check failed for {game_id}: {type(e).__name__}: {e}", flush=True)
 
     # Stable identity per row, AFTER every step that adds rows. Live clients
     # take new plays by this key instead of by count - see _assign_entry_keys.
