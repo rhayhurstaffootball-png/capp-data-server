@@ -48,6 +48,7 @@ MIN_PAIR_SCORE = 6            # backup_resolve's value, graded on Bleacher Repor
 DISTANCE_TYPO = 1             # Roger: "Wouldnt surprise me if the play is 1 yard off"
 STUCK_RUN = 4                 # the "Clock stuck (4+ plays)" QC error - espn_fetcher._QC_STUCK_THRESH
 SAME_CLOCK_SECONDS = 5        # CBS within this of a stuck clock on every play = the clock was stuck for real
+BACKWARDS_MARGIN = 5          # an ESPN clock this far above the row before it runs backwards (every_game_check.BACK_MARGIN)
 SNAP_YARDS = 1                # same snap: yard line within this (a typo), see same_snap()
 # Roger, Sep 14 2026: CBS + NCAA beat ESPN "If the ESPN versions are off in a noticable fashio[n]" / "A Down is always a
 # difference" / distance and spot: "I would say 2... because if its off I have seen it be off by 1 but 2 yards is a long
@@ -631,6 +632,7 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
         if it.get("team_id") and work[i].get("possession") in (home_name, away_name):
             poss_votes.setdefault(it["team_id"], Counter())[work[i]["possession"]] += 1
 
+    pair_by_row = {id(work[i]): it for i, it in pairs.items()}      # the clock step after the adds - rows shift when they go in
     inserts, seen_keys = [], set()
     reasons = Counter()
     for q, after, it, rejected_with, gap_covered in to_add:
@@ -713,6 +715,34 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
         summary["added"] += 1
         if len(summary["examples"]) < 8:
             summary["examples"].append("Q%s %s added from CBS: %s" % (entry["quarter"], entry["clock"], text[:60]))
+
+    # ESPN's own clock that runs BACKWARDS once CBS's missing plays are in (Roger, Sep 15 2026: "the 6:03 Time is what makes
+    # it out of order... if a user sees that they are going to assume its the wrong play or wrong time" / "Even if its a 1
+    # off today it doesnt mean that it doesnt happen 20 times on Saturday"). apply_text_snap_clocks trusts ESPN's clock when
+    # it fits the TYPED snaps around it - it cannot see a play only CBS has. Nebraska Q1 (Sep 12): no snap typed on the
+    # Amachree run, ESPN's 6:03 fits 6:12 / 4:39, CBS's 5:34 sack goes in above it -> 6:03 under 5:34 -> CBS's 5:20 (the
+    # answer key). ESPN clocks only - a typed snap still outranks everything. MEASURED on Sep 12's 125 games before it went
+    # in: exactly that one clock changed, 0 games worse (every_game_check clk0_0915 -> clk1_0915).
+    last_clock = {}
+    for i, e in enumerate(work):
+        if M.is_admin_line(e.get("play_text", "")):
+            continue
+        q = M._quarter(e.get("quarter"))
+        s = M.clock_secs(M.norm_clock(e.get("clock")))
+        if s is None or q > 4:
+            continue
+        if (q in last_clock and s > last_clock[q] + BACKWARDS_MARGIN and not _is_timeout(e)
+                and clock_src.get(str(e.get("espn_play_id"))) == "espn"):
+            it = pair_by_row.get(id(e))
+            if it is not None and it.get("clock_secs") is not None and _fits(work, i, it["clock_secs"]):
+                change(i, "clock", "%d:%02d" % divmod(it["clock_secs"], 60), "CBS clock (ESPN clock ran backwards)")
+                summary["clock_fixes"]["cbs_backwards"] = summary["clock_fixes"].get("cbs_backwards", 0) + 1
+                if e.get("ncaa_status") == "verified":
+                    e["ncaa_status"] = "fixed"
+                    summary["verified"] -= 1
+                    summary["fixed"] += 1
+                s = it["clock_secs"]
+        last_clock[q] = s
 
     summary["duplicate_reasons"] = dict(reasons)
     summary["review_count"] = summary["fixed"] + summary["added"]
