@@ -158,17 +158,61 @@ def _aligned(mine_rows, their_plays):
     return hit
 
 
+# ⚠ AFTER-THE-PLAY PENALTIES ARE NOT PLAYS (Roger, Sep 14 2026): "If there is a penalty before the snap of a new play that
+# is its own play if there is a penalty during or after the play that penalty is part of the play it happened during" /
+# "Yes, after the play penalties never get their own play". A row with no snap has no film clip, and Catapult pairs
+# boards to clips in order - SMU Q2 9:51 "PENALTY `SMU Personal Foul ... NO PLAY" put every later clip on the wrong board
+# (Sep 12). MEASURED on Sep 12's 125 ESPN games: 604 lines start with PENALTY - 536 before-the-snap kinds (false start 340,
+# delay of game 109, offside 60, ...) stay; 3 carry the crew's typed snap time ("(12:11) PENALTY ISU Holding ... NO PLAY":
+# that line IS the wiped-out snap - Sep 13 rule, a wiped-out snap is a play) stay; 2 offsetting + 1 kickoff stay; 65 fold
+# (unsportsmanlike 23, personal foul 15, holding 10, unnecessary roughness 4, face mask 3, ...). Checked against the play
+# before by the enforcement spot: marked off from its END (after it) or its START (during it - PI on an incompletion,
+# face mask on a run, holding on a kickoff return).
+_PEN_ONLY_LINE = re.compile(r"^\s*(\(\d{1,2}:\d{2}\)\s*)?penalty\b", re.I)
+_TYPED_SNAP_LINE = re.compile(r"^\s*\(\d{1,2}:\d{2}\)")
+_BEFORE_SNAP_FOUL = re.compile(r"false start|delay of game|offside|encroach|neutral zone|illegal substitution|too many men|"
+                               r"illegal formation|illegal shift|illegal motion|illegal procedure|illegal snap|"
+                               r"disconcerting", re.I)
+_STOPPAGE_LINE = re.compile(r"^\s*(timeout|official|end of|two.minute)", re.I)
+
+
+def after_play_penalty(entry):
+    """A row that is only a penalty called during or after the play before it - no row of its own."""
+    text = str(entry.get("play_text") or "")
+    return (bool(_PEN_ONLY_LINE.match(text)) and not _TYPED_SNAP_LINE.match(text) and not _BEFORE_SNAP_FOUL.search(text)
+            and "offsetting" not in text.lower()
+            and str(entry.get("down", "")).strip().upper() not in ("KO", "EP", "2PT", "OTO"))
+
+
+def _is_stoppage_row(entry):
+    return (str(entry.get("home_time_out")) == "Yes" or str(entry.get("away_time_out")) == "Yes"
+            or str(entry.get("down", "")).strip().upper() == "OTO" or bool(_STOPPAGE_LINE.match(str(entry.get("play_text") or ""))))
+
+
 def for_keyed_client(payload):
-    """The play payload for a client that takes plays by KEY (SBENTRY, ncaa_rows=1): rows a crew replaced are removed
-    and their keys listed in "withdrawn_keys" so a row already drawn can come off the screen. Returns a NEW dict - the
-    cached payload is shared by every client and must not change."""
+    """The play payload for a client that takes plays by KEY (SBENTRY, ncaa_rows=1): rows a crew replaced are removed,
+    an after-the-play penalty row is folded into the play it belongs to (its text added to that row), and both kinds of
+    key are listed in "withdrawn_keys" so a row already drawn can come off the screen. Returns a NEW dict - the cached
+    payload is shared by every client and must not change (rows it changes are copies)."""
     entries = (payload or {}).get("entries") or []
-    gone = [e for e in entries if e.get("ncaa_status") == "superseded"]
-    if not gone:
+    gone, folded, kept = [], [], []
+    for e in entries:
+        if e.get("ncaa_status") == "superseded":
+            gone.append(e)
+            continue
+        if after_play_penalty(e):
+            at = next((k for k in range(len(kept) - 1, -1, -1) if str(kept[k].get("quarter")) == str(e.get("quarter"))
+                       and not _is_stoppage_row(kept[k])), None)
+            if at is not None:
+                kept[at] = dict(kept[at], play_text=f"{kept[at].get('play_text') or ''} {e.get('play_text') or ''}".strip())
+                folded.append(e)
+                continue
+        kept.append(e)
+    if not gone and not folded:
         return payload
     out = dict(payload)
-    out["entries"] = [e for e in entries if e.get("ncaa_status") != "superseded"]
-    out["withdrawn_keys"] = [str(e.get("entry_key") or e.get("espn_play_id")) for e in gone]
+    out["entries"] = kept
+    out["withdrawn_keys"] = [str(e.get("entry_key") or e.get("espn_play_id")) for e in gone + folded]
     return out
 
 

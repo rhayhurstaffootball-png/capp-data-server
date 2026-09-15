@@ -1940,9 +1940,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # Sep 12's 125 games (_dev_tools/game_replay_test/measure_quarter_share.py). A crew-replaced row never reaches the
     # coach's screen (ncaa_check.for_keyed_client), so it is not counted.
     quarter_issues = {}
+    import ncaa_check as _nc
     for entry in entries:
-        if entry.get("ncaa_status") == "superseded":
-            continue
+        if entry.get("ncaa_status") == "superseded" or _nc.after_play_penalty(entry):
+            continue                                   # not a row on the coach's screen (ncaa_check.for_keyed_client)
         _qi = quarter_issues.setdefault(str(entry.get("quarter")), {"rows": 0, "issues": 0})
         _qi["rows"] += 1
         _changes = entry.get("ncaa_changes") or []
