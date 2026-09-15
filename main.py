@@ -2266,6 +2266,53 @@ async def primary_backup_get(espn_game_id: str, league: str = Query("cfb", descr
                                     feed.get("away_name", ""), gid)
 
 
+# ── Backup source for a quarter swap ─────────────────────────────────────────
+# Roger, Sep 14 2026: "Q1 SCOREBOARDS HAVE OVER A 10% ERROR RATE... WOULD YOU LIKE TO USE THE BACKUP SOURCE?" - each
+# quarter judged on its own, the prompt in the app, "Yes" makes the backup the primary for that quarter. "Remember the
+# primary backup is CBS"; NCAA's kept copy (/primary-backup) when CBS has no play-by-play for the game. Same item format
+# as Resolve (capp-backup-data); ready.through = the quarters the backup has finished.
+
+async def _backup_source_doc(gid: str, league: str) -> dict:
+    from espn_fetcher import get_game_plays
+    import cbs_backup
+    try:
+        feed = await asyncio.to_thread(get_game_plays, gid, league)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not load the game's plays: {type(e).__name__}: {e}")
+    doc = await asyncio.to_thread(cbs_backup.for_game, feed.get("game_date", ""), feed.get("home_team_id", ""),
+                                  feed.get("away_team_id", ""), gid)
+    if doc.get("available"):
+        return doc
+    try:
+        ncaa = await primary_backup_get(gid, league)
+    except HTTPException as e:
+        return {"available": False, "note": str(e.detail), "espn_game_id": gid}
+    ncaa = dict(ncaa)
+    ncaa["available"] = True
+    return ncaa
+
+
+@app.get("/backup-source/{espn_game_id}/status", dependencies=[Depends(verify_api_key)])
+async def backup_source_status(espn_game_id: str, league: str = Query("cfb", description="cfb or nfl")):
+    """Small answer for SBENTRY's end-of-quarter prompt: is there a backup, and through which quarter."""
+    gid = _backup_game_id(espn_game_id)
+    doc = await _backup_source_doc(gid, league)
+    ready = doc.get("ready") or {}
+    return {"available": bool(doc.get("available")) and int(ready.get("through") or 0) >= 1, "espn_game_id": gid,
+            "ready_through": int(ready.get("through") or 0), "label": ready.get("label", ""),
+            "note": doc.get("note", "")}
+
+
+@app.get("/backup-source/{espn_game_id}", dependencies=[Depends(verify_api_key)])
+async def backup_source_get(espn_game_id: str, league: str = Query("cfb", description="cfb or nfl")):
+    """The backup source's items for a quarter swap (finished quarters are in ready.through)."""
+    gid = _backup_game_id(espn_game_id)
+    doc = await _backup_source_doc(gid, league)
+    if not doc.get("available"):
+        raise HTTPException(status_code=404, detail=doc.get("note") or "There is no backup source for this game yet.")
+    return doc
+
+
 # ── Binder Wall #2 — Row-Level Security enforcement ─────────────────────────
 # _supa_headers_json() above uses the SERVICE-ROLE key, which BYPASSES Postgres
 # RLS by design (Supabase grants service_role the BYPASSRLS attribute). That's

@@ -148,12 +148,24 @@ def play_by_play(cbs_game_id):
 
 
 def scoreboard(cbs_game_id):
-    """{"available", "status", "quarter"} - CBS's own game state (FINAL / in progress)."""
-    status, body = _call(BOARD_URL.format(cbs_game_id))
-    gs = ((body or {}).get("scoreboard") or {}).get("game_status") if isinstance(body, dict) else None
+    """{"available", "status", "quarter", "home_team_id", "away_team_id"} - CBS's own game state (FINAL / in progress)
+    and CBS's ids for its home and away team (every play's team_in_possession is one of them - cbs_backup.py).
+    CAPP_CBS_DIR (tests only): read saved <dir>/<cbs id>_scoreboard.json and never touch the network."""
+    folder = os.environ.get("CAPP_CBS_DIR") or ""
+    if folder:
+        try:
+            status, body = 200, json.load(open(os.path.join(folder, f"{cbs_game_id}_scoreboard.json"), encoding="utf-8"))
+        except Exception:
+            status, body = 0, None
+    else:
+        status, body = _call(BOARD_URL.format(cbs_game_id))
+    sb = body.get("scoreboard") if isinstance(body, dict) else None
+    gs = sb.get("game_status") if isinstance(sb, dict) else None
     if status != 200 or not isinstance(gs, dict):
-        return {"available": False, "status": "", "quarter": None}
-    return {"available": True, "status": str(gs.get("status") or ""), "quarter": gs.get("quarter")}
+        return {"available": False, "status": "", "quarter": None, "home_team_id": "", "away_team_id": ""}
+    return {"available": True, "status": str(gs.get("status") or ""), "quarter": gs.get("quarter"),
+            "home_team_id": str((sb.get("hometeam") or {}).get("id") or ""),
+            "away_team_id": str((sb.get("awayteam") or {}).get("id") or "")}
 
 
 def _int(v):

@@ -1934,6 +1934,25 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                            + list(to_examples))
     qc_examples = [msg for _, msg in list(qc_flags.items())[:5]]
 
+    # Each quarter judged on its OWN scoreboards (Roger, Sep 14 2026: "Q1 SCOREBOARDS HAVE OVER A 10% ERROR RATE... WOULD
+    # YOU LIKE TO USE THE BACKUP SOURCE?" / "look at SMU their 2nd Q Was Trash but the rest was virtually perfect"). An
+    # issue is a red row, a row the check fixed or added, or a clock that is still a guess - the definition measured on
+    # Sep 12's 125 games (_dev_tools/game_replay_test/measure_quarter_share.py). A crew-replaced row never reaches the
+    # coach's screen (ncaa_check.for_keyed_client), so it is not counted.
+    quarter_issues = {}
+    for entry in entries:
+        if entry.get("ncaa_status") == "superseded":
+            continue
+        _qi = quarter_issues.setdefault(str(entry.get("quarter")), {"rows": 0, "issues": 0})
+        _qi["rows"] += 1
+        _changes = entry.get("ncaa_changes") or []
+        _guess = (clock_src.get(str(entry.get("espn_play_id"))) == "guess"
+                  and not any(isinstance(c, dict) and c.get("field") == "clock" for c in _changes))
+        if (str(entry.get("qc_issue") or "").strip() or _changes or entry.get("ncaa_status") == "added" or _guess):
+            _qi["issues"] += 1
+    for _qi in quarter_issues.values():
+        _qi["share"] = round(_qi["issues"] / _qi["rows"], 3) if _qi["rows"] else 0.0
+
     return {
         "entries":    entries,
         "actual_home": actual_home,
@@ -1942,6 +1961,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         "away_name":  capp_away,
         "home_abbrev": home_team_abbrev,
         "away_abbrev": away_team_abbrev,
+        # ESPN's team ids + kickoff stamp: how the backup source finds this game (main.py /backup-source).
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
+        "game_date":  game_date,
         "status":     game_status,
         "league":     league,
         "qc_summary": {
@@ -1958,6 +1981,8 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
             # Where each play's clock came from (apply_text_snap_clocks): text / espn / kickoff / guess.
             # Roger's Gameday Report alerts when most are guesses - the game needs a Bleacher Report upload.
             "clock_sources": dict(Counter(v or "none" for v in clock_src.values())),
+            # {quarter: {rows, issues, share}} - what SBENTRY's end-of-quarter backup prompt reads (see above).
+            "quarter_issues": quarter_issues,
         },
         "fetched_at": time.time(),   # unix timestamp — clients poll this to detect changes
     }

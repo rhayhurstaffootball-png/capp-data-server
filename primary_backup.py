@@ -231,6 +231,10 @@ def to_backup(copy, entries, home_name, away_name, espn_game_id):
     teams = copy.get("teams") or {}
     through = int(copy.get("ready_through") or 0)
     sides = spot_code_sides(entries, plays, home_name, away_name)
+    # Whose play (for a quarter swap, SBENTRY quarter_swap.py): NCAA's team_id against the copy's two teams.
+    # NOT CHECKED YET: whether NCAA names the kicking or the receiving team on a kickoff (CBS names the kicker).
+    tid_side = {str((teams.get(s) or {}).get("team_id") or ""): s for s in ("home", "away")}
+    tid_side.pop("", None)
     items, skipped = [], 0
     for p in plays:
         q = M._quarter(p.get("quarter"))
@@ -239,8 +243,10 @@ def to_backup(copy, entries, home_name, away_name, espn_game_id):
             continue
         low = text.lower()
         clock, is_snap = _clock_of(p, timeout=low.startswith("timeout"))
+        # score_home / score_away: NCAA's score AFTER the play (MEASURED Sep 14 2026 - the touchdown line reads 6-0).
         base = {"quarter": q, "clock": clock, "clock_secs": M.clock_secs(clock), "clock_is_snap": is_snap,
-                "text": text, "score_home": p.get("home_score"), "score_away": p.get("away_score")}
+                "text": text, "score_home": p.get("home_score"), "score_away": p.get("away_score"),
+                "team_side": tid_side.get(str(p.get("team_id") or ""))}
         if low.startswith("timeout"):
             kind = _timeout_item(text, teams)
             if kind is None:
