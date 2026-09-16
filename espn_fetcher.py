@@ -722,6 +722,19 @@ def fill_missing_field_positions(entries):
     prev_gain = 0
     for entry in entries:
         fp = entry.get("field_position", 0)
+        # A STOPPAGE ROW IS TRANSPARENT HERE (fixed Sep 16 2026). An officials timeout has no field position at all -
+        # map_espn_play writes "" for it - so it must not become prev_fp. It used to, and then the next row with no
+        # field position of its own reached `prev_fp < 0` and compared str to int: TypeError, the /plays route 500s,
+        # and the coach gets NO DATA for the whole game.
+        # MEASURED: NFL week 1, 2 of 16 games. It needs the two-minute warning (or an official timeout) followed
+        # IMMEDIATELY by a team timeout, which is why the other 14 - and 15 of 15 college games - never tripped it:
+        #   NE@SEA  idx 164 "Two-Minute Warning" (fp "") -> idx 165 "Timeout #2 by SEA" (fp 0)
+        #   SF@LAR  idx 154 "Official Timeout"   (fp "") -> idx 155 "Timeout #2 by SF"  (fp 0)
+        # Skipping the stoppage fills that timeout row from the last real snap instead: SF@LAR gets 47, which is
+        # exactly where the feed puts the next snap. No game that survived before can change - any game reaching
+        # this branch crashed.
+        if not isinstance(fp, int):
+            continue
         if fp == 0 and prev_fp != 0:
             if prev_fp < 0:
                 prev_yte = 100 + prev_fp
@@ -730,7 +743,10 @@ def fill_missing_field_positions(entries):
             new_yte = max(0, min(100, prev_yte - prev_gain))
             entry["field_position"] = convert_field_position(new_yte)
         prev_fp = entry.get("field_position", 0)
-        prev_gain = int(entry.get("gain", 0))
+        try:
+            prev_gain = int(entry.get("gain", 0) or 0)
+        except (TypeError, ValueError):
+            prev_gain = 0          # same class of bug: a non-numeric gain must never 500 a whole game
 
 # ============================================================
 # Scoreboard Lag
