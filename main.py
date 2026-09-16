@@ -2280,7 +2280,7 @@ async def _backup_source_doc(gid: str, league: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not load the game's plays: {type(e).__name__}: {e}")
     doc = await asyncio.to_thread(cbs_backup.for_game, feed.get("game_date", ""), feed.get("home_team_id", ""),
-                                  feed.get("away_team_id", ""), gid)
+                                  feed.get("away_team_id", ""), gid, league)
     if doc.get("available"):
         return doc
     try:

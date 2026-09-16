@@ -32,7 +32,15 @@ _CACHE_SECONDS = 20          # the live poller asks every ~10 s per open game; o
 
 _cache = {}
 _lock = threading.Lock()
-_tables = {"games": None, "tid_codes": None}
+# Tables are PER LEAGUE, in separate files - never one table with a league column (Sep 16 2026). find_game resolves by
+# ESPN team id, and ESPN's NFL ids run 1-34 straight through the low college range: MEASURED, 14 of the 32 NFL teams
+# share an id with a college team already in the table (Auburn=2=Bills, Arkansas=8=Lions, Arizona=12=Chiefs,
+# Stanford=24=Chargers, California=25=49ers, UCLA=26=Seahawks, USC=30=Jaguars ...). One table cannot hold both.
+# Mirrors workflow.db's `division` column (Roger: "Houston Texans = NFL, Houston = College") and leaves the working
+# college tables untouched. NFL tables are built by _dev_tools/game_replay_test/build_cbs_nfl_tables.py.
+_FILES = {"cfb": ("cbs_games.csv", "cbs_team_codes.json"),
+          "nfl": ("cbs_nfl_games.csv", "cbs_nfl_team_codes.json")}
+_tables = {}
 
 
 def _call(url, ttl=_CACHE_SECONDS):
@@ -55,25 +63,30 @@ def _call(url, ttl=_CACHE_SECONDS):
     return status, body
 
 
-def _load_tables():
-    if _tables["games"] is None:
-        by_date = {}
-        try:
-            for r in csv.DictReader(open(os.path.join(HERE, "cbs_games.csv"), encoding="utf-8")):
-                by_date.setdefault(str(r.get("Date") or ""), []).append(r)
-        except Exception as e:
-            print(f"WARNING: cbs_games.csv not loaded: {type(e).__name__}: {e}", flush=True)
-        _tables["games"] = by_date
-    if _tables["tid_codes"] is None:
-        tid_codes = {}
-        try:
-            codes = json.load(open(os.path.join(HERE, "cbs_team_codes.json"), encoding="utf-8")).get("codes") or {}
-            for code, v in codes.items():
-                tid_codes.setdefault(str(v.get("espn_team_id") or ""), set()).add(code)
-        except Exception as e:
-            print(f"WARNING: cbs_team_codes.json not loaded: {type(e).__name__}: {e}", flush=True)
-        _tables["tid_codes"] = tid_codes
-    return _tables["games"], _tables["tid_codes"]
+def _load_tables(league="cfb"):
+    """(games by date, ESPN team id -> CBS codes) for ONE league. Loaded once per league and never mixed - see _FILES.
+    A missing file caches empty, exactly as before, so a broken table never retries on every poll."""
+    lg = "nfl" if str(league or "").lower() == "nfl" else "cfb"
+    cached = _tables.get(lg)
+    if cached is not None:
+        return cached
+    games_file, codes_file = _FILES[lg]
+    by_date = {}
+    try:
+        for r in csv.DictReader(open(os.path.join(HERE, games_file), encoding="utf-8")):
+            by_date.setdefault(str(r.get("Date") or ""), []).append(r)
+    except Exception as e:
+        print(f"WARNING: {games_file} not loaded: {type(e).__name__}: {e}", flush=True)
+    tid_codes = {}
+    try:
+        codes = json.load(open(os.path.join(HERE, codes_file), encoding="utf-8")).get("codes") or {}
+        for code, v in codes.items():
+            tid_codes.setdefault(str(v.get("espn_team_id") or ""), set()).add(code)
+    except Exception as e:
+        print(f"WARNING: {codes_file} not loaded: {type(e).__name__}: {e}", flush=True)
+    with _lock:
+        _tables[lg] = (by_date, tid_codes)
+    return by_date, tid_codes
 
 
 def _us_dates(game_date):
@@ -85,15 +98,18 @@ def _us_dates(game_date):
     return [d.strftime("%Y%m%d"), (d - datetime.timedelta(days=1)).strftime("%Y%m%d")]
 
 
-def find_game(game_date, home_team_id, away_team_id):
+def find_game(game_date, home_team_id, away_team_id, league="cfb"):
     """The CBS game for an ESPN game: {"available", "cbs_game_id", "home_code", "away_code", "swapped", "note"}.
+
+    league picks which table to read ("cfb" or "nfl") and MUST be passed: the same ESPN team id means a different team
+    in each league (id 25 = California and the 49ers), so reading the wrong table can match the wrong sport's game.
 
     Both teams' codes known and on one game that date -> that game. One team known and the other team's code is not in
     the table at all (a team CBS lists that has not played a matched game yet) -> that game too: a team plays one game
     a date. Anything else -> not available (never a guess)."""
     if not enabled():
         return {"available": False, "note": "CBS turned off (CAPP_CBS=0)"}
-    games, tid_codes = _load_tables()
+    games, tid_codes = _load_tables(league)
     home, away = tid_codes.get(str(home_team_id), set()), tid_codes.get(str(away_team_id), set())
     known = set().union(*tid_codes.values()) if tid_codes else set()
     if not home and not away:

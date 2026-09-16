@@ -1,0 +1,200 @@
+{
+ "built_from": "2026 preseason 1-4 + regular 1-18",
+ "league": "nfl",
+ "codes": {
+  "ARI": {
+   "espn_abbr": "ARI",
+   "espn_location": "Arizona",
+   "espn_team_id": "22",
+   "games": 21
+  },
+  "ATL": {
+   "espn_abbr": "ATL",
+   "espn_location": "Atlanta",
+   "espn_team_id": "1",
+   "games": 20
+  },
+  "BAL": {
+   "espn_abbr": "BAL",
+   "espn_location": "Baltimore",
+   "espn_team_id": "33",
+   "games": 20
+  },
+  "BUF": {
+   "espn_abbr": "BUF",
+   "espn_location": "Buffalo",
+   "espn_team_id": "2",
+   "games": 20
+  },
+  "CAR": {
+   "espn_abbr": "CAR",
+   "espn_location": "Carolina",
+   "espn_team_id": "29",
+   "games": 21
+  },
+  "CHI": {
+   "espn_abbr": "CHI",
+   "espn_location": "Chicago",
+   "espn_team_id": "3",
+   "games": 20
+  },
+  "CIN": {
+   "espn_abbr": "CIN",
+   "espn_location": "Cincinnati",
+   "espn_team_id": "4",
+   "games": 20
+  },
+  "CLE": {
+   "espn_abbr": "CLE",
+   "espn_location": "Cleveland",
+   "espn_team_id": "5",
+   "games": 20
+  },
+  "DAL": {
+   "espn_abbr": "DAL",
+   "espn_location": "Dallas",
+   "espn_team_id": "6",
+   "games": 20
+  },
+  "DEN": {
+   "espn_abbr": "DEN",
+   "espn_location": "Denver",
+   "espn_team_id": "7",
+   "games": 20
+  },
+  "DET": {
+   "espn_abbr": "DET",
+   "espn_location": "Detroit",
+   "espn_team_id": "8",
+   "games": 20
+  },
+  "GB": {
+   "espn_abbr": "GB",
+   "espn_location": "Green Bay",
+   "espn_team_id": "9",
+   "games": 20
+  },
+  "HOU": {
+   "espn_abbr": "HOU",
+   "espn_location": "Houston",
+   "espn_team_id": "34",
+   "games": 20
+  },
+  "IND": {
+   "espn_abbr": "IND",
+   "espn_location": "Indianapolis",
+   "espn_team_id": "11",
+   "games": 20
+  },
+  "JAC": {
+   "espn_abbr": "JAX",
+   "espn_location": "Jacksonville",
+   "espn_team_id": "30",
+   "games": 20
+  },
+  "KC": {
+   "espn_abbr": "KC",
+   "espn_location": "Kansas City",
+   "espn_team_id": "12",
+   "games": 20
+  },
+  "LAC": {
+   "espn_abbr": "LAC",
+   "espn_location": "Los Angeles",
+   "espn_team_id": "24",
+   "games": 20
+  },
+  "LAR": {
+   "espn_abbr": "LAR",
+   "espn_location": "Los Angeles",
+   "espn_team_id": "14",
+   "games": 20
+  },
+  "LV": {
+   "espn_abbr": "LV",
+   "espn_location": "Las Vegas",
+   "espn_team_id": "13",
+   "games": 20
+  },
+  "MIA": {
+   "espn_abbr": "MIA",
+   "espn_location": "Miami",
+   "espn_team_id": "15",
+   "games": 20
+  },
+  "MIN": {
+   "espn_abbr": "MIN",
+   "espn_location": "Minnesota",
+   "espn_team_id": "16",
+   "games": 20
+  },
+  "NE": {
+   "espn_abbr": "NE",
+   "espn_location": "New England",
+   "espn_team_id": "17",
+   "games": 20
+  },
+  "NO": {
+   "espn_abbr": "NO",
+   "espn_location": "New Orleans",
+   "espn_team_id": "18",
+   "games": 20
+  },
+  "NYG": {
+   "espn_abbr": "NYG",
+   "espn_location": "New York",
+   "espn_team_id": "19",
+   "games": 20
+  },
+  "NYJ": {
+   "espn_abbr": "NYJ",
+   "espn_location": "New York",
+   "espn_team_id": "20",
+   "games": 20
+  },
+  "PHI": {
+   "espn_abbr": "PHI",
+   "espn_location": "Philadelphia",
+   "espn_team_id": "21",
+   "games": 20
+  },
+  "PIT": {
+   "espn_abbr": "PIT",
+   "espn_location": "Pittsburgh",
+   "espn_team_id": "23",
+   "games": 20
+  },
+  "SEA": {
+   "espn_abbr": "SEA",
+   "espn_location": "Seattle",
+   "espn_team_id": "26",
+   "games": 20
+  },
+  "SF": {
+   "espn_abbr": "SF",
+   "espn_location": "San Francisco",
+   "espn_team_id": "25",
+   "games": 20
+  },
+  "TB": {
+   "espn_abbr": "TB",
+   "espn_location": "Tampa Bay",
+   "espn_team_id": "27",
+   "games": 20
+  },
+  "TEN": {
+   "espn_abbr": "TEN",
+   "espn_location": "Tennessee",
+   "espn_team_id": "10",
+   "games": 20
+  },
+  "WAS": {
+   "espn_abbr": "WSH",
+   "espn_location": "Washington",
+   "espn_team_id": "28",
+   "games": 20
+  }
+ },
+ "conflicts": {},
+ "unmatched_codes": []
+}

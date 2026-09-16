@@ -193,10 +193,11 @@ def _mmss(clock):
     return "%02d:%02d" % divmod(s, 60) if s is not None else ""
 
 
-def for_game(game_date, home_team_id, away_team_id, espn_game_id=""):
-    """Find the CBS game for an ESPN game and build its backup items. Never raises."""
+def for_game(game_date, home_team_id, away_team_id, espn_game_id="", league="cfb"):
+    """Find the CBS game for an ESPN game and build its backup items. Never raises.
+    league picks CBS's per-league table (see cbs_live.find_game) - an ESPN team id alone does not say which sport."""
     try:
-        cg = cbs_live.find_game(game_date, home_team_id, away_team_id)
+        cg = cbs_live.find_game(game_date, home_team_id, away_team_id, league)
         if not cg.get("available"):
             return {"available": False, "note": cg.get("note") or "No backup game found."}
         pbp = cbs_live.play_by_play(cg["cbs_game_id"])

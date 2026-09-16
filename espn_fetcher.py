@@ -1845,31 +1845,37 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # either way: the server keeps it for the PRIMARY BACKUP button, and it is CBS's check's next clock source.
     # The summary keeps the key "ncaa_check" - every client and test reads that key; "source" says which one ran.
     ncaa_summary = {"available": False, "review_count": 0}
-    if league == "cfb":
+    if league in ("cfb", "nfl"):
         _gd = ""
         for _c in (data.get("header", {}) or {}).get("competitions", [{}]):
             _gd = _c.get("date", "") or _gd
         _pbp, _found = None, {}
-        try:
-            import ncaa_live
-            _found = ncaa_live.resolve_game(_season_guess(_gd), capp_home, capp_away,
-                                            date=_ncaa_date(_gd) or None)
-            if _found.get("available"):
-                _pbp = ncaa_live.play_by_play(_found["ncaa_game_id"])
-                if _pbp.get("available") and summary is None:
-                    # Primary Backup (Roger, Sep 14 2026): keep NCAA's copy while the game is played - NCAA rewrites a
-                    # game later and drops the team from every spot. Never from a replay (summary given). Never raises,
-                    # stores on its own thread. See primary_backup.py.
-                    import primary_backup
-                    primary_backup.note_pbp(game_id, _found["ncaa_game_id"], _pbp)
-        except Exception as e:
-            print(f"WARNING: NCAA fetch failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+        # NFL gets CBS and nothing else (Sep 16 2026). NCAA is college-only by definition (ncaa_live is division=
+        # "fbs"), so an NFL game has no second vote and no primary backup. Consequence to know: cbs_check skips its
+        # two-source down/distance/spot step without ncaa_pbp (cbs_check.py:489), so NFL gets verification, CBS clock
+        # fixes and missing-play adds - not D&D corrections. Timeouts are unchanged too (_classify_timeouts is cfb
+        # only, and CBS writes no timeout plays); NFL timeout attribution stays the gamebook-abbreviation path.
+        if league == "cfb":
+            try:
+                import ncaa_live
+                _found = ncaa_live.resolve_game(_season_guess(_gd), capp_home, capp_away,
+                                                date=_ncaa_date(_gd) or None)
+                if _found.get("available"):
+                    _pbp = ncaa_live.play_by_play(_found["ncaa_game_id"])
+                    if _pbp.get("available") and summary is None:
+                        # Primary Backup (Roger, Sep 14 2026): keep NCAA's copy while the game is played - NCAA
+                        # rewrites a game later and drops the team from every spot. Never from a replay (summary
+                        # given). Never raises, stores on its own thread. See primary_backup.py.
+                        import primary_backup
+                        primary_backup.note_pbp(game_id, _found["ncaa_game_id"], _pbp)
+            except Exception as e:
+                print(f"WARNING: NCAA fetch failed for {game_id}: {type(e).__name__}: {e}", flush=True)
         _pbp_ok = bool(_pbp and _pbp.get("available"))
         cbs_ran = False
         try:
             import cbs_live
             import cbs_check
-            _cg = cbs_live.find_game(_gd, home_team_id, away_team_id)
+            _cg = cbs_live.find_game(_gd, home_team_id, away_team_id, league)
             if _cg.get("available"):
                 _cp = cbs_live.play_by_play(_cg["cbs_game_id"])
                 if _cp.get("available"):
