@@ -284,6 +284,31 @@ def _written_differently(e, it):
 # ── lining up ─────────────────────────────────────────────────────────────────
 
 SERIES_SECONDS = 180          # same_series_snap: the two sources' clocks for one snap are never this far apart
+SERIES_GUARD = True           # same_series_snap also requires the SAME SERIES (possession count) - see _series_indices
+
+
+def _series_indices(seq, team_of):
+    """Roger's series sequence, per source: "A Sequential number of Possesions by a Team... if a Team recieves a
+    Kickoff... They get 3 First downs then they have to Punt that is Series 1 for that team. The next time they are on
+    offense... that is Series 2." (Sep 18 2026). Returns, for each element of `seq`, the index of the possession it
+    belongs to inside its quarter - counted from the start of the quarter, incremented every time the offense
+    changes on a snapped play (a numeric down). Kicks, tries and penalty-only lines inherit the possession around
+    them. Counted the same way on ESPN's rows and on CBS's plays, in each source's own team vocabulary, so the two
+    numbers agree exactly when the two sources saw the same sequence of possession changes - no team-id mapping.
+    `team_of(x)` names the offense for an element (ESPN: the possession name; CBS: team_in_possession)."""
+    out, q_last, idx, offense = [], None, 0, None
+    for x in seq:
+        q = M._quarter(x.get("quarter"))
+        if q != q_last:
+            q_last, idx, offense = q, 0, None
+        down = str(x.get("down") or "").strip()
+        team = team_of(x) if down.isdigit() else None
+        if team and team != offense:
+            if offense is not None:
+                idx += 1
+            offense = team
+        out.append(idx)
+    return out
 
 
 def same_series_snap(e, it):
@@ -311,7 +336,14 @@ def same_series_snap(e, it):
     if fp is None or y is None or abs(abs(fp) - y) > SNAP_YARDS:
         return False
     ec, cc = M.clock_secs(M.norm_clock(e.get("clock"))), it.get("clock_secs")
-    return ec is not None and cc is not None and abs(ec - cc) <= SERIES_SECONDS
+    if ec is None or cc is None or abs(ec - cc) > SERIES_SECONDS:
+        return False
+    # Roger, Sep 18 2026: "if there is a Clock issue and we need to make sure the change is in the right spot, it
+    # needs to be part of the same series sequence". Both sides carry their possession index (verify_entries stamps
+    # them); a snap in a different possession is a different snap, whatever else matches.
+    if SERIES_GUARD and e.get("_series") is not None and it.get("_series") is not None and e["_series"] != it["_series"]:
+        return False
+    return True
 
 
 def _good_pair(e, it):
@@ -506,6 +538,11 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
 
     quarters = sorted({M._quarter(e.get("quarter")) for e in work} - {0})
     last_q = max(quarters) if quarters else 0
+    # The series sequence on both sides (see _series_indices) - what same_series_snap compares.
+    for e, s in zip(work, _series_indices(work, lambda x: x.get("possession"))):
+        e["_series"] = s
+    for it, s in zip(plays, _series_indices(plays, lambda x: x.get("team_id"))):
+        it["_series"] = s
     pairs, to_add = {}, []
     for q in quarters:
         mine = [(i, e) for i, e in enumerate(work) if M._quarter(e.get("quarter")) == q
