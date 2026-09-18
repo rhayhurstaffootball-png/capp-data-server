@@ -973,6 +973,143 @@ def _raise_lagging_scores(entries, events):
     return fixes
 
 
+# A scoring play, an extra point / try, or a kickoff - in ESPN's typed style ("... for 14 yards, TOUCHDOWN",
+# "field goal attempt from 30 yards GOOD", "#99 N.Reed kickoff 65 yards") and in its scoring-summary style
+# ("Dominique Henry 13 Yd pass from Caden Veltkamp (Connor Cook Kick)", "Connor Calvert 39 Yd Field Goal").
+_SCORE_TEXT = re.compile(r"touchdown|field goal|kick attempt|extra point|safety|two.point|kickoff|\b\d+ yd\b|for a td\b",
+                         re.I)
+
+
+def _lower_spiked_scores(entries, events):
+    """Bring down a run of rows showing a score the game had not reached yet.
+
+    The case (SMU vs UC Davis Q2, Sep 12 2026, found on Roger's Sep 18 replay): the crew deleted and re-typed two plays
+    from the 7:00-5:30 stretch late in the half, and each re-entry took the clock and score OF THAT MOMENT (0:59 /
+    35-0, 0:24 / 42-0). `apply_scoreboard_lag` hands every row the score of the row before it, so the four rows after
+    those two re-entries read 35-0 and 42-0 while the game was 28-0 - four wrong boards - and the two rows AFTER
+    them were flagged "Score dropped -14" for being right. `_raise_lagging_scores` is raise-only and cannot touch it.
+
+    A SPIKE, per side, needs all three:
+      1. the score RISES at an ordinary row - a play, a penalty line, a timeout - never at a scoring play, an extra
+         point, a try or a kickoff, where a rise is what should happen;
+      2. the run then COMES BACK DOWN below its lowest score (ESPN's rows contradict themselves, and a score never
+         goes down, so the run is the wrong part);
+      3. the row sits ABOVE the score ESPN's scoring summary allows at its clock (the last event at or before it,
+         strictly before it for the scoring row itself). A row the summary vouches for is never touched, whatever
+         the rows after it say - they may be the lagging ones, stuck on a clock the raise could not lift.
+    The value is that summary ceiling, held between the score entering the run and the score after it; when the
+    summary is behind those neighbours its clock is stale and the score after the run stands.
+
+    ⚠ MEASURED on the way here (Sep 12 corpus): the first version ("above the ceiling and later rows lower") lowered
+    218 rows in 63 games and got four wrong AT scoring plays - an extra point 36 s off the summary's clock sent to
+    0-0 (Texas State), a kickoff typed 5:00 after a TD the summary has at 4:59 sent back to the score before the TD
+    (Army), a "0:00" summary clock lowering a real touchdown (Nicholls); rule 1 leaves every one alone. Without
+    rule 3, HCU vs Arkansas Baptist Q2 lowered five rows at 28-0 the summary vouched for, because the rows after them
+    sit on a stuck clock and still read 21-0. One note per run, like the raise.
+    """
+    fixes = {}
+    if not events:
+        return fixes
+
+    def _secs(e):
+        raw = str(e.get("clock") or "")
+        return _clock_to_seconds(raw) if re.match(r"^\d{1,2}:\d{2}$", raw) else None
+
+    def _q(e):
+        try:
+            return int(e.get("quarter"))
+        except (TypeError, ValueError):
+            return None
+
+    def _is_scoring_row(e):
+        down = str(e.get("down") or "").strip().upper()
+        if down in ("EP", "2PT", "KO"):
+            return True
+        return bool(_SCORE_TEXT.search(str(e.get("play_text") or "")))
+
+    def _ceiling(e, side, strict):
+        q, c = _q(e), _secs(e)
+        if q is None or c is None:
+            return None
+        val = 0
+        for (eq, ec, eh, ea) in events:
+            key = (eq, -ec)
+            if key < (q, -c) or (not strict and key == (q, -c)):
+                val = eh if side == "home_score" else ea
+            else:
+                break
+        return val
+
+    # Rows with a usable score, in table order (a negative score is a broken row - not evidence either way).
+    order = [i for i, e in enumerate(entries)
+             if isinstance(e.get("home_score"), int) and isinstance(e.get("away_score"), int)
+             and e["home_score"] >= 0 and e["away_score"] >= 0]
+    original = {i: (entries[i]["home_score"], entries[i]["away_score"]) for i in order}
+    for side in ("home_score", "away_score"):
+        n = 0
+        while n + 1 < len(order):
+            i_prev, i = order[n], order[n + 1]
+            before, s = entries[i_prev][side], entries[i][side]
+            if not (s > before) or _is_scoring_row(entries[i]):
+                n += 1
+                continue
+            # A rise at an ordinary row. The row after an extra point or a kickoff rises too - the scoring row shows
+            # the score BEFORE its points, so the points land on the next row - which is why rule 3 is asked here as
+            # well: the run may only start on a row the summary says is too high (Purdue Q1: the row after the
+            # 7-6 extra point read 7-7, and a run started there swallowed the rest of the quarter).
+            ceil_i = _ceiling(entries[i], side, strict=False)
+            if ceil_i is None or s <= ceil_i:
+                n += 1
+                continue
+            # Rule 1 met. Walk the run while the score stays at or above its lowest value.
+            run, low, m = [i], s, n + 2
+            after = None
+            while m < len(order):
+                j = order[m]
+                sj = entries[j][side]
+                if sj < low:
+                    after = sj
+                    break
+                run.append(j)
+                low = min(low, sj)
+                m += 1
+            if after is None:
+                n = m                              # never came back down: a real score, leave it
+                continue
+            # Rule 2 met. A score entering the run that is HIGHER than the one after it is a spike of its own (Purdue:
+            # a stray 13-20 row sat right before the 23-23 stretch) - the lower neighbour is the one to hold to.
+            before = min(before, after)
+            noted = False                          # rule 3 is per row
+            for k in run:
+                e = entries[k]
+                if str(e.get("down") or "").strip().upper() in ("EP", "2PT", "KO"):
+                    continue                       # a kick or kickoff inside the run keeps its score: its clock is the
+                                                   # scoring play's, and the summary's clock for that is seconds off
+                                                   # (Central Arkansas 8:58, Nicholls 8:59: the extra point was
+                                                   # being sent to the score before its own touchdown)
+                ceil = _ceiling(e, side, strict=bool(_SCORE_TEXT.search(str(e.get("play_text") or ""))))
+                if ceil is None:
+                    target = before                # no clock to ask the summary about: the score entering the run
+                elif e[side] <= ceil:
+                    continue                       # the summary vouches for this row - not ours to touch
+                elif ceil < before:
+                    target = after                 # the summary's clock is stale here; the rows around it decide
+                else:
+                    target = min(ceil, after)
+                if e[side] > target:
+                    e[side] = target
+                    oh, oa = original[k]
+                    note = f"Auto-fixed: score {oh}-{oa} → {e['home_score']}-{e['away_score']}"
+                    if e.get("_score_fix_note", "").startswith("Auto-fixed: score ") and k in fixes:
+                        fixes[k] = e["_score_fix_note"] = note   # the other side already noted this row: refresh it
+                        noted = True
+                    elif not noted:
+                        fixes[k] = e["_score_fix_note"] = note
+                        noted = True
+            n = m
+    return fixes
+
+
 # ============================================================
 # Scoring Gap Detection (period boundaries)
 # ============================================================
@@ -2049,6 +2186,8 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     _events = score_events(data)
     for _i, _msg in _raise_lagging_scores(entries, _events).items():
         entry_fixes.setdefault(_i, _msg)
+    # (_lower_spiked_scores, the raise's counterpart, runs later - after the CBS clock fixes and the timeout re-slot,
+    # so it sees the rows in their best order: a timeout ESPN filed at the wrong spot carries the score of ITS clock.)
 
     # Insert placeholder entries for scoring plays missing from the feed
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
@@ -2123,6 +2262,16 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     except Exception as e:
         _to_moves = []
         print(f"WARNING: timeout re-slot failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+
+    # Bring down a run of rows carrying a score the game had not reached yet (a play re-typed late took the score of
+    # that moment, and the scoreboard lag handed it to the rows after it - SMU Q2, Sep 12 2026). Here, after the CBS
+    # clock fixes and the timeout re-slot, so the rows are in their best order first: measured on the Sep 12 corpus,
+    # a timeout ESPN filed 3 minutes early got lowered to the score of the spot it was filed in, not of its clock.
+    try:
+        for _i, _msg in _lower_spiked_scores(entries, _events).items():
+            entry_fixes.setdefault(_i, _msg)
+    except Exception as e:
+        print(f"WARNING: score spike pass failed for {game_id}: {type(e).__name__}: {e}", flush=True)
 
     # Stable identity per row, AFTER every step that adds rows. Live clients
     # take new plays by this key instead of by count - see _assign_entry_keys.
