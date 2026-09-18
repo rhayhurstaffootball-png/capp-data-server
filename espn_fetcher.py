@@ -528,6 +528,73 @@ def reslot_late_timeouts(plays):
     return moves
 
 
+def reslot_timeouts_by_clock(entries):
+    """reslot_late_timeouts again, on the FINISHED rows, by each row's clock. Returns the moves made.
+
+    ⚠ WHY A SECOND PASS (Syracuse @ Pitt Q4, Sep 17-18 2026, Roger live). reslot_late_timeouts runs on the raw feed,
+    before any clock work. There it saw two Syracuse timeouts (3:03, 2:56) sitting above five plays the crew had
+    stamped (02:00) - in order, as far as the typed times could tell. The backup check then put the five plays back
+    on their real clocks (3:08 / 3:03 / 2:56 / 2:56 / 2:15) and the same two timeouts now read backwards against
+    them. Roger: "166-169 are now out of order". Same rule, same limits - only a timeout moves, only inside its
+    quarter, only when plainly out of place (more than 5 s) - just measured against the corrected clocks, so a
+    timeout the crew filed early lands where its own typed time says, after the play with the higher clock and
+    before the first play with a lower one (CBS's order for the Pitt pair).
+    """
+    moves = []
+    i = 0
+    while i < len(entries):
+        t = entries[i]
+        if not (str(t.get("play_text") or "").strip().lower().startswith("timeout")
+                or t.get("home_time_out") == "Yes" or t.get("away_time_out") == "Yes"):
+            i += 1
+            continue
+        tsecs = _clock_to_seconds(str(t.get("clock") or ""))
+        q = t.get("quarter")
+        if not tsecs or q is None:
+            i += 1
+            continue
+
+        def _play_secs(e):
+            # A play nobody vouches for (the backup check paired nothing to it) cannot anchor a timeout either
+            # way - Pitt's second kickoff line, stamped 2:07 and unpaired, sat between the two timeouts and the
+            # corrected plays and hid the whole problem. Same principle as the stuck-run fence in cbs_check.
+            if e.get("quarter") != q or str(e.get("down") or "") == "OTO" or e.get("home_time_out") == "Yes" \
+                    or e.get("away_time_out") == "Yes" or str(e.get("play_text") or "").strip().lower().startswith("timeout") \
+                    or e.get("ncaa_status") == "unverified":
+                return None
+            s = _clock_to_seconds(str(e.get("clock") or ""))
+            return s if s else None
+
+        prev = next((_play_secs(entries[k]) for k in range(i - 1, -1, -1)
+                     if entries[k].get("quarter") == q and _play_secs(entries[k]) is not None), None)
+        nxt = next((_play_secs(entries[k]) for k in range(i + 1, len(entries))
+                    if entries[k].get("quarter") == q and _play_secs(entries[k]) is not None), None)
+        if prev is not None and prev + 5 < tsecs:
+            # Filed LATE: the play before it already shows a lower clock. In front of the first play below its time.
+            target = next((k for k in range(i) if entries[k].get("quarter") == q
+                           and _play_secs(entries[k]) is not None and _play_secs(entries[k]) < tsecs), None)
+            if target is None:
+                i += 1
+                continue
+            entries.insert(target, entries.pop(i))
+            moves.append({"text": str(t.get("play_text") or "")[:60], "quarter": q, "from": i, "to": target})
+            i += 1
+            continue
+        if nxt is not None and nxt > tsecs + 5:
+            # Filed EARLY: the play after it still shows a HIGHER clock - the Pitt case, once the five plays under the
+            # two Syracuse timeouts went from 2:00 back to 3:08-2:15. It goes after every later play with a higher
+            # clock, in front of the first at or below its time (a timeout stops the clock at T and the next snap is at
+            # T - Roger's measured convention: the timeout carries the clock of the play after it).
+            target = next((k for k in range(i + 1, len(entries)) if entries[k].get("quarter") != q
+                           or (_play_secs(entries[k]) is not None and _play_secs(entries[k]) <= tsecs)), len(entries))
+            row = entries.pop(i)
+            entries.insert(target - 1, row)
+            moves.append({"text": str(row.get("play_text") or "")[:60], "quarter": q, "from": i, "to": target - 1})
+            continue                              # re-check the row now at i
+        i += 1
+    return moves
+
+
 def apply_text_snap_clocks(plays):
     """The snap time the stat crew typed into the play text is the clock. Final say.
 
@@ -1028,7 +1095,7 @@ def _fill_scoring_gaps(entries, home_display, away_display, events=None):
 
 _QC_VALID_POS    = {0, 1, 2, 3, 6, 7, 8}   # valid positive score deltas
 _QC_BUNDLED_ART  = {-7, -8}                 # lag mirrors of bundled TD+EP — skip
-_QC_STUCK_THRESH = 4
+_QC_STUCK_THRESH = 3   # matches cbs_check.STUCK_RUN (4 until Sep 18 2026 - see the note there)
 
 def _qc_flag_entries(entries, home_name, away_name):
     """
@@ -1064,6 +1131,25 @@ def _qc_flag_entries(entries, home_name, away_name):
                 flags.setdefault(i, []).append(f"Clock stuck ({streak}+ plays)")
         else:
             streak = 1
+
+    # A row sitting above a play whose clock the backup check CORRECTED, with a lower clock of its own, is provably
+    # out of place: the corrected clock is fenced by both sources, this row's is not. Syracuse @ Pitt Q4 (Sep 17-18
+    # 2026): ESPN's second kickoff line, stamped 2:07, stayed above five plays put back on 3:08-2:15 - it is ESPN's
+    # own duplicate of the onside kick and nothing could vouch for it. The play-order check did not see it (it
+    # compares paired plays, and this row has no pair), so the coach saw 3:03 / 2:56 / 2:07 / 3:08 with no flag.
+    # Roger: "166-169 are now out of order". Only against a corrected neighbour, so an ordinary game never sees it.
+    for i in range(len(entries) - 1):
+        c, n = entries[i], entries[i + 1]
+        if c.get("quarter") != n.get("quarter") or n.get("ncaa_status") != "fixed":
+            continue
+        if not any(isinstance(ch, dict) and ch.get("field") == "clock" for ch in (n.get("ncaa_changes") or [])):
+            continue
+        if (c.get("home_time_out") == "Yes" or c.get("away_time_out") == "Yes"
+                or str(c.get("down") or "") == "OTO" or str(c.get("play_text") or "").strip().lower().startswith("timeout")):
+            continue
+        mine, theirs = _clock_to_seconds(str(c.get("clock") or "")), _clock_to_seconds(str(n.get("clock") or ""))
+        if mine and theirs and mine + 5 < theirs:
+            flags.setdefault(i, []).append("Out of order - check this play")
 
     # Missing EP — only fires when _infer_missing_pats also failed
     for i in range(1, len(entries)):
@@ -2029,6 +2115,14 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                 ncaa_summary["source"] = "ncaa"
             except Exception as e:
                 print(f"WARNING: NCAA check failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+
+    # Timeouts once more, against the CORRECTED clocks (see reslot_timeouts_by_clock). Before the keys and before the
+    # timeout classify, so every index those two hand on is still the row it names.
+    try:
+        _to_moves = reslot_timeouts_by_clock(entries)
+    except Exception as e:
+        _to_moves = []
+        print(f"WARNING: timeout re-slot failed for {game_id}: {type(e).__name__}: {e}", flush=True)
 
     # Stable identity per row, AFTER every step that adds rows. Live clients
     # take new plays by this key instead of by count - see _assign_entry_keys.

@@ -46,7 +46,10 @@ import ncaa_match as M
 PLAY_KINDS = ("play", "kickoff", "extra_point", "two_point")
 MIN_PAIR_SCORE = 6            # backup_resolve's value, graded on Bleacher Report pastes (CBS words plays the same way)
 DISTANCE_TYPO = 1             # Roger: "Wouldnt surprise me if the play is 1 yard off"
-STUCK_RUN = 4                 # the "Clock stuck (4+ plays)" QC error - espn_fetcher._QC_STUCK_THRESH
+STUCK_RUN = 3                 # the "Clock stuck" QC error - espn_fetcher._QC_STUCK_THRESH. Was 4 until Sep 18 2026:
+                              # Syracuse @ Pitt Q4 had three snaps on 3:09 the check never looked at. MEASURED at 3 on
+                              # the Sep 12 corpus + Pitt: 47 runs (17 at 4), 20 confirmed stuck for real and left
+                              # alone, CBS clock fixes 506 -> 511, backwards clocks 16 -> 16, games worse 0.
 SAME_CLOCK_SECONDS = 5        # CBS within this of a stuck clock on every play = the clock was stuck for real
 BACKWARDS_MARGIN = 5          # an ESPN clock this far above the row before it runs backwards (every_game_check.BACK_MARGIN)
 SNAP_YARDS = 1                # same snap: yard line within this (a typo), see same_snap()
@@ -54,6 +57,10 @@ SNAP_YARDS = 1                # same snap: yard line within this (a typo), see s
 # difference" / distance and spot: "I would say 2... because if its off I have seen it be off by 1 but 2 yards is a long
 # way". So 2+ yards off = fixed when CBS and NCAA agree; 1 yard stays ESPN's.
 NOTICEABLE_YARDS = 2
+# A stretch of typed ESPN clocks all off CBS's by this much in the same direction takes CBS's clocks (see the
+# "off as a run" step in verify_entries). Module-level so a measurement can switch the rule off (OFF_RUN_MIN = 999).
+OFF_RUN_SECONDS = 30
+OFF_RUN_MIN = 3
 _NO_CLOCK_DOWNS = ("EP", "2PT")
 # A penalty-only CBS line ESPN does not have (a dead-ball foul, no snap) is NOT added until Roger rules: an extra board with
 # no film clip moved every later clip on SMU Sep 12 (the 9:57 personal foul), and whether dead-ball fouls get a board is
@@ -276,13 +283,44 @@ def _written_differently(e, it):
 
 # ── lining up ─────────────────────────────────────────────────────────────────
 
+SERIES_SECONDS = 180          # same_series_snap: the two sources' clocks for one snap are never this far apart
+
+
+def same_series_snap(e, it):
+    """Roger, Sep 18 2026: "Down Distance Yardline as it applies in the series of plays... We dont want the same Down
+    Distance and yard line to create dupes because they happen to be the same 6 minutes apart in a game."
+    The line-up already proposes pairs in sequence order; this is the content test for such a pair when the two
+    scorers wrote the snap so differently that nothing else matches - Syracuse @ Pitt Q4: ESPN "#4 J.Johnson rush
+    middle for 10 yards to the Pitt44 (#17 C.Woodson)" at 5:14, CBS "A.Odom pass to T.Russell, tackled by C.Woodson
+    at PITT 44" at 6:22, both 2nd & 9 at the 46 - one snap, and the live check added CBS's as a second play.
+    Same down, distance within 1, the same yard line - and clocks inside SERIES_SECONDS, which is what keeps a
+    2nd & 9 at the 46 in the first quarter from pairing with one six minutes later. A penalty-only line never uses
+    this (it has no snap)."""
+    if it.get("kind") != "play" or it.get("down") is None:
+        return False
+    et, ct = str(e.get("play_text") or ""), str(it.get("text") or "")
+    if _PEN_ONLY.match(et) or _PEN_ONLY.match(ct):
+        return False
+    down = str(e.get("down") or "").strip().upper()
+    if not down.isdigit() or int(down) != int(it["down"]):
+        return False
+    d1, d2 = _int(e.get("distance")), _int(it.get("distance"))
+    if d1 is None or d2 is None or abs(d1 - d2) > DISTANCE_TYPO:
+        return False
+    fp, y = _int(e.get("field_position")), _int(it.get("spot_yard"))
+    if fp is None or y is None or abs(abs(fp) - y) > SNAP_YARDS:
+        return False
+    ec, cc = M.clock_secs(M.norm_clock(e.get("clock"))), it.get("clock_secs")
+    return ec is not None and cc is not None and abs(ec - cc) <= SERIES_SECONDS
+
+
 def _good_pair(e, it):
     """The line-up's pair is really this play: a penalty-only line never pairs with a snapped play (Middle Tennessee,
     Sep 12), content strong enough, clocks not far apart - or Roger's same-play test, whatever the clocks say."""
     text = str(e.get("play_text") or "")
     if bool(_PEN_ONLY.match(text)) != bool(_PEN_ONLY.match(it.get("text", ""))):
         return same_play(e, it)                  # only the play that very foul wiped out
-    if same_play(e, it):
+    if same_play(e, it) or same_series_snap(e, it):
         return True
     if M.score_pair(e, _as_ncaa(it)) < MIN_PAIR_SCORE:
         return False
@@ -617,6 +655,51 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
                 summary["clock_fixes"]["cbs"] += 1
             done.add(i)
         summary["stuck_blocks"] = summary.get("stuck_blocks", 0) + 1
+    # ⚠ A RUN OF TYPED CLOCKS THAT ARE ALL OFF THE SAME WAY takes CBS's clocks - Roger, Sep 18 2026, on the measured
+    # numbers: "the clock that makes sense wins". MEASURED on 70 games / 9,960 paired plays with a typed snap: the
+    # two sources sit within 7 s on 90% of plays and 40 s on 99%; only 1.3% differ by 30+ s, and a LONE big gap can be
+    # CBS's fault (period-boundary junk: ESPN 0:41 vs CBS 15:00). What is never CBS's fault is a STRETCH of plays all
+    # late by a minute in the same direction (Syracuse @ Pitt Q4: 5:14 / 4:15 / 3:46 / 3:13 / 3:09 / 3:09 / 3:09 where
+    # CBS has 6:22 / 5:44 / 5:25 / 4:58 / 4:57 / 4:28 / 3:50 - ESPN's version ends in three snaps on one second).
+    # So: three or more consecutive paired plays, every typed clock 30+ s from CBS's and all the same way, CBS's
+    # clocks running down and sitting between the paired plays either side of the run (which by construction agree
+    # with CBS within 30 s - they ended the run). Timeouts and admin lines are transparent; an unpaired play or a
+    # play the two sources agree on ends the run. One disagreement alone stays ESPN's.
+    def _flush_off_run(run):
+        if len(run) < OFF_RUN_MIN:
+            return
+        secs = [pairs[i]["clock_secs"] for i in run]
+        if any(b > a for a, b in zip(secs, secs[1:])):
+            return
+        q = work[run[0]].get("quarter")
+        hi = _trusted_bound(work, pairs, run[0], q, above=True)
+        lo = _trusted_bound(work, pairs, run[-1], q, above=False)
+        if not (lo <= secs[-1] and secs[0] <= hi):
+            return
+        for i, s in zip(run, secs):
+            change(i, "clock", "%d:%02d" % divmod(s, 60), "CBS clock (typed clocks off as a run)")
+            summary["clock_fixes"]["cbs"] += 1
+            done.add(i)
+        summary["off_runs"] = summary.get("off_runs", 0) + 1
+
+    off_run, off_dir = [], 0
+    for i, e in enumerate(work):
+        if M.is_admin_line(e.get("play_text", "")) or _is_timeout(e):
+            continue                                     # transparent: a timeout inside a late stretch is still one stretch
+        it = pairs.get(i)
+        s = M.clock_secs(M.norm_clock(e.get("clock")))
+        direction = 0
+        if (it is not None and it.get("clock_secs") is not None and s is not None and i not in done
+                and _SNAP.match(str(e.get("play_text") or ""))
+                and str(e.get("down") or "").strip().upper() not in _NO_CLOCK_DOWNS):
+            d = it["clock_secs"] - s
+            direction = 1 if d > OFF_RUN_SECONDS else (-1 if d < -OFF_RUN_SECONDS else 0)
+        if direction and off_run and direction == off_dir and work[off_run[-1]].get("quarter") == e.get("quarter"):
+            off_run.append(i)
+            continue
+        _flush_off_run(off_run)
+        off_run, off_dir = ([i], direction) if direction else ([], 0)
+    _flush_off_run(off_run)
     need_ncaa = [i for i in todo if i not in done]
     if need_ncaa and ncaa_pbp:
         for i, secs in sorted(_ncaa_clocks(work, need_ncaa, ncaa_pbp).items()):
