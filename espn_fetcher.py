@@ -823,10 +823,94 @@ def _auto_fix_entries(entries):
 
 
 # ============================================================
+# The score ESPN itself publishes (scoringPlays)
+# ============================================================
+
+def score_events(data):
+    """ESPN's own scoring summary as (period, clock seconds, home, away), in game order.
+
+    ⚠ THE AUTHORITY ON THE SCORE, AND WE WERE NOT READING IT. ESPN's play rows lag: a field goal at the end of a half
+    leaves every row of the next period carrying the old score until ESPN's own numbers catch up. MEASURED on
+    Syracuse @ Pitt (Sep 17 2026, Roger live): Syracuse kicked a 42-yarder at Q2 0:02 to go to 10, and the first TEN
+    Q3 rows still read 17-7, so ten boards would have gone to film 3 points short. `_auto_fix_entries` says a score
+    regression "cannot be safely auto-corrected without knowing the true score" - this IS that true score, and it
+    arrives in the same summary payload we already download (10 events on the SMU game, with the resulting score on
+    each one).
+    """
+    out = []
+    for sp in (data.get("scoringPlays") or []):
+        q = (sp.get("period") or {}).get("number")
+        raw = str((sp.get("clock") or {}).get("displayValue") or "")
+        h, a = sp.get("homeScore"), sp.get("awayScore")
+        if q is None or h is None or a is None or not re.match(r"^\d{1,2}:\d{2}$", raw):
+            continue
+        try:
+            out.append((int(q), _clock_to_seconds(raw), int(h), int(a)))
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda x: (x[0], -x[1]))
+    return out
+
+
+def _raise_lagging_scores(entries, events):
+    """Lift any row sitting below a score ESPN's summary says was already on the board.
+
+    RAISE ONLY, never lower - a score CAN be wrong high in ESPN's rows too, but which of the two numbers is wrong
+    cannot be told from the feed, and lowering a score that really was earned would put a wrong number on film.
+
+    Only a row STRICTLY LATER in game time than the scoring event is touched, which keeps two conventions intact:
+      - a scoring row shows the score BEFORE its own points (that is what `apply_scoreboard_lag` builds), and
+      - the extra point and the kickoff that share the scoring play's clock keep the scores they already carry.
+
+    One note per RUN of corrected rows, not per row: a qc_issue on every one of ten rows would push that quarter's
+    issue share over 10% and set off the backup prompt for a problem that had just been fixed.
+    """
+    fixes = {}
+    if not events:
+        return fixes
+    in_run = False
+    for i, e in enumerate(entries):
+        raw = str(e.get("clock") or "")
+        try:
+            q = int(e.get("quarter"))
+        except (TypeError, ValueError):
+            in_run = False
+            continue
+        if not re.match(r"^\d{1,2}:\d{2}$", raw):
+            in_run = False
+            continue
+        c = _clock_to_seconds(raw)
+        floor_h = floor_a = None
+        for (eq, ec, eh, ea) in events:
+            if (eq, -ec) < (q, -c):
+                floor_h, floor_a = eh, ea
+            else:
+                break
+        h, a = e.get("home_score"), e.get("away_score")
+        if floor_h is None or h is None or a is None:
+            in_run = False
+            continue
+        if h < floor_h or a < floor_a:
+            was = f"{h}-{a}"
+            e["home_score"], e["away_score"] = max(h, floor_h), max(a, floor_a)
+            if not in_run:
+                note = f"Auto-fixed: score {was} → {e['home_score']}-{e['away_score']}"
+                fixes[i] = note
+                # ⚠ ON THE ROW, not by index: `_fill_scoring_gaps` can insert rows after this pass, and
+                # `_qc_flag_entries`' own result is written over qc_issue later, so the note is carried on the entry
+                # and merged in at that point.
+                e["_score_fix_note"] = note
+                in_run = True
+        else:
+            in_run = False
+    return fixes
+
+
+# ============================================================
 # Scoring Gap Detection (period boundaries)
 # ============================================================
 
-def _fill_scoring_gaps(entries, home_display, away_display):
+def _fill_scoring_gaps(entries, home_display, away_display, events=None):
     """
     After scoreboard lag: detect period-opening KOs where the score
     jumped vs. the previous period's last entry, meaning one or more
@@ -876,6 +960,27 @@ def _fill_scoring_gaps(entries, home_display, away_display):
         if dh <= 0 and da <= 0:
             i += 1
             continue
+
+        # ⚠ NOT A GAP IF THE PLAY IS ALREADY ON THE TABLE. MEASURED on Sep 12's 125 games: this check produced 9
+        # placeholders and every one was a +3 field goal at the end of a half, with the field-goal row sitting
+        # directly above the placeholder (Kentucky, Ole Miss, Memphis, Florida Atlantic, Louisiana-Monroe, Bryant,
+        # Liberty, Butler, Samford). Nothing was missing in any of them. The cause is a convention, not an absence: a
+        # scoring row carries the score BEFORE it scores, and the next period's kickoff lags at the old score too, so
+        # the points only surface a row or two later and the delta reads as an omission. Roger, Sep 17 2026 on the one
+        # in his Pitt game: "is it something that we have already fixed and the bookkeeping row Is just noise we dont
+        # need?" - it was noise. So: if ESPN's own scoring summary has an event in the period that just ended whose
+        # resulting score is the score the game settles on after the boundary, the play is there. Say nothing.
+        if events:
+            prev_q = None
+            try:
+                prev_q = int(prev.get("quarter"))
+            except (TypeError, ValueError):
+                prev_q = None
+            settled = (nxt["home_score"], nxt["away_score"])
+            if prev_q is not None and any((eq == prev_q and (eh, ea) == settled)
+                                          for (eq, _ec, eh, ea) in events):
+                i += 1
+                continue
 
         gaps_found += 1
 
@@ -1851,9 +1956,17 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # Post-lag auto-fix: correct errors that survived the pre-mapping pipeline
     entry_fixes = _auto_fix_entries(entries)
 
+    # ESPN's own scoring summary is the authority on the score: lift any row still carrying a score the summary says
+    # was already on the board (a half-ending field goal used to leave the whole next period 3 points short). Runs
+    # BEFORE the gap check on purpose - with the scores right, a boundary that only looked like a missing play stops
+    # looking like one.
+    _events = score_events(data)
+    for _i, _msg in _raise_lagging_scores(entries, _events).items():
+        entry_fixes.setdefault(_i, _msg)
+
     # Insert placeholder entries for scoring plays missing from the feed
     # (e.g., last-second Q2 TDs filtered as "End Period" type plays)
-    inserted_gap_count = _fill_scoring_gaps(entries, capp_home, capp_away)
+    inserted_gap_count = _fill_scoring_gaps(entries, capp_home, capp_away, events=_events)
 
     # The live check (Roger, Sep 14 2026): "ESPN = Primary CBS = Primary Backup for Comparison NCAA = Secondary Backup
     # for ESPN Bad Plays and CBS not Posting Play By Play". ESPN is the play data. When CBS has play-by-play for the
@@ -1950,6 +2063,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         entry["qc_issue"] = qc_flags.get(i, "")
         if entry.get("ncaa_status") == "added" and not entry["qc_issue"]:
             entry["qc_issue"] = "Auto-added - check this play"   # Roger, Sep 13 2026: no vendor names on screen
+        # The score catch-up note (see _raise_lagging_scores), added here because qc_issue is written over above.
+        _sfn = entry.pop("_score_fix_note", "")
+        if _sfn and _sfn not in entry["qc_issue"]:
+            entry["qc_issue"] = " | ".join([p for p in (entry["qc_issue"], _sfn) if p])
         entry.pop("_forced_key", None)
 
     auto_fixed_examples = (list(inferred_pat_fixes) + list(entry_fixes.values())
