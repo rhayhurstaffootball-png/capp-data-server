@@ -360,6 +360,32 @@ def _fits(work, i, secs):
     return lo <= secs <= hi and secs != M.clock_secs(work[i].get("clock"))
 
 
+def _trusted_bound(work, pairs, start, q, above):
+    """The clock of the nearest PAIRED play outside a stuck run, walking up (above=True) or down from `start` - the
+    nearest neighbour that can fence the run in. Seconds; the quarter's edge when nothing qualifies.
+
+    ⚠ WHY NOT THE ROW NEXT DOOR (Syracuse @ Pitt Q4, Sep 17 2026, Roger watching live): five plays sat at (02:00),
+    CBS had them at 3:08 / 3:03 / 2:56 / 2:56 / 2:15, and _fits rejected every one because the row above the run was
+    ESPN's kickoff stamped 2:07 - wrong itself (CBS: 3:09), and never paired. A neighbour nobody vouches for cannot
+    fence the run in, so a row with no CBS pair is skipped, as are timeouts and admin lines.
+    ⚠ BUT A PAIRED ROW FENCES WITH ITS OWN CLOCK, whether or not CBS's clock for it agrees. MEASURED (Sep 12 corpus)
+    when this also skipped paired rows CBS disagreed with by 5+ s: FIU @ Buffalo Q2 climbed a five-play run to
+    11:26-10:03 over a punt ESPN has at 7:36, and Miami (OH) put a kickoff at 9:37 above the extra point at 9:31 -
+    two games made worse. ESPN's clock on a play CBS vouches for is that play's own claim, and it stands."""
+    step = -1 if above else 1
+    i = start + step
+    while 0 <= i < len(work):
+        e = work[i]
+        if e.get("quarter") != q:
+            break
+        s = M.clock_secs(M.norm_clock(e.get("clock")))
+        if (pairs.get(i) is not None and s is not None
+                and not M.is_admin_line(e.get("play_text", "")) and not _is_timeout(e)):
+            return s
+        i += step
+    return 15 * 60 if above else 0
+
+
 def _stuck_runs(work, min_len=STUCK_RUN):
     """Runs of rows the "Clock stuck" QC error fires on (espn_fetcher._qc_flag_entries): the same clock on consecutive
     rows of one quarter, the rows after the first not a kickoff / try / officials timeout. [row indices]"""
@@ -534,7 +560,7 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
     # stuck for real". A stuck run is checked whatever its clocks came from - typed snaps too (Buffalo @ FIU Sep 12:
     # "(06:05)" typed on 4 plays). CBS within a few seconds on every play of the run = stuck for real, left alone.
     guessed = {i for i, e in enumerate(work) if clock_src.get(str(e.get("espn_play_id"))) == "guess"}
-    stuck = set()
+    stuck, stuck_blocks = set(), []
     for run in _stuck_runs(work):
         summary["stuck_runs"] += 1
         rows = [i for i in run if not M.is_admin_line(work[i].get("play_text", "")) and not _is_timeout(work[i])]
@@ -546,6 +572,7 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
             summary["stuck_confirmed"] += 1
             continue
         stuck.update(rows)
+        stuck_blocks.append(rows)
     todo = [i for i in sorted(guessed | stuck)
             if not M.is_admin_line(work[i].get("play_text", "")) and not _is_timeout(work[i])
             and str(work[i].get("down") or "").strip().upper() not in _NO_CLOCK_DOWNS]
@@ -564,6 +591,32 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
                        "CBS clock (stuck clock)" if i in stuck else "CBS clock")
                 summary["clock_fixes"]["cbs"] += 1
                 done.add(i)
+    # A stuck run the row-by-row passes could not move at all is taken AS A BLOCK: CBS's clocks for it must run down
+    # and must sit between the nearest clocks outside the run that both sources agree on (_trusted_bound). Roger,
+    # Sep 17 2026, after Pitt's five (02:00) boards: "the Errors on the clock should be auto fixed by the backup source".
+    # Only a run the stuck check already caught - a clock a few seconds off is not an error and stays ESPN's.
+    for rows_ in stuck_blocks:
+        need = [i for i in rows_ if i in todo and i not in done]
+        # ⚠ THE WHOLE RUN OR NOTHING. MEASURED (Sep 12 corpus): FIU @ Buffalo Q1's run of four had CBS pairs for two;
+        # moving those two to 8:20 / 7:41 left the unpaired two sitting at 6:05 above them - a run half moved is
+        # worse than a run left stuck. A row of the run nobody can clock refuses the block for all of them.
+        if len(need) < 2 or any(i not in pairs or pairs[i].get("clock_secs") is None for i in need):
+            continue
+        block = need
+        secs = [pairs[i]["clock_secs"] for i in block]
+        if any(b > a for a, b in zip(secs, secs[1:])):
+            continue                                 # CBS's own clocks do not run down - nothing to trust here
+        q = work[block[0]].get("quarter")
+        hi = _trusted_bound(work, pairs, rows_[0], q, above=True)
+        lo = _trusted_bound(work, pairs, rows_[-1], q, above=False)
+        if not (lo <= secs[-1] and secs[0] <= hi):
+            continue
+        for i, s in zip(block, secs):
+            if s != M.clock_secs(M.norm_clock(work[i].get("clock"))):
+                change(i, "clock", "%d:%02d" % divmod(s, 60), "CBS clock (stuck clock)")
+                summary["clock_fixes"]["cbs"] += 1
+            done.add(i)
+        summary["stuck_blocks"] = summary.get("stuck_blocks", 0) + 1
     need_ncaa = [i for i in todo if i not in done]
     if need_ncaa and ncaa_pbp:
         for i, secs in sorted(_ncaa_clocks(work, need_ncaa, ncaa_pbp).items()):
