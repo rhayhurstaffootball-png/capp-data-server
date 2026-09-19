@@ -7450,6 +7450,12 @@ _ADMIN_HTML = """<!DOCTYPE html>
   body.gd-wall #gd-grid > .card > div:last-child { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   body.gd-wall #gd-grid > .card > div:last-child[hidden] { display: none; }
   body.gd-wall #gd-grid .gd-plays-scroll { flex: 1; min-height: 0; max-height: none !important; }
+  /* an always-visible, easy-to-grab scrollbar on every card's play table */
+  .gd-plays-scroll { overflow-y: scroll !important; scrollbar-width: auto; scrollbar-color: #4c8dff #0d1117; }
+  .gd-plays-scroll::-webkit-scrollbar { width: 16px; height: 16px; }
+  .gd-plays-scroll::-webkit-scrollbar-track { background: #0d1117; border-radius: 8px; }
+  .gd-plays-scroll::-webkit-scrollbar-thumb { background: #4c8dff; border-radius: 8px; border: 3px solid #0d1117; }
+  .gd-plays-scroll::-webkit-scrollbar-thumb:hover { background: #6ea3ff; }
   body.gd-wall #gd-grid table { font-size: inherit; }
   body.gd-wall #gd-grid th { font-size: 0.7em; padding: 6px 8px; position: sticky; top: 0; }
   body.gd-wall #gd-grid td { padding: 5px 8px; }
