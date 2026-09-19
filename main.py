@@ -8612,7 +8612,15 @@ function gdKick(iso) {
 
 function gdState(c) {
   if (!c.has_game) return '<span class="badge badge-gray">no game</span>';
-  if (c.espn_state === "in") return '<span class="badge badge-green">LIVE</span> <span class="mono">Q' + escN(c.period || "") + " " + escN(c.clock || "") + "</span>";
+  // ESPN's status detail carries the things a coach needs to see at a glance: a delay, halftime, end of a quarter.
+  // (Roger, Sep 19 2026, BYU at Colorado State "Delayed": "I would like a way on the wall for me to see that Alert")
+  const det = String(c.espn_detail || "");
+  if (/delay|suspend|postpon/i.test(det)) return '<span class="badge badge-red">' + escN(det.toUpperCase()) + '</span>';
+  if (c.espn_state === "in") {
+    if (/half/i.test(det)) return '<span class="badge badge-yellow">HALFTIME</span>';
+    if (/^end of/i.test(det)) return '<span class="badge badge-yellow">' + escN(det.toUpperCase()) + '</span>';
+    return '<span class="badge badge-green">LIVE</span> <span class="mono">Q' + escN(c.period || "") + " " + escN(c.clock || "") + "</span>";
+  }
   if (c.espn_state === "post") return '<span class="badge badge-blue">FINAL</span>';
   return '<span class="badge badge-gray">' + escN(gdKick(c.kickoff)) + '</span>';
 }
