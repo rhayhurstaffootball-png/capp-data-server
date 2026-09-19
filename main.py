@@ -7782,6 +7782,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
           </select>
         </label>
         <span class="small gd-stamp"></span>
+        <button class="btn" onclick="gdFullscreen(true)" style="font-size:12px;padding:5px 12px;" title="Full screen (if the browser did not take it on Wall)">⛶ Full screen</button>
         <button class="btn" onclick="gdWallExit()" style="font-size:12px;padding:5px 12px;">Exit (Esc)</button>
       </div>
       <div id="gd-wall-body"></div>
@@ -8502,6 +8503,7 @@ function gdWallEnter() {
   document.body.classList.add("gd-wall");
   gdWallStrip();
   gdOpenAll();
+  gdFullscreen(true);
 }
 
 function gdWallExit() {
@@ -8512,9 +8514,20 @@ function gdWallExit() {
   wall.hidden = true;
   document.body.classList.remove("gd-wall");
   gdApplyCols();
+  gdFullscreen(false);
+}
+
+// real browser full screen (no tabs, no address bar) - the browser only allows it from a click, and drops it on Esc
+function gdFullscreen(on) {
+  try {
+    if (on) { if (!document.fullscreenElement && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {}); }
+    else if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  } catch (e) {}
 }
 
 document.addEventListener("keydown", e => { if (e.key === "Escape" && document.body.classList.contains("gd-wall")) gdWallExit(); });
+// leaving full screen by any other route (browser UI, F11) takes the wall down with it
+document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement && document.body.classList.contains("gd-wall")) gdWallExit(); });
 
 function gdAgo(s) {
   if (s == null || s === "") return "-";
