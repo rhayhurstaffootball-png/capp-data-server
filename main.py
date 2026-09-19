@@ -3188,6 +3188,28 @@ async def admin_list_clients():
     return r.json()
 
 
+@app.get("/admin/api/gameday/board", dependencies=[Depends(_require_admin)])
+async def admin_gameday_board(date: str = Query("", description="YYYYMMDD; default: today, US Mountain")):
+    """One card per licensed school's game on the date (gameday_board.board): ESPN status + the server's own numbers."""
+    import gameday_board
+    day = str(date or "").strip()
+    if not re.fullmatch(r"\d{8}", day):
+        try:
+            from zoneinfo import ZoneInfo
+            day = datetime.now(ZoneInfo("America/Denver")).strftime("%Y%m%d")
+        except Exception:
+            day = datetime.utcnow().strftime("%Y%m%d")
+    clients = await admin_list_clients()
+    return gameday_board.board(day, clients, _game_request_snapshot())
+
+
+@app.get("/admin/api/gameday/plays/{game_id}", dependencies=[Depends(_require_admin)])
+def admin_gameday_plays(game_id: str, league: str = Query("cfb")):
+    """The rows a keyed client receives for the game, trimmed for the board's expanded view."""
+    import gameday_board
+    return gameday_board.plays(game_id, league)
+
+
 @app.get("/admin/api/gameday/status", dependencies=[Depends(_require_admin)])
 def admin_gameday_status():
     """Game-day operator status: platform health, alerts, and per-game telemetry."""
@@ -7703,11 +7725,17 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <h2>Game-Day Monitoring
           <button class="btn btn-primary" onclick="loadGameDayStatus()" style="float:right;font-size:12px;padding:5px 14px;">Refresh</button>
         </h2>
-        <p class="small" style="margin-bottom:14px;">Platform health, alerting, and per-game delivery/QC telemetry for live operations.</p>
+        <p class="small" style="margin-bottom:14px;">Every licensed school's game for the day. Click a card to watch its plays come in.</p>
         <div id="gameday-summary"><div class="loading">Loading...</div></div>
         <div id="gameday-alerts" style="margin-top:18px;"></div>
-        <div id="gameday-games" style="margin-top:18px;"></div>
-        <div id="gameday-detail" style="margin-top:18px;"></div>
+        <div style="margin-top:18px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <b>Game day</b>
+          <input type="date" id="gd-date" onchange="loadGameDayBoard()" style="padding:5px 8px;">
+          <button class="btn" onclick="gdSetToday(); loadGameDayBoard();" style="font-size:12px;padding:5px 12px;">Today</button>
+          <span class="small" id="gd-stamp"></span>
+        </div>
+        <div id="gameday-board" style="margin-top:12px;"><div class="loading">Loading the board...</div></div>
+        <div id="gameday-plays" style="margin-top:18px;"></div>
       </div>
     </div>
 
@@ -8343,8 +8371,6 @@ function stopGameDayRefresh() {
 function loadGameDayStatus() {
   document.getElementById("gameday-summary").innerHTML = '<div class="loading">Loading summary...</div>';
   document.getElementById("gameday-alerts").innerHTML = '<div class="loading">Loading alerts...</div>';
-  document.getElementById("gameday-games").innerHTML = '<div class="loading">Loading game telemetry...</div>';
-  document.getElementById("gameday-detail").innerHTML = '<div class="loading">Select a game row to inspect fixes and remaining QC issues.</div>';
   api("GET", "/gameday/status").then(data => {
     if (!data || !data.summary) {
       document.getElementById("gameday-summary").innerHTML = '<div class="loading">Error loading game-day status.</div>';
@@ -8378,84 +8404,151 @@ function loadGameDayStatus() {
         '</div>';
     }
 
-    const games = Array.isArray(data.games) ? data.games : [];
-    _gameDayGames = games;
-    if (!games.length) {
-      document.getElementById("gameday-games").innerHTML = '<div class="loading">No tracked games in cache yet.</div>';
-      document.getElementById("gameday-detail").innerHTML = '<div class="loading">No game detail available yet.</div>';
-      return;
-    }
-    const rows = games.map(g => `
-      <tr class="clickable" onclick="showGameDayDetail('${g.game_id}')">
-        <td>${badgeForLevel(g.alert_level, (g.alert_level || "green").toUpperCase())}</td>
-        <td>${g.away_name || "—"} at ${g.home_name || "—"}</td>
-        <td>${g.status || "—"}</td>
-        <td>${g.plays_count || 0}</td>
-        <td>${g.auto_fixed_count || 0}</td>
-        <td>${g.qc_issue_count || 0}</td>
-        <td>${g.requests_last_60s || 0}</td>
-        <td>${g.p95_latency_ms || 0} ms</td>
-        <td>${fmtBytes(g.payload_bytes || 0)}</td>
-        <td>${fmtAge(g.age_seconds)}</td>
-        <td class="mono">${(g.auto_fixed_examples || []).slice(0, 2).join(", ") || "—"}</td>
-        <td class="mono">${(g.alert_reasons || []).join(", ") || "—"}</td>
-      </tr>
-    `).join("");
-    document.getElementById("gameday-games").innerHTML = `
-      <table>
-        <thead>
-          <tr>
-            <th>Level</th><th>Game</th><th>Status</th><th>Plays</th><th>Fixed</th><th>Flagged</th>
-            <th>Req/60s</th><th>P95</th><th>Payload</th><th>Age</th><th>Fixed Examples</th><th>Notes</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    `;
-    document.getElementById("gameday-detail").innerHTML = '<div class="loading">Click a game row to inspect QC details.</div>';
+    loadGameDayBoard();
   }).catch(() => {
     document.getElementById("gameday-summary").innerHTML = '<div class="loading">Cannot reach game-day status endpoint.</div>';
     document.getElementById("gameday-alerts").innerHTML = "";
-    document.getElementById("gameday-games").innerHTML = "";
-    document.getElementById("gameday-detail").innerHTML = "";
+    loadGameDayBoard();
   });
 }
 
-function showGameDayDetail(gameId) {
-  const game = (_gameDayGames || []).find(g => String(g.game_id) === String(gameId));
-  if (!game) return;
-  const fixedExamples = (game.auto_fixed_examples || []).length
-    ? (game.auto_fixed_examples || []).map(x => `<li>${x}</li>`).join("")
-    : "<li>No auto-fixes recorded for this game.</li>";
-  const flaggedExamples = (game.qc_examples || []).length
-    ? (game.qc_examples || []).map(x => `<li>${x}</li>`).join("")
-    : "<li>No remaining QC flags for this game.</li>";
-  const notes = (game.alert_reasons || []).length
-    ? (game.alert_reasons || []).join(", ")
-    : "No active alerts for this game.";
-  document.getElementById("gameday-detail").innerHTML = `
-    <div class="card">
-      <h2>${game.away_name || "—"} at ${game.home_name || "—"} <span class="small mono">(${game.game_id})</span></h2>
-      <div class="kpi-grid">
-        <div class="kpi"><div class="label">Alert Level</div><div class="value">${(game.alert_level || "green").toUpperCase()}</div><div class="sub">${notes}</div></div>
-        <div class="kpi"><div class="label">Auto-Fixed</div><div class="value">${game.auto_fixed_count || 0}</div><div class="sub">manual gaps: ${game.manual_gap_count || 0}</div></div>
-        <div class="kpi"><div class="label">Still Flagged</div><div class="value">${game.qc_issue_count || 0}</div><div class="sub">remaining QC issues</div></div>
-        <div class="kpi"><div class="label">Latency</div><div class="value">${game.p95_latency_ms || 0} ms</div><div class="sub">avg ${game.avg_latency_ms || 0} ms</div></div>
-        <div class="kpi"><div class="label">Traffic</div><div class="value">${game.requests_last_60s || 0}</div><div class="sub">req/60s, ${game.requests_last_300s || 0} req/5m</div></div>
-        <div class="kpi"><div class="label">Payload</div><div class="value">${fmtBytes(game.payload_bytes || 0)}</div><div class="sub">plays=${game.plays_count || 0}, age=${fmtAge(game.age_seconds)}</div></div>
-      </div>
-      <div class="form-row">
-        <div class="card" style="margin-bottom:0;">
-          <h2>Auto-Fixed Examples</h2>
-          <ul>${fixedExamples}</ul>
-        </div>
-        <div class="card" style="margin-bottom:0;">
-          <h2>Still Flagged</h2>
-          <ul>${flaggedExamples}</ul>
-        </div>
-      </div>
-    </div>
-  `;
+// ── Game Day BOARD: one card per licensed school's game, click to watch the plays come in (Sep 18 2026) ──
+let _gdBoard = null;    // last board payload
+let _gdOpen = null;     // expanded game id
+let _gdSeen = {};       // game id -> Set of row keys already shown (new rows are highlighted once)
+
+function gdDate() {
+  const el = document.getElementById("gd-date");
+  return (el && el.value) ? el.value.replace(/-/g, "") : "";
+}
+
+function gdSetToday() {
+  const el = document.getElementById("gd-date");
+  if (!el) return;
+  const mt = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Denver" }));
+  el.value = mt.getFullYear() + "-" + String(mt.getMonth() + 1).padStart(2, "0") + "-" + String(mt.getDate()).padStart(2, "0");
+}
+
+function gdKick(iso) {
+  try { return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/Denver" }) + " MT"; }
+  catch (e) { return iso || ""; }
+}
+
+function gdState(c) {
+  if (!c.has_game) return '<span class="badge badge-gray">no game</span>';
+  if (c.espn_state === "in") return '<span class="badge badge-green">LIVE</span> <span class="mono">Q' + escN(c.period || "") + " " + escN(c.clock || "") + "</span>";
+  if (c.espn_state === "post") return '<span class="badge badge-blue">FINAL</span>';
+  return '<span class="badge badge-gray">' + escN(gdKick(c.kickoff)) + '</span>';
+}
+
+function gdQuarters(c) {
+  const q = (c && c.quarters) || {};
+  const keys = Object.keys(q);
+  if (!keys.length) return '<span class="small">no rows yet</span>';
+  return keys.map(k => {
+    const t = q[k] || {};
+    const pct = Math.round((t.share || 0) * 1000) / 10;
+    const bad = (t.share || 0) >= 0.10;
+    return '<span class="badge ' + (bad ? "badge-red" : "badge-green") + '" title="' + (t.issues || 0) + ' of ' + (t.rows || 0) + ' rows">Q' + escN(k) + " " + pct + "%</span>";
+  }).join(" ");
+}
+
+function loadGameDayBoard() {
+  const box = document.getElementById("gameday-board");
+  if (!box) return;
+  if (!gdDate()) gdSetToday();
+  const d = gdDate();
+  api("GET", "/gameday/board" + (d ? "?date=" + encodeURIComponent(d) : "")).then(data => {
+    _gdBoard = data;
+    renderGameDayCards(data);
+    const stamp = document.getElementById("gd-stamp");
+    if (stamp) stamp.textContent = "updated " + new Date((data.generated_at || 0) * 1000).toLocaleTimeString();
+    if (_gdOpen) loadGameDayPlays(_gdOpen, true);
+  }).catch(e => { box.innerHTML = '<div class="loading">Cannot load the board: ' + escN(e) + '</div>'; });
+}
+
+function renderGameDayCards(data) {
+  const box = document.getElementById("gameday-board");
+  if (!box) return;
+  const cards = (data && data.cards) || [];
+  if (!cards.length) { box.innerHTML = '<div class="loading">No licensed accounts with a mapped team.</div>'; return; }
+  const html = cards.map(c => {
+    const open = _gdOpen && String(_gdOpen) === String(c.game_id);
+    const chk = c.check || {};
+    const score = (c.has_game && c.espn_state !== "pre")
+      ? escN(c.away_name) + " <b>" + escN(c.away_score) + "</b> &nbsp;–&nbsp; <b>" + escN(c.home_score) + "</b> " + escN(c.home_name) : "";
+    const cbs = !c.has_game ? "" : (c.enhanced === "Yes" ? '<span class="badge badge-green">backup ✓</span>'
+      : c.enhanced ? '<span class="badge badge-red">no backup</span>' : '<span class="badge badge-gray">backup ?</span>');
+    const feed = c.tracked
+      ? '<span class="badge ' + (c.feed_state === "healthy" ? "badge-green" : c.feed_state === "unknown" ? "badge-gray" : "badge-red") + '">' + escN(c.feed_state || "") + "</span>"
+      : '<span class="badge badge-gray">not opened</span>';
+    const stats = c.tracked
+      ? "rows <b>" + (c.plays_count || 0) + "</b> · verified <b>" + (chk.verified || 0) + "</b> · fixed <b>" + (c.auto_fixed_count || 0) +
+        "</b> · added <b>" + (chk.added || 0) + "</b> · flagged <b>" + (c.qc_issue_count || 0) + "</b>"
+      : (c.has_game ? "nobody has opened this game yet" : "");
+    return '<div class="card" style="margin:0;cursor:' + (c.has_game ? "pointer" : "default") + ";" + (open ? "outline:2px solid #4c8dff;" : "") + '"' +
+      (c.has_game ? ' onclick="gdToggle(' + escN(c.game_id) + ')"' : "") + ">" +
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;"><b style="font-size:15px;">' + escN(c.school) + "</b><span>" + gdState(c) + "</span></div>" +
+      (c.has_game
+        ? '<div class="small" style="margin-top:4px;">' + (c.home_away === "home" ? "vs " : "at ") + escN(c.opponent) + " · " + escN(gdKick(c.kickoff)) + (c.tv ? " · " + escN(c.tv) : "") + "</div>"
+        : '<div class="small" style="margin-top:4px;">bye / no game on this date</div>') +
+      (score ? '<div style="margin-top:6px;font-size:14px;">' + score + "</div>" : "") +
+      (c.has_game ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">' + feed + " " + cbs +
+        ' <span class="badge badge-gray" title="requests in the last 5 minutes">' + (c.requests_last_300s || 0) + " req/5m</span></div>" : "") +
+      (stats ? '<div class="small" style="margin-top:8px;">' + stats + "</div>" : "") +
+      (c.tracked ? '<div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;">' + gdQuarters(c) + "</div>" : "") +
+      "</div>";
+  }).join("");
+  box.innerHTML = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;">' + html + "</div>" +
+    ((data.unmapped || []).length ? '<div class="small" style="margin-top:8px;">Licensed but no team mapped: ' + escN(data.unmapped.join(", ")) + "</div>" : "");
+}
+
+function gdToggle(gid) {
+  const box = document.getElementById("gameday-plays");
+  if (_gdOpen && String(_gdOpen) === String(gid)) {
+    _gdOpen = null;
+    if (box) box.innerHTML = "";
+    renderGameDayCards(_gdBoard);
+    return;
+  }
+  _gdOpen = String(gid);
+  renderGameDayCards(_gdBoard);
+  loadGameDayPlays(gid, false);
+}
+
+function loadGameDayPlays(gid, quiet) {
+  const box = document.getElementById("gameday-plays");
+  if (!box) return;
+  if (!quiet) box.innerHTML = '<div class="loading">Loading plays...</div>';
+  const card = ((_gdBoard || {}).cards || []).find(c => String(c.game_id) === String(gid)) || {};
+  api("GET", "/gameday/plays/" + encodeURIComponent(gid) + "?league=" + encodeURIComponent(card.league || "cfb")).then(d => {
+    if (String(_gdOpen) !== String(gid)) return;
+    const rows = d.rows || [];
+    const seen = _gdSeen[gid];
+    const fresh = new Set();
+    if (seen && seen.size) rows.forEach(r => { if (!seen.has(r.key)) fresh.add(r.key); });
+    _gdSeen[gid] = new Set(rows.map(r => r.key));
+    const chk = d.check || {};
+    const head = '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;">' +
+      '<h2 style="margin:0;">' + escN(d.away_name || "") + " at " + escN(d.home_name || "") + ' <span class="small mono">(' + escN(gid) + ")</span></h2>" +
+      '<div class="small">' + rows.length + " rows · source " + escN(chk.source || "-") + " · verified " + (chk.verified || 0) + " · fixed " + (chk.fixed || 0) +
+      " · added " + (chk.added || 0) + " · unverified " + (chk.unverified || 0) + (fresh.size ? ' · <b style="color:#4c8dff;">+' + fresh.size + " new</b>" : "") + "</div></div>" +
+      '<div style="margin:6px 0 10px;display:flex;gap:4px;flex-wrap:wrap;">' + gdQuarters({ quarters: d.quarters || {} }) + "</div>";
+    const trs = rows.map(r => {
+      const st = r.status === "fixed" ? '<span class="badge badge-blue">fixed</span>'
+        : r.status === "added" ? '<span class="badge badge-red">added</span>'
+        : r.status === "unverified" ? '<span class="badge badge-gray">unverified</span>' : "";
+      return "<tr" + (fresh.has(r.key) ? ' style="background:rgba(76,141,255,0.18);"' : "") + '><td class="mono">' + r.n + "</td><td>" + escN(r.quarter) +
+        '</td><td class="mono">' + escN(r.clock) + '</td><td class="mono">' + escN(r.home_score) + "-" + escN(r.away_score) +
+        '</td><td class="mono">' + escN(r.down) + "&amp;" + escN(r.distance) + " @" + escN(r.fp) + "</td><td>" + escN(r.text) + "</td><td>" + st +
+        (r.changes ? ' <span class="small mono">' + escN(r.changes) + "</span>" : "") +
+        (r.qc ? ' <span class="small" style="color:#f0b429;">' + escN(r.qc) + "</span>" : "") + "</td></tr>";
+    }).join("");
+    box.innerHTML = '<div class="card">' + head + '<div id="gd-plays-scroll" style="max-height:520px;overflow:auto;"><table><thead><tr>' +
+      "<th>#</th><th>Q</th><th>Clock</th><th>Score</th><th>D&amp;D</th><th>Play</th><th>Check</th></tr></thead><tbody>" + trs + "</tbody></table></div></div>";
+    const wrap = document.getElementById("gd-plays-scroll");
+    if (wrap && fresh.size) wrap.scrollTop = wrap.scrollHeight;
+  }).catch(e => { if (!quiet) box.innerHTML = '<div class="loading">Cannot load plays: ' + escN(e) + "</div>"; });
 }
 
 // ── Clients table ─────────────────────────────────────────────────────────────
