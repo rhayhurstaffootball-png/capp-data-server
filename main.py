@@ -295,7 +295,9 @@ def _build_gameday_payload() -> dict:
         alerts.append({"level": "yellow", "kind": "memory", "message": "Process memory is above 1.0 GB."})
 
     for row in merged_games:
-        if row["alert_level"] != "green":
+        # Roger, Sep 19 2026 (UNC at Clemson on the errors list, pulled once at 12:42 and closed): only a game a
+        # client is ACTUALLY WATCHING belongs on the errors list. A closed game's fixes and flags are history.
+        if row["alert_level"] != "green" and is_game_watched(str(row.get("game_id", ""))):
             alerts.append({
                 "level": row["alert_level"],
                 "kind": "game",
