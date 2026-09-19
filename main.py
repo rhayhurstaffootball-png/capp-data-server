@@ -797,6 +797,16 @@ def plays(
         else:
             # Key-based clients also lose rows a crew replaced (Sep 14 2026) and are told which keys to take down.
             payload = ncaa_check.for_keyed_client(payload)
+            # ... including a play ESPN removed OUTRIGHT after a review (Houston @ Texas Tech, Sep 18 2026 live):
+            # gone from the middle of the feed on two fresh fetches = withdrawn. See withdrawn_memory.
+            try:
+                import withdrawn_memory
+                _gone = withdrawn_memory.note(game_id, payload)
+                if _gone:
+                    payload = dict(payload)
+                    payload["withdrawn_keys"] = sorted(set(payload.get("withdrawn_keys") or []) | set(_gone))
+            except Exception as _e:
+                print(f"WARNING: withdrawn memory failed for {game_id}: {type(_e).__name__}: {_e}", flush=True)
         latency_ms = (time.perf_counter() - started) * 1000
         try:
             payload_bytes = len(json.dumps(payload).encode("utf-8"))
