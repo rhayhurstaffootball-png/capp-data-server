@@ -7436,6 +7436,27 @@ _ADMIN_HTML = """<!DOCTYPE html>
   .badge-yellow { background: #2d2200; color: #facc15; }
   .badge-red2   { background: #3b0a0a; color: #f87171; }
   .loading { color: #8b95a1; font-size: 13px; padding: 20px 0; text-align: center; }
+  /* Game Day WALL: the board fills the whole monitor, every game open, each card its own scrolling play feed */
+  #gd-wall { position: fixed; inset: 0; z-index: 90; background: #070a0f; display: flex; flex-direction: column; padding: 10px 12px; gap: 8px; }
+  #gd-wall[hidden] { display: none; }
+  #gd-wall-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex-shrink: 0; }
+  #gd-wall-bar select { width: auto; padding: 4px 8px; }
+  #gd-wall-strip { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #gd-wall-body { flex: 1; min-height: 0; }
+  #gd-wall-body #gameday-board { height: 100%; margin: 0 !important; }
+  body.gd-wall #gd-grid { height: 100%; grid-auto-rows: minmax(0, 1fr); gap: 10px; font-size: var(--gd-font, 16px); }
+  body.gd-wall #gd-grid > .card { display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding: 12px 14px; }
+  body.gd-wall #gd-grid > .card[data-nogame] { display: none; }
+  body.gd-wall #gd-grid > .card > div:last-child { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  body.gd-wall #gd-grid > .card > div:last-child[hidden] { display: none; }
+  body.gd-wall #gd-grid .gd-plays-scroll { flex: 1; min-height: 0; max-height: none !important; }
+  body.gd-wall #gd-grid table { font-size: inherit; }
+  body.gd-wall #gd-grid th { font-size: 0.7em; padding: 6px 8px; position: sticky; top: 0; }
+  body.gd-wall #gd-grid td { padding: 5px 8px; }
+  body.gd-wall #gd-grid .small { font-size: 0.85em; }
+  body.gd-wall #gd-grid .badge { font-size: 0.75em; }
+  body.gd-wall #gd-grid .gd-school { font-size: 1.35em; }
+  body.gd-wall #gd-grid .gd-score { font-size: 1.15em; }
   select { background: #0d1117; border: 1px solid #2c3b55; border-radius: 7px; color: white; font-size: 13px; padding: 8px 12px; outline: none; width: 100%; cursor: pointer; }
   select:focus { border-color: #3a7ebf; }
   select:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -7735,14 +7756,35 @@ _ADMIN_HTML = """<!DOCTYPE html>
           <button class="btn" onclick="gdOpenAll()" style="font-size:12px;padding:5px 12px;">Open all</button>
           <button class="btn" onclick="gdCloseAll()" style="font-size:12px;padding:5px 12px;">Close all</button>
           <label class="small">Columns
-            <select id="gd-cols" onchange="gdSetCols(this.value)" style="padding:4px 6px;">
+            <select class="gd-cols" onchange="gdSetCols(this.value)" style="padding:4px 6px;width:auto;">
               <option value="auto">auto</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
             </select>
           </label>
-          <span class="small" id="gd-stamp"></span>
+          <button class="btn btn-primary" onclick="gdWallEnter()" style="font-size:12px;padding:5px 12px;" title="Fill the monitor: every game open, each with its own scrolling play feed">Wall</button>
+          <span class="small gd-stamp"></span>
         </div>
         <div id="gameday-board" style="margin-top:12px;"><div class="loading">Loading the board...</div></div>
       </div>
+    </div>
+    <div id="gd-wall" hidden>
+      <div id="gd-wall-bar">
+        <b style="font-size:16px;letter-spacing:1px;color:#3a7ebf;">CAPP GAME DAY</b>
+        <span id="gd-wall-strip"></span>
+        <span style="flex:1;"></span>
+        <label class="small">Columns
+          <select class="gd-cols" onchange="gdSetCols(this.value)">
+            <option value="auto">auto</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+          </select>
+        </label>
+        <label class="small">Text
+          <select class="gd-size" onchange="gdSetSize(this.value)">
+            <option value="14">small</option><option value="16">normal</option><option value="18">large</option><option value="21">XL</option><option value="24">XXL</option>
+          </select>
+        </label>
+        <span class="small gd-stamp"></span>
+        <button class="btn" onclick="gdWallExit()" style="font-size:12px;padding:5px 12px;">Exit (Esc)</button>
+      </div>
+      <div id="gd-wall-body"></div>
     </div>
 
     <div class="panel" id="playbook-tab">
@@ -8382,6 +8424,8 @@ function loadGameDayStatus() {
       document.getElementById("gameday-summary").innerHTML = '<div class="loading">Error loading game-day status.</div>';
       return;
     }
+    _gdPlatform = data;
+    gdWallStrip();
     const platform = data.platform || {};
     const requests = (platform.requests || {});
     const recent = (requests.recent_latency_user || requests.recent_latency || {});
@@ -8428,12 +8472,72 @@ function gdId(s) { return String(s == null ? "" : s).replace(/[^A-Za-z0-9_-]/g, 
 
 function gdCols() { try { return localStorage.getItem("gdCols") || "auto"; } catch (e) { return "auto"; } }
 function gdSetCols(v) { try { localStorage.setItem("gdCols", v); } catch (e) {} gdApplyCols(); }
+function gdSize() { try { return localStorage.getItem("gdSize") || "16"; } catch (e) { return "16"; } }
+function gdSetSize(v) { try { localStorage.setItem("gdSize", v); } catch (e) {} gdApplyCols(); }
 function gdApplyCols() {
   const grid = document.getElementById("gd-grid");
-  const v = gdCols();
-  if (grid) grid.style.gridTemplateColumns = (v === "auto") ? "repeat(auto-fill,minmax(620px,1fr))" : "repeat(" + v + ",minmax(0,1fr))";
-  const sel = document.getElementById("gd-cols");
-  if (sel && sel.value !== v) sel.value = v;
+  const v = gdCols(), s = gdSize();
+  if (grid) {
+    // on the wall "auto" packs the open games into as few rows as fit; on the page it is a min-width flow
+    let cols = v;
+    if (v === "auto" && document.body.classList.contains("gd-wall")) {
+      const n = grid.querySelectorAll(".card:not([data-nogame])").length || 1;
+      cols = String(n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4);
+    }
+    grid.style.gridTemplateColumns = (cols === "auto") ? "repeat(auto-fill,minmax(620px,1fr))" : "repeat(" + cols + ",minmax(0,1fr))";
+    grid.style.setProperty("--gd-font", s + "px");
+  }
+  document.querySelectorAll(".gd-cols").forEach(sel => { if (sel.value !== v) sel.value = v; });
+  document.querySelectorAll(".gd-size").forEach(sel => { if (sel.value !== s) sel.value = s; });
+}
+
+// ── the WALL: the board moves into a full-screen overlay, every game opens, each card fills its cell ──
+let _gdPlatform = null;   // last /gameday/status payload (server health strip on the wall)
+
+function gdWallEnter() {
+  const board = document.getElementById("gameday-board"), wall = document.getElementById("gd-wall"), body = document.getElementById("gd-wall-body");
+  if (!board || !wall || !body) return;
+  body.appendChild(board);
+  wall.hidden = false;
+  document.body.classList.add("gd-wall");
+  gdWallStrip();
+  gdOpenAll();
+}
+
+function gdWallExit() {
+  const board = document.getElementById("gameday-board"), wall = document.getElementById("gd-wall"), panel = document.getElementById("gameday-tab");
+  if (!board || !wall || !panel) return;
+  const home = panel.querySelector(".card");
+  if (home) home.appendChild(board);
+  wall.hidden = true;
+  document.body.classList.remove("gd-wall");
+  gdApplyCols();
+}
+
+document.addEventListener("keydown", e => { if (e.key === "Escape" && document.body.classList.contains("gd-wall")) gdWallExit(); });
+
+function gdAgo(s) {
+  if (s == null || s === "") return "-";
+  s = Math.round(Number(s) || 0);
+  return s < 90 ? s + " s" : s < 5400 ? Math.round(s / 60) + " min" : Math.round(s / 3600) + " h";
+}
+
+function gdWallStrip() {
+  const el = document.getElementById("gd-wall-strip");
+  if (!el) return;
+  const d = _gdPlatform || {};
+  const platform = d.platform || {}, fetcher = platform.fetcher || {}, summary = d.summary || {};
+  const recent = ((platform.requests || {}).recent_latency_user || (platform.requests || {}).recent_latency || {});
+  const alerts = Array.isArray(d.alerts) ? d.alerts : [];
+  const bad = alerts.filter(a => a.level === "red").length, warn = alerts.length - bad;
+  const b = (ok, txt) => '<span class="badge ' + (ok === true ? "badge-green" : ok === false ? "badge-red" : "badge-gray") + '">' + txt + "</span>";
+  el.innerHTML = [
+    b(platform.status === "ok" || platform.ready === true, "server " + escN(platform.status || "?")),
+    b(!!fetcher.poller_alive, "poller " + (fetcher.poller_alive ? "alive" : "DOWN") + " · " + escN(fetcher.last_poll_duration_ms || 0) + " ms"),
+    b(null, "P95 " + escN(recent.p95_ms || 0) + " ms"),
+    b(null, "live " + escN(summary.live_games || 0) + " / tracked " + escN(summary.tracked_games || 0)),
+    alerts.length ? b(bad ? false : null, escN(alerts.length) + " alert" + (alerts.length === 1 ? "" : "s") + (bad ? " · " + bad + " red" : "") + (warn ? " · " + warn + " other" : "")) : b(true, "no alerts"),
+  ].join(" ");
 }
 
 function gdDate() {
@@ -8480,8 +8584,8 @@ function loadGameDayBoard() {
   api("GET", "/gameday/board" + (d ? "?date=" + encodeURIComponent(d) : "")).then(data => {
     _gdBoard = data;
     renderGameDayCards(data);
-    const stamp = document.getElementById("gd-stamp");
-    if (stamp) stamp.textContent = "updated " + new Date((data.generated_at || 0) * 1000).toLocaleTimeString();
+    const when = "updated " + new Date((data.generated_at || 0) * 1000).toLocaleTimeString();
+    document.querySelectorAll(".gd-stamp").forEach(s => { s.textContent = when; });
     _gdOpen.forEach(g => loadGameDayPlays(g, true));
   }).catch(e => { box.innerHTML = '<div class="loading">Cannot load the board: ' + escN(e) + '</div>'; });
 }
@@ -8500,17 +8604,24 @@ function gdCardHead(c) {
     ? "rows <b>" + (c.plays_count || 0) + "</b> · verified <b>" + (chk.verified || 0) + "</b> · fixed <b>" + (c.auto_fixed_count || 0) +
       "</b> · added <b>" + (chk.added || 0) + "</b> · flagged <b>" + (c.qc_issue_count || 0) + "</b>"
     : (c.has_game ? "nobody has opened this game yet" : "");
+  // health + connection: how long since the feed produced a new row, how old the server's copy is, who is pulling
+  const quiet = c.tracked && c.espn_state === "in" && Number(c.seconds_since_new_play || 0) > 600;
+  const conn = c.tracked
+    ? '<span class="badge ' + (quiet ? "badge-red" : "badge-gray") + '" title="time since the feed last produced a new row">last new row ' + escN(gdAgo(c.seconds_since_new_play)) + " ago</span>" +
+      ' <span class="badge badge-gray" title="age of the server copy of this game">fetched ' + escN(gdAgo(c.age_seconds)) + " ago</span>" +
+      ' <span class="badge ' + ((c.requests_last_60s || 0) > 0 ? "badge-green" : "badge-gray") + '" title="coach app requests in the last minute / 5 minutes">' +
+      escN(c.requests_last_60s || 0) + " req/min · " + escN(c.requests_last_300s || 0) + " req/5m</span>"
+    : (c.has_game ? '<span class="badge badge-gray">' + escN(c.requests_last_300s || 0) + " req/5m</span>" : "");
   const btn = c.has_game
     ? '<button class="btn' + (open ? "" : " btn-primary") + '" onclick="gdToggle(' + escN(c.game_id) + ')" style="font-size:12px;padding:4px 12px;">' + (open ? "Hide plays" : "Show plays") + "</button>"
     : "";
   return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
-    '<b style="font-size:18px;">' + escN(c.school) + '</b><span style="display:flex;align-items:center;gap:10px;">' + gdState(c) + btn + "</span></div>" +
+    '<b class="gd-school" style="font-size:18px;">' + escN(c.school) + '</b><span style="display:flex;align-items:center;gap:10px;">' + gdState(c) + btn + "</span></div>" +
     (c.has_game
       ? '<div class="small" style="margin-top:4px;">' + (c.home_away === "home" ? "vs " : "at ") + escN(c.opponent) + " · " + escN(gdKick(c.kickoff)) + (c.tv ? " · " + escN(c.tv) : "") + "</div>"
       : '<div class="small" style="margin-top:4px;">bye / no game on this date</div>') +
-    (score ? '<div style="margin-top:6px;font-size:16px;">' + score + "</div>" : "") +
-    (c.has_game ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">' + feed + " " + cbs +
-      ' <span class="badge badge-gray" title="requests in the last 5 minutes">' + (c.requests_last_300s || 0) + " req/5m</span></div>" : "") +
+    (score ? '<div class="gd-score" style="margin-top:6px;font-size:16px;">' + score + "</div>" : "") +
+    (c.has_game ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">' + feed + " " + cbs + " " + conn + "</div>" : "") +
     (stats ? '<div class="small" style="margin-top:8px;">' + stats + "</div>" : "") +
     (c.tracked ? '<div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;">' + gdQuarters(c) + "</div>" : "");
 }
@@ -8528,7 +8639,7 @@ function renderGameDayCards(data) {
     box.innerHTML = '<div id="gd-grid" style="display:grid;gap:14px;align-items:start;"></div><div id="gd-unmapped" class="small" style="margin-top:8px;"></div>';
     grid = document.getElementById("gd-grid");
     grid.dataset.cards = want;
-    grid.innerHTML = cards.map(c => '<div class="card" id="gd-card-' + gdId(c.username) + '" style="margin:0;">' +
+    grid.innerHTML = cards.map(c => '<div class="card" id="gd-card-' + gdId(c.username) + '" style="margin:0;"' + (c.has_game ? "" : " data-nogame") + ">" +
       '<div id="gd-head-' + gdId(c.username) + '"></div><div id="gd-plays-' + gdId(c.username) + '" style="margin-top:10px;" hidden></div></div>').join("");
     gdApplyCols();
   }
@@ -8547,6 +8658,7 @@ function renderGameDayCards(data) {
   });
   const un = document.getElementById("gd-unmapped");
   if (un) un.textContent = (data.unmapped || []).length ? "Licensed but no team mapped: " + data.unmapped.join(", ") : "";
+  gdApplyCols();
 }
 
 function gdSlot(gid) {
