@@ -8490,7 +8490,22 @@ function gdApplyCols() {
   }
   document.querySelectorAll(".gd-cols").forEach(sel => { if (sel.value !== v) sel.value = v; });
   document.querySelectorAll(".gd-size").forEach(sel => { if (sel.value !== s) sel.value = s; });
+  gdFitWall();
 }
+
+// On the wall every card is a fixed cell: give its play table an explicit height (the space left under the
+// card head) so the table scrolls inside the card instead of running past its bottom edge.
+function gdFitWall() {
+  const wall = document.body.classList.contains("gd-wall");
+  document.querySelectorAll("#gd-grid > .card").forEach(card => {
+    const sc = card.querySelector(".gd-plays-scroll");
+    if (!sc) return;
+    if (!wall) { sc.style.height = ""; return; }
+    const h = Math.floor(card.getBoundingClientRect().bottom - sc.getBoundingClientRect().top - 14);
+    sc.style.height = Math.max(80, h) + "px";
+  });
+}
+window.addEventListener("resize", () => { if (document.body.classList.contains("gd-wall")) gdFitWall(); });
 
 // ── the WALL: the board moves into a full-screen overlay, every game opens, each card fills its cell ──
 let _gdPlatform = null;   // last /gameday/status payload (server health strip on the wall)
@@ -8727,14 +8742,18 @@ function loadGameDayPlays(gid, quiet) {
         (r.changes ? ' <span class="small mono">' + escN(r.changes) + "</span>" : "") +
         (r.qc ? ' <span class="small" style="color:#f0b429;">' + escN(r.qc) + "</span>" : "") + "</td></tr>";
     }).join("");
+    // FOLLOW the newest play: the view stays pinned to the bottom unless you scrolled up on purpose;
+    // scrolling back to the bottom pins it again. New rows always bring the view down.
     const prev = box.querySelector(".gd-plays-scroll");
+    const pinned = !prev || (prev.scrollTop + prev.clientHeight >= prev.scrollHeight - 12);
     const keep = prev ? prev.scrollTop : 0;
     const html = head + '<div class="gd-plays-scroll" style="max-height:60vh;overflow:auto;"><table><thead><tr>' +
       "<th>#</th><th>Q</th><th>Clock</th><th>Score</th><th>D&amp;D</th><th>Play</th><th>Check</th></tr></thead><tbody>" + trs + "</tbody></table></div>";
     _gdPlaysHtml[gid] = html;
     box.innerHTML = html;
+    gdFitWall();
     const wrap = box.querySelector(".gd-plays-scroll");
-    if (wrap) wrap.scrollTop = fresh.size ? wrap.scrollHeight : keep;
+    if (wrap) wrap.scrollTop = (pinned || fresh.size) ? wrap.scrollHeight : keep;
   }).catch(e => { if (!quiet) box.innerHTML = '<div class="loading">Cannot load plays: ' + escN(e) + "</div>"; });
 }
 
