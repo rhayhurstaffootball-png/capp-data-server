@@ -1234,6 +1234,22 @@ _QC_VALID_POS    = {0, 1, 2, 3, 6, 7, 8}   # valid positive score deltas
 _QC_BUNDLED_ART  = {-7, -8}                 # lag mirrors of bundled TD+EP — skip
 _QC_STUCK_THRESH = 3   # matches cbs_check.STUCK_RUN (4 until Sep 18 2026 - see the note there)
 
+TIMEOUT_UNVERIFIED_NOTE = "Timeout not verified - check who it is charged to"
+
+
+def is_quarter_issue(entry, changes=None, guess=False):
+    """Does this row count toward its quarter's issue share (the coach's 10% backup prompt, the admin board)?
+    An issue is a red row, a row the check fixed or added, or a clock still a guess (measured Sep 12 2026 on 125
+    games). Roger, Sep 19 2026 (SMU at Louisville, Q1): "an unverified timeout is not really an issue.. just
+    information for action" - a row whose ONLY note is the timeout note is not an issue."""
+    qc = str(entry.get("qc_issue") or "").strip()
+    if qc:
+        parts = [p.strip() for p in qc.replace(" \u00b7 ", " | ").split(" | ") if p.strip()]
+        if parts and all(p == TIMEOUT_UNVERIFIED_NOTE for p in parts):
+            qc = ""
+    return bool(qc or changes or entry.get("ncaa_status") == "added" or guess)
+
+
 def _qc_flag_entries(entries, home_name, away_name):
     """
     Run QC checks on fully mapped + lagged entries.
@@ -2301,7 +2317,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # A timeout no rule could settle is exactly the row worth a human look, so
     # say so rather than leaving it indistinguishable from a confident one.
     for _i in to_unresolved:
-        qc_flags.setdefault(_i, "Timeout not verified - check who it is charged to")
+        qc_flags.setdefault(_i, TIMEOUT_UNVERIFIED_NOTE)
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
         if entry.get("ncaa_status") == "added" and not entry["qc_issue"]:
@@ -2331,7 +2347,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         _changes = entry.get("ncaa_changes") or []
         _guess = (clock_src.get(str(entry.get("espn_play_id"))) == "guess"
                   and not any(isinstance(c, dict) and c.get("field") == "clock" for c in _changes))
-        if (str(entry.get("qc_issue") or "").strip() or _changes or entry.get("ncaa_status") == "added" or _guess):
+        if is_quarter_issue(entry, _changes, _guess):
             _qi["issues"] += 1
     for _qi in quarter_issues.values():
         _qi["share"] = round(_qi["issues"] / _qi["rows"], 3) if _qi["rows"] else 0.0

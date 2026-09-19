@@ -88,8 +88,8 @@ def _cbs(date, home_id, away_id, gid):
 
 
 def _issue(r):
-    return (bool(r.get("qc_issue")) or bool(r.get("ncaa_changes")) or r.get("ncaa_status") == "added"
-            or r.get("clock_source") == "guess")
+    # the one rule (espn_fetcher.is_quarter_issue): an unverified timeout is information, not an issue
+    return F.is_quarter_issue(r, r.get("ncaa_changes"), r.get("clock_source") == "guess")
 
 
 def quarter_shares(entries):
