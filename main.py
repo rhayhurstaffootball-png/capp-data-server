@@ -8503,10 +8503,27 @@ function gdApplyCols() {
 // card head) so the table scrolls inside the card instead of running past its bottom edge.
 function gdFitWall() {
   const wall = document.body.classList.contains("gd-wall");
-  document.querySelectorAll("#gd-grid > .card").forEach(card => {
+  const grid = document.getElementById("gd-grid");
+  if (!grid) return;
+  const cards = Array.from(grid.querySelectorAll(":scope > .card:not([data-nogame])"));
+  if (!wall) {
+    grid.querySelectorAll(":scope > .card").forEach(card => { card.style.height = ""; const sc = card.querySelector(".gd-plays-scroll"); if (sc) sc.style.height = ""; });
+    return;
+  }
+  // every card gets the exact height of its grid cell (rows = games / columns), so a long play feed can never
+  // push a card down into the one below it; the play table then gets whatever is left under the card head
+  const m = /repeat\((\d+)/.exec(grid.style.gridTemplateColumns || "");
+  const cols = m ? Math.max(1, parseInt(m[1], 10)) : 1;
+  const rows = Math.max(1, Math.ceil(cards.length / cols));
+  const body = document.getElementById("gd-wall-body");
+  const gridH = grid.clientHeight || (body ? body.clientHeight : 0);
+  if (gridH > 0) {
+    const rowH = Math.floor((gridH - 10 * (rows - 1)) / rows);
+    cards.forEach(card => { card.style.height = rowH + "px"; });
+  }
+  cards.forEach(card => {
     const sc = card.querySelector(".gd-plays-scroll");
     if (!sc) return;
-    if (!wall) { sc.style.height = ""; return; }
     const h = Math.floor(card.getBoundingClientRect().bottom - sc.getBoundingClientRect().top - 14);
     sc.style.height = Math.max(80, h) + "px";
   });
