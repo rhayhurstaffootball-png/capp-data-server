@@ -1167,6 +1167,64 @@ def game_version(game_id: str):
     _record_game_request(game_id, "version", latency_ms, 200, payload_bytes=len(json.dumps(payload).encode("utf-8")))
     return payload
 
+# ── Raw ESPN pass-through for CAPP's OWN tools (Sep 20 2026) ──────────────────
+# Roger: "We never go directly to ESPN we always go through our server. Thats a rule.. machines never touch ESPN."
+# The dev tools (corpus fetch, gameday report, backup-data builder, CBS table builders) had been calling
+# site.api.espn.com from a laptop with their own User-Agent names; on Sep 20 ESPN's edge began refusing every
+# non-stock User-Agent (403) and those tools broke. These three routes hand back ESPN's payload untouched, fetched
+# with the same session the poller uses, so every CAPP machine reaches ESPN through this server only.
+# Key-protected like every other route; nothing is cached (tools, not coaches) and no game is marked active.
+_ESPN_RAW_HOSTS = {
+    "cfb": "https://site.api.espn.com/apis/site/v2/sports/football/college-football",
+    "nfl": "https://site.api.espn.com/apis/site/v2/sports/football/nfl",
+}
+
+
+def _espn_raw(league: str, path: str, params: dict) -> dict:
+    import espn_fetcher as _ef
+    base = _ESPN_RAW_HOSTS.get((league or "cfb").lower())
+    if not base:
+        raise HTTPException(status_code=400, detail="league must be cfb or nfl")
+    try:
+        r = _ef._session.get(f"{base}/{path}", params={k: v for k, v in params.items() if v is not None},
+                             timeout=_ef.REQUEST_TIMEOUT)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ESPN unreachable: {type(e).__name__}: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ESPN answered HTTP {r.status_code}")
+    try:
+        return r.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="ESPN answered non-JSON")
+
+
+@app.get("/espn/scoreboard", dependencies=[Depends(verify_api_key)])
+def espn_scoreboard(
+    league: str = Query("cfb", description="cfb or nfl"),
+    dates: Optional[str] = Query(None, description="YYYYMMDD"),
+    groups: Optional[str] = Query(None, description="ESPN group, e.g. 80 = FBS, 81 = FCS"),
+    limit: int = Query(400, ge=1, le=900),
+    week: Optional[int] = Query(None),
+    seasontype: Optional[int] = Query(None),
+    year: Optional[int] = Query(None),
+):
+    """ESPN's scoreboard JSON, untouched. Same query names ESPN takes."""
+    return _espn_raw(league, "scoreboard", {"dates": dates, "groups": groups, "limit": limit, "week": week,
+                                            "seasontype": seasontype, "year": year})
+
+
+@app.get("/espn/summary/{game_id}", dependencies=[Depends(verify_api_key)])
+def espn_summary(game_id: str, league: str = Query("cfb", description="cfb or nfl")):
+    """ESPN's game summary JSON (drives, plays, header), untouched. The corpus builder's input."""
+    return _espn_raw(league, "summary", {"event": game_id})
+
+
+@app.get("/espn/teams", dependencies=[Depends(verify_api_key)])
+def espn_teams(league: str = Query("cfb", description="cfb or nfl"), limit: int = Query(500, ge=1, le=1000)):
+    """ESPN's team list JSON, untouched (the parsed form is /teams)."""
+    return _espn_raw(league, "teams", {"limit": limit})
+
+
 @app.get("/teams", dependencies=[Depends(verify_api_key)])
 def teams(league: str = Query("cfb", description="cfb or nfl")):
     """Raw ESPN team list — [{display_name, id}]. Client handles name resolution."""
