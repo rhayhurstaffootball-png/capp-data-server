@@ -1242,6 +1242,8 @@ def is_quarter_issue(entry, changes=None, guess=False):
     An issue is a red row, a row the check fixed or added, or a clock still a guess (measured Sep 12 2026 on 125
     games). Roger, Sep 19 2026 (SMU at Louisville, Q1): "an unverified timeout is not really an issue.. just
     information for action" - a row whose ONLY note is the timeout note is not an issue."""
+    if entry.get("cbs_tail"):
+        return False                     # a CBS tail row (cbs_tail.py) is the data the coach asked for, not an issue
     qc = str(entry.get("qc_issue") or "").strip()
     if qc:
         parts = [p.strip() for p in qc.replace(" \u00b7 ", " | ").split(" | ") if p.strip()]
@@ -2289,6 +2291,22 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     except Exception as e:
         print(f"WARNING: score spike pass failed for {game_id}: {type(e).__name__}: {e}", flush=True)
 
+    # CBS TAKES OVER THE TAIL of a live game (Roger, Sep 19 2026: "I HAVE to get them this data" - ESPN's play feed sat
+    # minutes behind CBS on three licensed games at once and blank on Nebraska). Every CBS play after ESPN's last
+    # published play goes in as its own row (cbs_tail.py); the moment ESPN publishes the play, its CBS row leaves the
+    # tail and the coach app swaps it for ESPN's. After the score passes (the rows keep CBS's scores), before the keys.
+    cbs_tail_added = 0
+    if game_status == "in" and summary is None:
+        try:
+            import cbs_backup
+            import cbs_tail
+            _doc = cbs_backup.for_game(_gd, home_team_id, away_team_id, game_id, league)
+            cbs_tail_added = cbs_tail.append_tail(entries, _doc, capp_home, capp_away, game_status)
+            if cbs_tail_added:
+                print(f"[cbs_tail] {game_id}: {cbs_tail_added} row(s) from CBS past ESPN's last play", flush=True)
+        except Exception as e:
+            print(f"WARNING: CBS tail failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+
     # Stable identity per row, AFTER every step that adds rows. Live clients
     # take new plays by this key instead of by count - see _assign_entry_keys.
     _assign_entry_keys(entries)
@@ -2320,7 +2338,10 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         qc_flags.setdefault(_i, TIMEOUT_UNVERIFIED_NOTE)
     for i, entry in enumerate(entries):
         entry["qc_issue"] = qc_flags.get(i, "")
-        if entry.get("ncaa_status") == "added" and not entry["qc_issue"]:
+        if entry.get("cbs_tail"):
+            import cbs_tail as _ct
+            entry["qc_issue"] = _ct.NOTE                         # a tail row's note is always "backup source"
+        elif entry.get("ncaa_status") == "added" and not entry["qc_issue"]:
             entry["qc_issue"] = "Auto-added - check this play"   # Roger, Sep 13 2026: no vendor names on screen
         # The score catch-up note (see _raise_lagging_scores), added here because qc_issue is written over above.
         _sfn = entry.pop("_score_fix_note", "")
@@ -2382,6 +2403,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
             "clock_sources": dict(Counter(v or "none" for v in clock_src.values())),
             # {quarter: {rows, issues, share}} - what SBENTRY's end-of-quarter backup prompt reads (see above).
             "quarter_issues": quarter_issues,
+            "cbs_tail_rows": cbs_tail_added,
         },
         "fetched_at": time.time(),   # unix timestamp — clients poll this to detect changes
     }
