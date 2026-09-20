@@ -2133,8 +2133,11 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                 away_team_abbrev = tabbrev
 
     game_status = "in"
+    game_detail = ""                                   # ESPN's words: "Halftime", "End of 1st", "Delayed", "7:12 - 2nd"
     for comp in header.get("competitions", [{}]):
         game_status = comp.get("status", {}).get("type", {}).get("state", "in")
+        _t = comp.get("status", {}).get("type", {}) or {}
+        game_detail = str(_t.get("shortDetail") or _t.get("detail") or "")
 
     # Get CAPP canonical names for possession field
     capp_home = espn_name_to_capp_name(home_team_name, league) or home_team_name
@@ -2386,6 +2389,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         "away_team_id": away_team_id,
         "game_date":  game_date,
         "status":     game_status,
+        "status_detail": game_detail,
         "league":     league,
         "qc_summary": {
             "auto_fixed_count": len(inferred_pat_fixes) + len(entry_fixes),
@@ -2599,6 +2603,7 @@ _feed_health: dict = {}      # game_id -> tracking dict
 # gaps — TV timeouts, reviews, injuries, halftime — so this is deliberately
 # generous. Under it, normal play is silent for ~1-3 minutes.
 FEED_STALL_SECONDS = 360          # 6 minutes with zero new plays while "in"
+_BREAK_WORDS = re.compile(r"half|end of|delay|suspend|postpon", re.I)   # ESPN's status words for a break in play
 FEED_DARK_SECONDS = 300           # "in" this long having produced NOTHING at all
 
 
@@ -2638,6 +2643,7 @@ def _note_feed_health(game_id, mapped):
                 h["last_count"] = count
                 h["last_change_at"] = now
             h["status"] = status
+            h["detail"] = str((mapped or {}).get("status_detail") or "")
             h["checked_at"] = now
     except Exception:
         pass          # health tracking must never break a poll
@@ -2729,9 +2735,14 @@ def get_feed_health(game_id) -> dict:
     quiet = max(0.0, now - h.get("last_change_at", now))
     live_for = max(0.0, now - h["in_since"]) if h.get("in_since") else 0.0
     state = "healthy"
+    # A game in a BREAK is quiet on purpose - halftime, the end of a quarter, a weather delay. ESPN's status stays
+    # "in" through all of them and its words say which (Roger, Sep 19 2026: "Nebraska says stalled but its halftime
+    # for them ... that freaks me out"). No new play in a break is not a stall.
+    detail = str(h.get("detail") or "")
+    in_break = bool(_BREAK_WORDS.search(detail))
     # Never report a problem for a game nobody has open — it is not being polled
     # BY DESIGN, so "no new plays" says nothing about the feed.
-    if h.get("status") == "in" and is_game_watched(game_id):
+    if h.get("status") == "in" and is_game_watched(game_id) and not in_break:
         if plays == 0 and live_for > FEED_DARK_SECONDS:
             state = "dark"
         elif plays > 0 and quiet > FEED_STALL_SECONDS:
@@ -2739,6 +2750,8 @@ def get_feed_health(game_id) -> dict:
     return {
         "state": state,
         "status": h.get("status", ""),
+        "detail": detail,
+        "in_break": in_break,
         "watched": is_game_watched(game_id),
         "plays": plays,
         "seconds_since_new_play": int(quiet),
