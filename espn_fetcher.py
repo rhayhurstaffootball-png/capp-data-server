@@ -1236,6 +1236,17 @@ _QC_STUCK_THRESH = 3   # matches cbs_check.STUCK_RUN (4 until Sep 18 2026 - see 
 
 TIMEOUT_UNVERIFIED_NOTE = "Timeout not verified - check who it is charged to"
 
+# "(14:40) PENALTY SJSU False Start (#9 J.Nix) 3 yards from SJSU07 to SJSU04. NO PLAY" - the whole row is a dead-ball
+# foul: no snap is described, so no game clock ran and the next play keeps the same clock. NOT the same as a penalty
+# that wiped a play which WAS run ("(13:05) Shotgun ... NO PLAY. ..."), where the row describes the snap first - that
+# one still counts toward a stalled crew.
+_DEAD_BALL_PENALTY = re.compile(r"^\s*(?:\(\d{1,2}:\d{2}\)\s*)?PENALTY\b", re.I)
+
+
+def _is_dead_ball_penalty(entry):
+    text = str(entry.get("play_text") or "")
+    return bool(_DEAD_BALL_PENALTY.match(text)) and "NO PLAY" in text.upper()
+
 
 def is_quarter_issue(entry, changes=None, guess=False):
     """Does this row count toward its quarter's issue share (the coach's 10% backup prompt, the admin board)?
@@ -1274,18 +1285,32 @@ def _qc_flag_entries(entries, home_name, away_name):
             elif delta not in _QC_VALID_POS:
                 flags.setdefault(i, []).append(f"Score jumped +{delta}")
 
-    # Stuck clock (4+ consecutive same clock in same quarter, non-special down)
-    streak = 1
-    for i in range(1, len(entries)):
-        c, p = entries[i], entries[i - 1]
-        if (c.get("clock") == p.get("clock")
-                and c.get("quarter") == p.get("quarter")
-                and str(c.get("down", "")) not in ("KO", "EP", "2PT", "OTO")):
+    # Stuck clock: _QC_STUCK_THRESH+ SCRIMMAGE plays on one clock in one quarter. A row that carries the previous
+    # play's clock BY NATURE - a try, a kickoff, a timeout, an officials' stoppage, a bookkeeping line, a dead-ball
+    # penalty - neither counts toward a run nor breaks one; it rides along inside it.
+    # Fresno St @ San Jose St Q2 14:40 (Sep 19 2026): an officials timeout, a false start "NO PLAY" and the snap
+    # after them were reported as a 3-play stall. Roger: "it looks right on the tree, it's 3 that should be stuck."
+    # The old rule tested only the CURRENT row's down and never the row above it, so a timeout could ANCHOR the very
+    # run it should have been left out of.
+    # MEASURED, Sep 12 + Sep 19 corpora (249 games, final rows): 159 flags -> 84. All 87 dropped runs were read: every
+    # one is a try + kickoff + dead-ball penalty on one clock, stacked timeouts, or overtime (every OT row reads
+    # 0:00). No stalled crew lost - the real ones (e.g. RGV @ NICH Q3, five snaps on 0:00) are still flagged.
+    # ⚠ cbs_check._stuck_runs stays BROAD on purpose and no longer mirrors this exactly: it decides which rows to
+    # re-check against CBS, where over-including costs nothing (CBS agrees -> no change) and it already drops
+    # timeouts and admin lines before repairing anything.
+    import ncaa_match as _nm
+    streak, prev = 0, None
+    for i, c in enumerate(entries):
+        if _nm._shares_clock_by_nature(c) or _is_dead_ball_penalty(c):
+            continue
+        if (prev is not None and c.get("clock") == prev.get("clock")
+                and c.get("quarter") == prev.get("quarter")):
             streak += 1
-            if streak == _QC_STUCK_THRESH:
-                flags.setdefault(i, []).append(f"Clock stuck ({streak}+ plays)")
         else:
             streak = 1
+        if streak == _QC_STUCK_THRESH:
+            flags.setdefault(i, []).append(f"Clock stuck ({streak}+ plays)")
+        prev = c
 
     # A row sitting above a play whose clock the backup check CORRECTED, with a lower clock of its own, is provably
     # out of place: the corrected clock is fenced by both sources, this row's is not. Syracuse @ Pitt Q4 (Sep 17-18

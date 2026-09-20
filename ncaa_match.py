@@ -254,18 +254,45 @@ def score_pair(row, ncaa_play):
     return s
 
 
+_CLOCK_SHARERS = ("EP", "2PT", "KO", "OTO")
+
+
+def _shares_clock_by_nature(row):
+    """A row that legitimately carries the clock of the play before it: a try, a kickoff, a timeout, an officials'
+    stoppage. Houston @ Texas Tech, Sep 18 2026 (Roger): Fix Clocks offered a play -> touchdown -> extra point
+    series as a stuck run, and counted a timeout as the third row of another. Neither is a stalled crew."""
+    if str(row.get("down") or "").strip().upper() in _CLOCK_SHARERS:
+        return True
+    if str(row.get("home_time_out") or "") == "Yes" or str(row.get("away_time_out") or "") == "Yes":
+        return True
+    text = str(row.get("play_text") or "").strip().lower()
+    return text.startswith("timeout") or text.startswith("extra point") or is_admin_line(text)
+
+
 def find_stuck_runs(rows, min_len=3):
-    """Index ranges where the clock does not move for `min_len`+ plays in one
-    quarter. This is what a stalled stat crew looks like in the data."""
-    runs, start = [], 0
-    for i in range(1, len(rows) + 1):
-        same = (i < len(rows)
-                and norm_clock(rows[i].get("clock")) == norm_clock(rows[start].get("clock"))
-                and _quarter(rows[i].get("quarter")) == _quarter(rows[start].get("quarter")))
-        if not same:
-            if i - start >= min_len:
-                runs.append((start, i - 1))
-            start = i
+    """Index ranges where the clock does not move for `min_len`+ SCRIMMAGE plays in one quarter. This is what a
+    stalled stat crew looks like in the data. Tries, kickoffs, timeouts and stoppages share a clock by nature: they
+    neither count toward the run nor break it (they ride along inside a run so the range stays contiguous)."""
+    runs = []
+    i, n = 0, len(rows)
+    while i < n:
+        if _shares_clock_by_nature(rows[i]):
+            i += 1
+            continue
+        clock, q = norm_clock(rows[i].get("clock")), _quarter(rows[i].get("quarter"))
+        j, count, last = i, 0, i
+        while j < n and _quarter(rows[j].get("quarter")) == q:
+            if _shares_clock_by_nature(rows[j]):
+                j += 1
+                continue
+            if norm_clock(rows[j].get("clock")) != clock:
+                break
+            count += 1
+            last = j
+            j += 1
+        if count >= min_len:
+            runs.append((i, last))
+        i = max(last + 1, i + 1)
     return runs
 
 
