@@ -463,7 +463,12 @@ _ADMIN_LINE = re.compile(
     r"|start of \w+ (quarter|period)\b|end of \w+ (quarter|period)\b"
     r"|.*\bend of (game|half|regulation)\b|.*\bstart of (game|half|overtime)\b"
     r"|timeout\b|officials timeout\b"
-    r"|.*\binjured on the play\b"
+    # An injury note is ONLY a line that is nothing but "<player> injured on the play" (NCAA writes it as its own row:
+    # "Moore,Hayden injured on the play"). ESPN appends the same words to the END of the real play ("... rush middle
+    # for 7 yards (#10 X.Griffin), 1ST DOWN. #10 X.Griffin injured on the play") and that play must stay a play -
+    # Sep 19 2026: six real plays in four games lost their board (Fresno Q3 8:29, NEB, MTSU, BYU) because this matched
+    # anywhere. Measured Sep 12 corpus: 110 real plays flip back to plays, 104 standalone lines stay admin, 0 others.
+    r"|[A-Za-z .,'\-]+\binjured on the play\b\.?\s*$"
     # NCAA writes a disqualification as its own line ("Air Force C.Paterson has been disqualified") after the
     # penalty play. Not a play: the live NCAA check added two of them to Air Force as boards (Sep 13 2026).
     # ⚠ ONLY a line that is nothing but "<team> <player> has been disqualified". NCAA also appends the same words
