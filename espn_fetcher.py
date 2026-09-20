@@ -1914,7 +1914,77 @@ def _fetch_historical_games(league, year, week, seasontype=2):
 # Play Fetching + Full Mapping Pipeline
 # ============================================================
 
-def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
+TIMEOUTS_FROM_CBS = True          # CBS's timeouts-remaining counters decide (measured Sep 19 2026 - see _classify_timeouts)
+# CBS shows the lower count ON THE PLAY the timeout was called after, so the drop's snap clock reads a few seconds to a
+# minute EARLIER than ESPN's timeout clock (MEASURED Sep 19 2026 on the Sep 12 corpus: the first version allowed the
+# drop to be later and fell from 98% to 84% agreement with NCAA's labels).
+_CBS_TO_BEFORE = 60               # the drop's snap can be up to this many game seconds before the timeout's clock
+_CBS_TO_AFTER = 30                # ... or up to half a minute after it, when one side's clock is typed off
+_CBS_TO_OTHER_TEAM = 100          # a drop for the OTHER team than ESPN names: only when nothing better fits
+_CBS_TO_UNNAMED = 25              # an ESPN row with no team (an "Officials Timeout"): a named row wins a near tie
+
+
+def _cbs_timeout_drops(cbs_doc):
+    """CBS's charged timeouts from its timeouts-remaining counters (cbs_backup.team_timeouts), or None when CBS has no
+    counters for this game. Each: quarter, clock_secs of the play the counter dropped on, side."""
+    if not cbs_doc or not cbs_doc.get("available") or not cbs_doc.get("teams_known") or not cbs_doc.get("counters_known"):
+        return None
+    out = []
+    for it in cbs_doc.get("items") or []:
+        if it.get("kind") == "team_timeout" and it.get("timeout_side") in ("home", "away") and it.get("clock_secs") is not None:
+            try:
+                q = int(str(it.get("quarter")).strip())
+            except (TypeError, ValueError):
+                continue
+            out.append({"q": q, "secs": int(it["clock_secs"]), "side": it["timeout_side"]})
+    return out
+
+
+def _fold_team(name):
+    return re.sub(r"[^a-z0-9 ]+", "", str(name or "").lower()).strip()
+
+
+def _cbs_drop_score(d, q, secs, side):
+    """How well a counter drop fits an ESPN timeout row (lower is better), or None when it cannot be that timeout.
+    A row ESPN typed as an officials' timeout (no team) is only charged by a drop sitting right on it (10 s)."""
+    # MEASURED Sep 19 2026 (Sep 12 corpus, 69 games, 682 timeout rows): charging a row for the OTHER team than it names,
+    # or charging a row the crew typed "Officials Timeout", both lost against NCAA's labels (a duplicate "Timeout
+    # Kentucky" row took Alabama's drop; a TV break on the same second as a counter drop got charged). So CBS only ever
+    # CONFIRMS the team ESPN names: a named row with a same-team drop in the window is charged, a named row with none
+    # is an officials' timeout unless NCAA charges it, and an unnamed row is left to the older rules.
+    if q is None or secs is None or d["q"] != q or side not in ("home", "away") or side != d["side"]:
+        return None
+    lead = d["secs"] - secs                      # positive = the drop's play sits earlier on the clock than the timeout
+    if not (-_CBS_TO_AFTER <= lead <= _CBS_TO_BEFORE):
+        return None
+    return abs(lead)
+
+
+def _assign_cbs_drops(rows, drops):
+    """{row index: drop} - BEST PAIR FIRST over the whole game, each row and each drop used once. (Row order was tried
+    first and was wrong: an earlier row stole a later row's drop - Arkansas @ Utah Q4, the 2:00 row took 1:45's.)"""
+    pairs = []
+    for i, q, secs, side in rows:
+        for k, d in enumerate(drops):
+            sc = _cbs_drop_score(d, q, secs, side)
+            if sc is not None:
+                pairs.append((sc, i, k))
+    out, used = {}, set()
+    for sc, i, k in sorted(pairs):
+        if i in out or k in used:
+            continue
+        out[i] = drops[k]
+        used.add(k)
+    return out
+
+
+# Sep 19 2026 (Roger, Maryland vs Virginia Tech live): ESPN's crew typed 13 team timeouts in a half - three for
+# Virginia Tech in Q1 alone - while CBS's timeouts-remaining counters dropped exactly 3 times. "No one is going to
+# call a timeout before a kickoff after a scoring play." So when CBS has counters for the game they decide FIRST:
+# an ESPN timeout row that lines up with a counter drop is charged to that team; one that lines up with nothing is
+# an officials' timeout (no charge, OTO). NCAA's labels and the measured fallback rules stay for games CBS does not
+# have. MEASURED before it went in: _dev_tools/game_replay_test/measure_timeouts_cbs.py.
+def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_doc=None):
     """Rewrite timeout rows to say who they are actually charged to.
 
     Returns (changed_count, examples, unresolved_count). Never raises: a second
@@ -1946,6 +2016,31 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
               f"({home_name} v {away_name}): {e}", flush=True)
 
     changed, examples, unresolved = 0, [], []
+    drops = _cbs_timeout_drops(cbs_doc) if TIMEOUTS_FROM_CBS else None
+    assigned = {}
+    if drops is not None:
+        _rq = []
+        for _i, _e in rows:
+            try:
+                _q = int(str(_e.get('quarter', '')).strip() or 0)
+            except (TypeError, ValueError):
+                _q = None
+            # the clock in the row's own text beats the clock field (the field is often the previous play's)
+            _m = re.search(r'clock\s+(\d{1,2}):(\d{2})', str(_e.get('play_text', '')), re.I)
+            if not _m:
+                _m = re.match(r'^\s*(\d{1,2}):(\d{2})\s*$', str(_e.get('clock', '')))
+            _side = 'home' if str(_e.get('home_time_out')) == 'Yes' else ('away' if str(_e.get('away_time_out')) == 'Yes' else None)
+            if _side is None:                     # no flag: the team the text names (loose: 'Arkansas' ~ 'Arkansas Razorbacks')
+                _tm = re.match(r'^\s*timeout\s+(.+?)\s*(,|$)', str(_e.get('play_text', '')), re.I)
+                _who = _fold_team(_tm.group(1)) if _tm else ''
+                _h, _a = _fold_team(home_name), _fold_team(away_name)
+                if _who and (_who == _h or _who in _h or _h in _who) and not (_who == _a or _who in _a or _a in _who):
+                    _side = 'home'
+                elif _who and (_who == _a or _who in _a or _a in _who):
+                    _side = 'away'
+            _rq.append((_i, _q, int(_m.group(1)) * 60 + int(_m.group(2)) if _m else None, _side))
+        assigned = _assign_cbs_drops(_rq, drops)
+        named = {_i for _i, _q, _s, _side in _rq if _side in ('home', 'away')}
     for i, e in rows:
         key = (str(e.get("quarter")), _norm_clock_str(e.get("clock")))
         lab = labels.get(key)
@@ -1963,6 +2058,16 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date=""):
                 verdict, why = ch, "backup source"
             elif ch is None:
                 verdict, why = "officials", "backup source"
+        # MEASURED Sep 19 2026 (Sep 12 corpus, 69 CBS games, 682 timeout rows, 598 with an NCAA label): CBS's counters
+        # AHEAD of NCAA's label fell from 98.2% to 95.7% agreement with those labels (the two-minute TV break on the
+        # same second as a real drop, a duplicate typed row). So: NCAA's label first, CBS's counters where NCAA is
+        # silent (all 13 of Maryland's rows on Sep 19 - NCAA had no labels live), the fallback rules last.
+        if verdict is None and drops is not None and i in named:
+            _hit = assigned.get(i)
+            if _hit is not None:
+                verdict, why = _hit['side'], 'backup counters'
+            else:
+                verdict, why = 'officials', 'backup counters (no timeout charged)'
         if verdict is None:
             ok, reason = _assume_officials(entries, i)
             if ok:
@@ -2035,7 +2140,7 @@ def _season_guess(game_date):
     return _dt.date.today().year
 
 
-_TO_SCORING = re.compile(r"touchdown|field goal.*good|kick attempt good|extra point", re.I)
+_TO_SCORING = re.compile(r"touchdown|field goal.*good|kick attempt good|extra point|two[ -]?point", re.I)
 _TO_KICKOFF = re.compile(r"\bkickoff\b|\bkicks off\b|\bkicks\b", re.I)
 
 
@@ -2299,11 +2404,13 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # published play goes in as its own row (cbs_tail.py); the moment ESPN publishes the play, its CBS row leaves the
     # tail and the coach app swaps it for ESPN's. After the score passes (the rows keep CBS's scores), before the keys.
     cbs_tail_added = 0
+    _cbs_doc = None                                       # also what the timeout classifier reads its counters from
     if summary is None:                                   # live or finished: cbs_tail.STATUSES decides
         try:
             import cbs_backup
             import cbs_tail
             _doc = cbs_backup.for_game(_gd, home_team_id, away_team_id, game_id, league)
+            _cbs_doc = _doc
             cbs_tail_added = cbs_tail.append_tail(entries, _doc, capp_home, capp_away, game_status)
             if cbs_tail_added:
                 print(f"[cbs_tail] {game_id}: {cbs_tail_added} row(s) from CBS past ESPN's last play", flush=True)
@@ -2329,7 +2436,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         game_date = ""
     try:
         to_changed, to_examples, to_unresolved = _classify_timeouts(
-            entries, capp_home, capp_away, league, game_date)
+            entries, capp_home, capp_away, league, game_date, cbs_doc=_cbs_doc)
     except Exception as e:
         print(f"WARNING: timeout classify failed for {game_id}: {e}", flush=True)
 

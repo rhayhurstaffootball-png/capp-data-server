@@ -177,6 +177,9 @@ def build(plays, board, home_code, away_code, swapped=False, espn_game_id=""):
             "ready": {"through": through, "label": "Full Game" if str(board.get("status") or "").upper() == "FINAL"
                       else _LABELS.get(through, "")},
             "has_timeouts": True, "teams_known": bool(home_id and away_id),
+            # Sep 19 2026: the timeout classifier trusts the counters only when CBS carried them for this game.
+            "counters_known": any(p.get("home_timeouts_remaining") is not None or p.get("away_timeouts_remaining") is not None
+                                  for p in plays),
             "items": items, "skipped": doc.get("skipped") or {}, "unparsed": [], "errors": []}
 
 
