@@ -15,7 +15,7 @@ tail, its key disappears from the feed, and the app takes it down the way it tak
 (espn_poller._drop_gone_placeholders) - ESPN's own version is drawn in its place.
 
 Guards:
-- Live games only (ESPN status "in"). A finished game's tail is a different question (never measured) - not here.
+- Live and finished games (a coach who pulls after the final gets the same fill). Measured on 125 finished games: 0 rows.
 - A CBS play that is ESPN's LAST play written differently (same play / same snap, cbs_check's tests against the last
   rows of that quarter) is not appended - the tail starts strictly after what ESPN has.
 - The same clock as ESPN's last play is NOT "after" (a tempo snap on the same second will come from ESPN a poll later).
@@ -33,10 +33,15 @@ RECENT = 8                                          # ESPN rows of the last quar
 
 
 def _q(v):
-    try:
-        return int(str(v).strip())
-    except (TypeError, ValueError):
-        return 0
+    """Quarter as a number. ESPN labels overtime "OT" / "2OT" (CBS numbers it 5, 6, ...): MEASURED Sep 19 2026 on the
+    Sep 12 corpus - reading "OT" as 0 made the whole game "after" ESPN's last play on both overtime games."""
+    t = str(v or "").strip().upper()
+    if t.isdigit():
+        return int(t)
+    if t.endswith("OT"):
+        n = t[:-2]
+        return 4 + (int(n) if n.isdigit() else 1)
+    return 0
 
 
 def _secs(clock):
@@ -82,9 +87,13 @@ def _key(r):
     return "gap:cbs:tail:%s:%s" % (r.get("quarter"), hashlib.sha1(body.encode("utf-8")).hexdigest()[:12])
 
 
+STATUSES = ("in", "post")   # live AND finished games. MEASURED Sep 19 2026 on the Sep 12 corpus (125 finished games,
+                            # ESPN complete): 0 rows appended, 0 crashes - once "OT" parsed as quarter 5 (see _q).
+
+
 def append_tail(entries, doc, home_name, away_name, status="in"):
     """Append CBS's tail rows to `entries` in place. Returns the number appended (0 = nothing to do)."""
-    if str(status or "") != "in" or not doc or not doc.get("available"):
+    if str(status or "") not in STATUSES or not doc or not doc.get("available"):
         return 0
     tail = tail_items(entries, doc.get("items") or [])
     if not tail:

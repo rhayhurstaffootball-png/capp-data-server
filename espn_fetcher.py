@@ -2296,7 +2296,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # published play goes in as its own row (cbs_tail.py); the moment ESPN publishes the play, its CBS row leaves the
     # tail and the coach app swaps it for ESPN's. After the score passes (the rows keep CBS's scores), before the keys.
     cbs_tail_added = 0
-    if game_status == "in" and summary is None:
+    if summary is None:                                   # live or finished: cbs_tail.STATUSES decides
         try:
             import cbs_backup
             import cbs_tail
