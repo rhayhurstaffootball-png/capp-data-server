@@ -1692,6 +1692,22 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         down = str(start_down) if start_down else "1"
         distance = start_distance if start_distance else 10
         gain = 0
+        # THE SPOT ON A TEAM TIMEOUT IS MEASURED FROM THE WRONG END. Roger, Maryland Q2 0:01 (Sep 19 2026): "the
+        # down and distance doesn't make sense coming out of the timeouts ... that way someone doesn't see them and
+        # think they are wonky." Maryland's drive read -37, then the timeout row +37, then -42.
+        # Read in ESPN's raw play: on a team timeout `start.team` is the team that CALLED it, not the team with the
+        # ball, and `yardsToEndzone` is measured to THAT team's end zone. When the defence calls it the two are
+        # opposite ends, so the spot lands on the far side of the field. Measured on the raw feed: start.team ==
+        # drive team on 334 timeouts and DIFFERENT on 143 (Sep 19, first 40 games) - the 143 are the flipped ones.
+        # Mirroring the yard line back onto the offense's half is all that is needed: down and distance already
+        # carry the previous snap's numbers and are left alone.
+        # ⚠ NOT done by copying the row above: ~50 timeouts per corpus sit after a kickoff, a try or a change of
+        # possession, where the snap above belongs to the OTHER team (Tennessee @ Georgia Tech Q4 1:38 would have
+        # taken Georgia Tech's 1&2 at the 2 onto a Tennessee timeout).
+        _to_team_id = str(play.get("start_team_id") or "")
+        if (_to_team_id and drive_team_id and _to_team_id != str(drive_team_id)
+                and yards_to_endzone is not None):
+            field_position = convert_field_position(100 - yards_to_endzone)
     else:
         down = str(start_down) if start_down else "1"
         distance = start_distance if start_distance else 10
