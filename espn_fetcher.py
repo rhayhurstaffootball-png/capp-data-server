@@ -1248,6 +1248,11 @@ def _is_dead_ball_penalty(entry):
     return bool(_DEAD_BALL_PENALTY.match(text)) and "NO PLAY" in text.upper()
 
 
+# "Timeout Grambling, clock 10:53" / "(02:00) Officials Timeout". Same shape as cbs_check._TIMEOUT so both sides of
+# the backup check agree on what counts as a timeout row.
+_TIMEOUT_TEXT = re.compile(r"^\s*(\(\d{1,2}:\d{2}\)\s*)?(officials\s+)?time\s*out", re.I)
+
+
 def is_quarter_issue(entry, changes=None, guess=False):
     """Does this row count toward its quarter's issue share (the coach's 10% backup prompt, the admin board)?
     An issue is a red row, a row the check fixed or added, or a clock still a guess (measured Sep 12 2026 on 125
@@ -2035,9 +2040,16 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
         return 0, [], []           # the backup source has no NFL data
 
     def _is_timeout(e):
+        # A ROW THE FEED NEVER FLAGGED IS STILL A TIMEOUT. Grambling @ TCU and Seton Hall @ UMass, Sep 12 2026: rows
+        # reading "Timeout Grambling, clock 10:53" arrived with home_time_out/away_time_out both "No" (the team-name
+        # match in map_espn_play found neither side) and a normal down, so they were never OTO either - and this
+        # function dropped them before any rule could look at them. The coach saw a "?" and had to classify by hand.
+        # The body below already knows what to do with an unflagged row: it reads the team out of the text. Same
+        # shape cbs_check._TIMEOUT has always used, so both sides of the check agree on what a timeout row is.
         return (str(e.get("home_time_out")) == "Yes"
                 or str(e.get("away_time_out")) == "Yes"
-                or str(e.get("down", "")).strip().upper() == "OTO")
+                or str(e.get("down", "")).strip().upper() == "OTO"
+                or bool(_TIMEOUT_TEXT.match(str(e.get("play_text") or ""))))
 
     rows = [(i, e) for i, e in enumerate(entries) if _is_timeout(e)]
     if not rows:
@@ -2117,6 +2129,15 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
             unresolved.append(i)
             continue
 
+        # TWO OFFICIALS' STOPPAGES CANNOT SHARE A TICK. If an OTO row already sits at this quarter and clock, a row
+        # the crew typed with a TEAM NAME is something else - and calling it officials would rewrite it into a second
+        # identical row, and a second identical board, in front of the coach. Lincoln (PA) vs Mississippi Valley St
+        # Q2 2:00 (Sep 12 2026), a game with NO backup source at all, where the fallback did exactly that. Leave it
+        # unresolved instead: the coach gets the "check who it is charged to" note and the Classify Timeouts button.
+        if verdict == "officials" and _names_a_team(e) and _officials_already_at(entries, i):
+            unresolved.append(i)
+            continue
+
         before = (e.get("down"), e.get("home_time_out"), e.get("away_time_out"),
                   e.get("play_text"))
         if verdict == "officials":
@@ -2140,6 +2161,23 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
                 examples.append("Q%s %s timeout -> %s (%s)"
                                 % (e.get("quarter"), e.get("clock"), verdict, why))
     return changed, examples, unresolved
+
+
+def _names_a_team(entry):
+    """True when the row reads "Timeout <someone>" rather than a bare/officials stoppage."""
+    return bool(re.match(r"^\s*timeout\s+\S", str(entry.get("play_text") or ""), re.I))
+
+
+def _officials_already_at(entries, i):
+    """True when another row in the same quarter already holds an officials' stoppage at this row's clock."""
+    e = entries[i]
+    q, c = str(e.get("quarter")), _norm_clock_str(e.get("clock"))
+    for j, o in enumerate(entries):
+        if j != i and str(o.get("quarter")) == q \
+                and str(o.get("down", "")).strip().upper() == "OTO" \
+                and _norm_clock_str(o.get("clock")) == c:
+            return True
+    return False
 
 
 def _timeout_line(verdict, team_name, clock, existing):
