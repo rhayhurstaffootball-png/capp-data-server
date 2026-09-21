@@ -2483,6 +2483,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # published play goes in as its own row (cbs_tail.py); the moment ESPN publishes the play, its CBS row leaves the
     # tail and the coach app swaps it for ESPN's. After the score passes (the rows keep CBS's scores), before the keys.
     cbs_tail_added = 0
+    cbs_backup_primary = False
     _cbs_doc = None                                       # also what the timeout classifier reads its counters from
     if summary is None:                                   # live or finished: cbs_tail.STATUSES decides
         try:
@@ -2490,9 +2491,11 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
             import cbs_tail
             _doc = cbs_backup.for_game(_gd, home_team_id, away_team_id, game_id, league)
             _cbs_doc = _doc
-            cbs_tail_added = cbs_tail.append_tail(entries, _doc, capp_home, capp_away, game_status)
+            cbs_tail_added, cbs_backup_primary = cbs_tail.append_tail(
+                entries, _doc, capp_home, capp_away, game_status)
             if cbs_tail_added:
-                print(f"[cbs_tail] {game_id}: {cbs_tail_added} row(s) from CBS past ESPN's last play", flush=True)
+                print(f"[cbs_tail] {game_id}: {cbs_tail_added} row(s) from CBS past ESPN's last play"
+                      f"{' - BACKUP IS THE PRIMARY FEED' if cbs_backup_primary else ''}", flush=True)
         except Exception as e:
             print(f"WARNING: CBS tail failed for {game_id}: {type(e).__name__}: {e}", flush=True)
 
@@ -2594,6 +2597,9 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
             # {quarter: {rows, issues, share}} - what SBENTRY's end-of-quarter backup prompt reads (see above).
             "quarter_issues": quarter_issues,
             "cbs_tail_rows": cbs_tail_added,
+            # True only when CBS has TAKEN OVER (not a hole filled): the coach app paints those rows
+            # white and raises its one-time "Now using backup source" alert instead of red.
+            "backup_primary": cbs_backup_primary,
         },
         "fetched_at": time.time(),   # unix timestamp — clients poll this to detect changes
     }

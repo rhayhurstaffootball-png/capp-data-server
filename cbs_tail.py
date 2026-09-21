@@ -28,6 +28,7 @@ import cbs_check
 import cbs_rows
 
 NOTE = "Backup source - primary feed behind"       # Roger, Sep 13 2026: no vendor names on screen
+PRIMARY_NOTE = "Backup source"                     # once the backup IS the feed, the row is normal, not a warning
 WHY = "CBS has this play, ESPN has not published it yet"
 RECENT = 8                                          # ESPN rows of the last quarter checked for "same play"
 
@@ -90,22 +91,73 @@ def _key(r):
 STATUSES = ("in", "post")   # live AND finished games. MEASURED Sep 19 2026 on the Sep 12 corpus (125 finished games,
                             # ESPN complete): 0 rows appended, 0 crashes - once "OT" parsed as quarter 5 (see _q).
 
+# ── HAS THE BACKUP BECOME THE PRIMARY? ───────────────────────────────────────────────────────────────────────────
+# Roger, Sep 19 2026 night: "that Red is scary as fuck... make it White and they get an alert 'Now using backup
+# source' and have it just pick up." And the limit he set on it: a single CBS play dropped into ESPN's flow, or a
+# tail row or two while ESPN is merely a play behind, STAYS RED - it is a play the coach should look at. White is
+# only for the case that actually happened on Saturday: ESPN quiet and CBS carrying the game.
+# Roger, Sep 20 2026, asked directly: rows ALWAYS appear the moment CBS is ahead - this decides colour and the
+# one-time alert, never whether the coach sees a play.
+# The two shapes, from Saturday's own numbers: ESPN dark on Nebraska gave a tail of 64 rows (MTSU 79, MD 34,
+# BYU 19); a lone missing play gives 1 or 2. Either signal is enough on its own.
+PRIMARY_TAIL_ROWS = 3        # CBS carrying this many plays past ESPN's last published one
+PRIMARY_QUIET_SECS = 90      # ...or ESPN has published nothing at all for this long
+
+
+def _wallclock_secs(entries, now=None):
+    """Seconds since the newest ESPN play was published, or None when no row carries a usable wallclock."""
+    import calendar
+    import time as _t
+    newest = None
+    for e in entries:
+        if e.get("cbs_tail"):
+            continue
+        w = str(e.get("wallclock") or "").strip()
+        if not w.endswith("Z") or len(w) < 20:
+            continue
+        try:
+            t = calendar.timegm(_t.strptime(w, "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            continue
+        if newest is None or t > newest:
+            newest = t
+    if newest is None:
+        return None
+    return max(0.0, (now if now is not None else _t.time()) - newest)
+
+
+def backup_is_primary(entries, appended, status="in", now=None):
+    """True when CBS has taken the game over, not merely filled a hole. Finished games never count: a post-game
+    pull is a backfill, nobody is watching a feed."""
+    if str(status or "") != "in" or appended <= 0:
+        return False
+    if appended >= PRIMARY_TAIL_ROWS:
+        return True
+    quiet = _wallclock_secs(entries, now)
+    return quiet is not None and quiet >= PRIMARY_QUIET_SECS
+
 
 def append_tail(entries, doc, home_name, away_name, status="in"):
-    """Append CBS's tail rows to `entries` in place. Returns the number appended (0 = nothing to do)."""
+    """Append CBS's tail rows to `entries` in place.
+
+    Returns (rows_appended, backup_is_primary). The second value is what tells the coach app to paint the rows
+    white and raise its one-time "Now using backup source" alert instead of the red every added row gets.
+    """
     if str(status or "") not in STATUSES or not doc or not doc.get("available"):
-        return 0
+        return 0, False
     tail = tail_items(entries, doc.get("items") or [])
     if not tail:
-        return 0
+        return 0, False
     sub = {"items": tail}
     rows = []
     for q in sorted({_q(it.get("quarter")) for it in tail}):
         if 1 <= q <= 5:
             rows.extend(cbs_rows.rows_for_quarter(sub, q, home_name, away_name))
+    primary = backup_is_primary(entries, len(rows), status)
     for r in rows:
         r.update(wallclock="", espn_play_id="", espn_seq=None, _forced_key=_key(r), cbs_tail=True,
-                 ncaa_status="added", qc_issue=NOTE,
+                 ncaa_status="added", qc_issue=(PRIMARY_NOTE if primary else NOTE),
+                 backup_primary=primary,
                  ncaa_changes=[{"field": "row", "old": "", "new": "added", "why": WHY}])
     entries.extend(rows)
-    return len(rows)
+    return len(rows), primary
