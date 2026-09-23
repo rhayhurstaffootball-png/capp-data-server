@@ -235,6 +235,11 @@ def _players(text):
     return t
 
 
+# Plays both scorers write as a set phrase rather than as a player doing something - there is no name
+# in common to match on, so same_snap decides these on down + distance + spot instead.
+_STOCK_PLAY = re.compile(r"\b(kneels?|kneel\s+down|takes?\s+a\s+knee|spikes?\s+the\s+ball|"
+                         r"spiked?\s+the\s+ball)\b", re.I)
+
 def _share_player(a, b):
     return _names_match(_players(a), _players(b))
 
@@ -259,6 +264,18 @@ def same_snap(e, it):
     # yards accepted. No Play." 4&6 at the 39): same foul, same yards, same penalized player, same yard line.
     if _same_foul(et, ct) and M._surnames(_penalty_clause(et)) & M._surnames(_penalty_clause(ct)):
         return True
+    # A STOCK-PHRASE PLAY HAS NO PLAYER TO SHARE. ESPN writes a kneel as "Kneel down by Mississippi
+    # St." - the TEAM, not a player - while CBS writes "K.Taylor kneels", so _share_player finds
+    # nothing and every branch below is skipped; MSST @ SC Q4 (Sep 19 2026) put the same knee in
+    # twice, at the same 2nd & 15 and the same spot, which is a duplicate board too. Down and
+    # distance settle it; the spot was already checked at the top of this function, and that is what
+    # protects the real second knee at UNT @ TXST (ESPN at TXST04, CBS at the TXST 1, 3 yards apart).
+    if _STOCK_PLAY.search(et) and _STOCK_PLAY.search(ct):
+        _d = str(e.get("down") or "").strip()
+        _d1, _d2 = _int(e.get("distance")), _int(it.get("distance"))
+        if (_d.isdigit() and it.get("down") is not None and int(_d) == int(it["down"])
+                and _d1 is not None and _d2 is not None and abs(_d1 - _d2) <= DISTANCE_TYPO):
+            return True
     if not _share_player(et, ct):
         return False
     down = str(e.get("down") or "").strip().upper()
