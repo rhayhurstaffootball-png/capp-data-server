@@ -112,6 +112,26 @@ def _call(path: str, ttl: int = _CACHE_SECONDS):
 # NCAA writes "Oregon St.", "Miami (OH)", "Army West Point", "App State" where
 # CAPP/ESPN write "Oregon State", "Miami (OH)", "Army", "Appalachian State".
 # Fold hard, then allow a small alias table for the ones folding cannot reach.
+# NCAA writes state names AP-style ("Ga. Southern", "Western Ky.", "Central Conn. St."); CAPP asks
+# with ESPN's full spelling. Expanded inside _fold BEFORE punctuation is stripped.
+# ⚠ THE PERIOD IS REQUIRED. Bare "la" would rewrite "La Salle" as "Louisiana Salle", and bare "ind"
+# or "miss" are just as dangerous; NCAA always writes the period, so demand it.
+_STATE_ABBR = [
+    ("n.c.", "north carolina"), ("s.c.", "south carolina"), ("n.d.", "north dakota"),
+    ("s.d.", "south dakota"), ("n.h.", "new hampshire"), ("n.j.", "new jersey"),
+    ("n.m.", "new mexico"), ("n.y.", "new york"), ("w.va.", "west virginia"),
+    ("r.i.", "rhode island"),
+    ("ala.", "alabama"), ("ariz.", "arizona"), ("ark.", "arkansas"), ("calif.", "california"),
+    ("colo.", "colorado"), ("conn.", "connecticut"), ("del.", "delaware"), ("fla.", "florida"),
+    ("ga.", "georgia"), ("ill.", "illinois"), ("ind.", "indiana"), ("kan.", "kansas"),
+    ("ky.", "kentucky"), ("la.", "louisiana"), ("md.", "maryland"), ("mass.", "massachusetts"),
+    ("mich.", "michigan"), ("minn.", "minnesota"), ("miss.", "mississippi"), ("mo.", "missouri"),
+    ("mont.", "montana"), ("neb.", "nebraska"), ("nev.", "nevada"), ("okla.", "oklahoma"),
+    ("ore.", "oregon"), ("pa.", "pennsylvania"), ("tenn.", "tennessee"), ("tex.", "texas"),
+    ("va.", "virginia"), ("vt.", "vermont"), ("wash.", "washington"), ("wis.", "wisconsin"),
+    ("wyo.", "wyoming"), ("caro.", "carolina"), ("val.", "valley"),
+]
+
 _ALIASES = {
     "army west point": "army",
     "app state": "appalachian state",
@@ -145,6 +165,10 @@ def _fold(s) -> str:
     """
     s = unicodedata.normalize("NFKD", str(s or ""))
     s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    # state abbreviations BEFORE the punctuation strip below - the period is what makes them safe
+    for _ab, _full in _STATE_ABBR:
+        if _ab in s:
+            s = re.sub(r"(?<![a-z])" + re.escape(_ab), _full, s)
     s = s.replace("&", " and ")
     s = re.sub(r"\bst\.?\b", "state", s)          # Oregon St. -> Oregon State
     s = re.sub(r"[^a-z0-9() ]+", " ", s)
