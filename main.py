@@ -5015,15 +5015,21 @@ async def playbook_manifest(_u: dict = Depends(_require_player)):
     # out of BOTH lists here, and /playbook/doc/{id}/url refuses it as well —
     # so a doc id kept from before a restriction still can't be opened.
     fmap, mine = await _pb_visibility_for(_u)
+    # Per-FILE limits (Sep 24 2026) sit on top of the folder rule. Read for
+    # staff too, so a coach's tree can mark a limited file with a lock.
+    dmap = await _pb_doc_group_map(team_id)
     sections = r.json()
     if fmap is not None:
-        sections = [d for d in sections if _pb_folder_visible(d.get("folder_path"), fmap, mine)]
+        sections = [d for d in sections
+                    if _pb_folder_visible(d.get("folder_path"), fmap, mine)
+                    and _pb_doc_visible(d.get("id"), dmap, mine)]
         folders = [p for p in folders if _pb_folder_visible(p, fmap, mine)]
     # "v" = the doc's r2_key: replacing a PDF always writes a new key, so the
     # portal's offline cache uses it as a version stamp to spot stale copies.
     return {"sections": [{"id": d["id"], "folder": d.get("folder_path", ""),
                           "title": d.get("title", ""), "pages": d.get("pages"),
-                          "v": d.get("r2_key", "")}
+                          "v": d.get("r2_key", ""),
+                          "restricted": bool(dmap.get(str(d["id"])))}
                          for d in sections],
             "folders": folders,
             "team": {"name": (team or {}).get("name", "CAPP Binder"),
@@ -5054,6 +5060,10 @@ async def playbook_doc_url(doc_id: str, _u: dict = Depends(_require_player)):
     # wrong-team doc — never confirm that a doc they can't have exists.
     fmap, mine = await _pb_visibility_for(_u)
     if fmap is not None and not _pb_folder_visible(rows[0].get("folder_path"), fmap, mine):
+        raise HTTPException(status_code=404, detail="Not found.")
+    # The FILE-level limit, enforced here for the same reason as the folder one:
+    # a player who saw the file before it was limited still holds its id.
+    if fmap is not None and not _pb_doc_visible(doc_id, await _pb_doc_group_map(_u["team_id"]), mine):
         raise HTTPException(status_code=404, detail="Not found.")
     try:
         async with httpx.AsyncClient() as c:
@@ -6933,6 +6943,37 @@ def _pb_folder_visible(folder_path, fmap: dict, my_groups: set) -> bool:
     return True
 
 
+_PB_DOC_GROUPS = "playbook_doc_groups"
+
+
+async def _pb_doc_group_map(team_id: str) -> dict:
+    """{doc_id: {group_id, ...}} for one team — the FILE-level limit (Sep 24 2026,
+    Roger: the Nevada itinerary in the hotel binder, Travel Playmakers only).
+    Empty dict = no file is limited. Fails OPEN like the folder map, and for the
+    same reason: a bad read must not blank a team's playbook."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOC_GROUPS}",
+                            params={"select": "doc_id,group_id", "team_id": f"eq.{team_id}"},
+                            headers=_supa_headers_json())
+        if r.status_code != 200:
+            return {}
+        out: dict = {}
+        for row in r.json():
+            out.setdefault(str(row.get("doc_id")), set()).add(str(row.get("group_id")))
+        return out
+    except Exception:
+        return {}
+
+
+def _pb_doc_visible(doc_id, dmap: dict, my_groups: set) -> bool:
+    """A file with groups assigned is visible only to their members. A file with
+    none follows its folder (callers test the folder rule as well — a limited
+    file inside a folder the player cannot see stays hidden)."""
+    assigned = (dmap or {}).get(str(doc_id))
+    return (not assigned) or bool(assigned & (my_groups or set()))
+
+
 async def _pb_visibility_for(u: dict):
     """(folder-group map, this user's group ids) — or (None, None) for staff,
     which every caller reads as 'show everything'."""
@@ -7145,6 +7186,46 @@ async def coach_pb_folder_access_set(payload: dict = Body(...), _u: dict = Depen
             "restricted": bool(gids)}
 
 
+@app.get("/coach/playbook/doc-access")
+async def coach_pb_doc_access(_u: dict = Depends(_require_coach)):
+    """Every FILE that is currently limited, and to which groups. Files not
+    listed here follow their folder."""
+    dmap = await _pb_doc_group_map(_u["team_id"])
+    return {"access": [{"doc_id": d, "group_ids": sorted(g)} for d, g in sorted(dmap.items())]}
+
+
+@app.post("/coach/playbook/doc-access")
+async def coach_pb_doc_access_set(payload: dict = Body(...), _u: dict = Depends(_require_coach)):
+    """Set which groups can see ONE file (Roger, Sep 24 2026: the Nevada
+    itinerary, Travel Playmakers only). Same shape as folder-access: an EMPTY
+    group list clears the limit and the rows are deleted, not left empty. The
+    doc must be this team's (404 otherwise — never confirm another team's id),
+    and every group must be this team's."""
+    team_id = _u["team_id"]
+    doc_id = str(payload.get("doc_id") or "").strip()
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="Pick a file first.")
+    if not await _doc_in_team(doc_id, team_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    gids = [str(g) for g in (payload.get("group_ids") or []) if g]
+    for gid in gids:
+        if not await _pb_group_in_team(gid, team_id):
+            raise HTTPException(status_code=404, detail="Group not found.")
+    async with httpx.AsyncClient() as c:
+        d = await c.delete(f"{SUPABASE_URL}/rest/v1/{_PB_DOC_GROUPS}",
+                           params={"team_id": f"eq.{team_id}", "doc_id": f"eq.{doc_id}"},
+                           headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+        if d.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=d.text)
+        if gids:
+            ins = await c.post(f"{SUPABASE_URL}/rest/v1/{_PB_DOC_GROUPS}",
+                               json=[{"team_id": team_id, "doc_id": doc_id, "group_id": g} for g in gids],
+                               headers={**_supa_headers_json(), "Prefer": "return=minimal"})
+            if ins.status_code not in (200, 201, 204):
+                raise HTTPException(status_code=500, detail=ins.text)
+    return {"ok": True, "doc_id": doc_id, "group_ids": gids, "restricted": bool(gids)}
+
+
 @app.get("/coach/playbook/group-preview")
 async def coach_pb_group_preview(email: str = "", _u: dict = Depends(_require_coach)):
     """What ONE player would see. A coach restricting folders cannot otherwise
@@ -7160,7 +7241,7 @@ async def coach_pb_group_preview(email: str = "", _u: dict = Depends(_require_co
                                 "team_id": f"eq.{team_id}", "limit": "1"},
                         headers=_scoped_headers(team_id))
         d = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
-                        params={"select": "folder_path,title", "team_id": f"eq.{team_id}",
+                        params={"select": "id,folder_path,title", "team_id": f"eq.{team_id}",
                                 "order": "folder_path.asc,sort_order.asc,title.asc"},
                         headers=_scoped_headers(team_id))
         f = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_FOLDERS}",
@@ -7169,18 +7250,28 @@ async def coach_pb_group_preview(email: str = "", _u: dict = Depends(_require_co
     if u.status_code != 200 or not u.json():
         raise HTTPException(status_code=404, detail="That player isn't on this roster.")
     fmap = await _pb_folder_group_map(team_id)
+    dmap = await _pb_doc_group_map(team_id)
     mine = await _pb_user_group_ids(team_id, email)
     paths = {(row.get("folder_path") or "").strip() for row in (d.json() if d.status_code == 200 else [])}
     paths |= {(row.get("folder_path") or "").strip() for row in (f.json() if f.status_code == 200 else [])}
     visible, hidden = [], []
     for p in sorted(paths):
         (visible if _pb_folder_visible(p, fmap, mine) else hidden).append(p or "(top level)")
-    sections = [row for row in (d.json() if d.status_code == 200 else [])
-                if _pb_folder_visible(row.get("folder_path"), fmap, mine)]
+    all_docs = d.json() if d.status_code == 200 else []
+    sections = [row for row in all_docs
+                if _pb_folder_visible(row.get("folder_path"), fmap, mine)
+                and _pb_doc_visible(row.get("id"), dmap, mine)]
+    # Files hidden by their OWN limit (folder visible, file not) - named, so a
+    # coach can see that the itinerary is hidden from this player on purpose.
+    hidden_files = [((row.get("folder_path") or "") + "/" + (row.get("title") or "")).strip("/")
+                    for row in all_docs
+                    if _pb_folder_visible(row.get("folder_path"), fmap, mine)
+                    and not _pb_doc_visible(row.get("id"), dmap, mine)]
     return {"email": email, "groups": sorted(mine),
             "visible_folders": visible, "hidden_folders": hidden,
+            "hidden_files": hidden_files,
             "visible_sections": len(sections),
-            "total_sections": len(d.json() if d.status_code == 200 else [])}
+            "total_sections": len(all_docs)}
 
 
 
