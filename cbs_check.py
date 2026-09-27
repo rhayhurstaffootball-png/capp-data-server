@@ -95,6 +95,19 @@ def _is_timeout(e):
             or str(e.get("down", "")).strip().upper() == "OTO" or bool(_TIMEOUT.match(str(e.get("play_text") or ""))))
 
 
+# The rows that follow a touchdown and legitimately share its END clock: the try (EP / 2PT) and the kickoff.
+_AFTER_TD_DOWNS = ("EP", "2PT", "KO")
+_TD_TEXT = re.compile(r"\bTOUCHDOWN\b|\b\d+ Yd (pass|run|rush|return|reception|fumble|interception)\b", re.I)
+
+
+def _is_touchdown_row(e):
+    """A scoring play that put six on the board - the crew's line ("... TOUCHDOWN, clock 12:16") or ESPN's own
+    summary line ("Yamir Knight 28 Yd pass from Kevin Jennings"). Never a try, kick or stoppage row."""
+    if str(e.get("down", "")).strip().upper() in ("EP", "2PT", "FG", "FGB", "OTO", "P"):
+        return False
+    return bool(e.get("scoring_play")) or bool(_TD_TEXT.search(str(e.get("play_text") or "")))
+
+
 def _as_ncaa(it):
     """A CBS item in the shape ncaa_match scores against."""
     d = {"quarter": it.get("quarter"), "clock": it.get("clock"), "text": it.get("text", ""), "drive_text": "",
@@ -933,6 +946,40 @@ def verify_entries(entries, backup, home_name, away_name, clock_src=None, ncaa_p
                     summary["fixed"] += 1
                 s = it["clock_secs"]
         last_clock[q] = s
+
+    # A TOUCHDOWN THAT SHOWS NO ELAPSED TIME takes CBS's clock (Roger, Sep 27 2026 - SMU vs Missouri St Q4 12:16 and 5:34).
+    # The crew types a touchdown's snap and its end as the same second ("(12:16) ... TOUCHDOWN, clock 12:16"), or ESPN
+    # sends only the scoring-summary line with no snap at all ("Yamir Knight 28 Yd pass from ..."), so the touchdown
+    # row lands on the SAME clock as the try and kickoff after it - a play with zero elapsed time. The typed snap is
+    # normally final; this is the one shape where it cannot be right, so it counts as "messed up" under the Sep 14 order
+    # and CBS decides. Only the TOUCHDOWN row moves - the try / kickoff really do happen at the clock the play ended on.
+    # No CBS pair, CBS not earlier, or CBS's clock outside the rows either side -> nothing changes (never a guess).
+    # MEASURED on 249 games (scratchpad measure_td_end_clock.py): 114 of 1,389 TDs typed snap == end (8%), 446 summary
+    # lines with no snap (32%); where CBS had the game it put the snap earlier on 71 of 84 and 48 of 49, median 5-7 s.
+    for i, e in enumerate(work):
+        if not _is_touchdown_row(e):
+            continue
+        q = M._quarter(e.get("quarter"))
+        s = M.clock_secs(M.norm_clock(e.get("clock")))
+        if s is None or q > 4:
+            continue
+        nxt = next((x for x in work[i + 1:] if M._quarter(x.get("quarter")) == q
+                    and not M.is_admin_line(x.get("play_text", "")) and not _is_timeout(x)), None)
+        if nxt is None or str(nxt.get("down", "")).strip().upper() not in _AFTER_TD_DOWNS:
+            continue
+        if M.clock_secs(M.norm_clock(nxt.get("clock"))) != s:
+            continue
+        it = pair_by_row.get(id(e))
+        if it is None or it.get("clock_secs") is None or it["clock_secs"] <= s:
+            continue
+        if not _fits(work, i, it["clock_secs"]):
+            continue
+        change(i, "clock", "%d:%02d" % divmod(it["clock_secs"], 60), "CBS clock (touchdown showed no elapsed time)")
+        summary["clock_fixes"]["cbs_td_snap"] = summary["clock_fixes"].get("cbs_td_snap", 0) + 1
+        if e.get("ncaa_status") == "verified":
+            e["ncaa_status"] = "fixed"
+            summary["verified"] -= 1
+            summary["fixed"] += 1
 
     summary["duplicate_reasons"] = dict(reasons)
     summary["review_count"] = summary["fixed"] + summary["added"]
