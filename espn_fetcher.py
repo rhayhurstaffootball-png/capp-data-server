@@ -2065,6 +2065,115 @@ def _assign_cbs_drops(rows, drops):
     return out
 
 
+# ONE STOPPAGE, TWO ROWS (Roger, Sep 27 2026 - Nebraska at Michigan State Q3 7:20 and 6:01: "There were Extra ones
+# inserted"). The stats crew typed the same timeout twice under ONE ESPN sequence number, on the same clock, and the
+# coach saw two stoppage rows - at 6:01 one naming each team - where one timeout happened. MEASURED on 255 games
+# (Sep 12 + Sep 19): 49 such pairs; in the 34 with CBS counters, CBS charged two there 17 times (both teams at the end
+# of a half - real), one 10 times and none 7 times (a TV break typed twice). So a same-sequence, same-clock group of
+# timeout rows keeps as many rows as CBS charges there (never fewer than one) and the rest are superseded - the row
+# stays in `entries` for count-based clients, for_keyed_client withdraws it. Only once CBS has posted two plays past
+# the clock (a drop shows up two plays late - cbs_backup.TIMEOUT_HOLD); until then every row stands. Without CBS
+# counters only the same team named twice collapses to one row; two different teams cannot be told apart and stay.
+# Two timeouts on different clocks or sequence numbers are never touched - a real back-to-back pair keeps both rows.
+_DUP_TO_WINDOW_BEFORE = _CBS_TO_BEFORE     # a drop this far EARLIER on the clock than the rows still belongs to them
+_DUP_TO_WINDOW_AFTER = _CBS_TO_AFTER
+
+
+def _cbs_plays_past(cbs_doc, q, secs, need=2):
+    """Has CBS posted `need` plays after quarter q / clock secs? A counter drop is only visible once the following
+    plays show the lower number, so a live game's newest timeout looks uncharged for a couple of plays."""
+    n = 0
+    for it in (cbs_doc or {}).get("items") or []:
+        if it.get("kind") not in ("play", "kickoff", "extra_point", "two_point"):
+            continue
+        try:
+            iq = int(str(it.get("quarter")).strip())
+        except (TypeError, ValueError):
+            continue
+        if iq > q or (iq == q and it.get("clock_secs") is not None and it["clock_secs"] < secs):
+            n += 1
+            if n >= need:
+                return True
+    return False
+
+
+def _timeout_row_side(e, home_name, away_name):
+    """'home' / 'away' from the flags, else from the team the text names, else None."""
+    if str(e.get("home_time_out")) == "Yes":
+        return "home"
+    if str(e.get("away_time_out")) == "Yes":
+        return "away"
+    m = re.match(r"^\s*timeout\s+(.+?)\s*(,|$)", str(e.get("play_text", "")), re.I)
+    who = _fold_team(m.group(1)) if m else ""
+    h, a = _fold_team(home_name), _fold_team(away_name)
+    if who and (who == h or who in h or h in who) and not (who == a or who in a or a in who):
+        return "home"
+    if who and (who == a or who in a or a in who):
+        return "away"
+    return None
+
+
+def _dedupe_timeout_rows(entries, home_name, away_name, cbs_doc=None):
+    """Mark the extra rows of a same-sequence, same-clock timeout group "superseded". Returns (count, examples)."""
+    groups = {}
+    for i, e in enumerate(entries):
+        if e.get("ncaa_status") == "superseded" or e.get("espn_seq") is None or not e.get("espn_play_id"):
+            continue
+        if not (str(e.get("home_time_out")) == "Yes" or str(e.get("away_time_out")) == "Yes"
+                or str(e.get("down", "")).strip().upper() == "OTO"
+                or _TIMEOUT_TEXT.match(str(e.get("play_text") or ""))):
+            continue
+        m = re.search(r"clock\s+(\d{1,2}):(\d{2})", str(e.get("play_text", "")), re.I) \
+            or re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(e.get("clock", "")))
+        if not m:
+            continue
+        try:
+            q = int(str(e.get("quarter", "")).strip())
+        except (TypeError, ValueError):
+            continue
+        groups.setdefault((q, str(e.get("espn_seq")), int(m.group(1)) * 60 + int(m.group(2))), []).append(i)
+    drops = _cbs_timeout_drops(cbs_doc) if TIMEOUTS_FROM_CBS else None
+    count, examples = 0, []
+    for (q, _seq, secs), idxs in groups.items():
+        if len({str(entries[i].get("espn_play_id")) for i in idxs}) < 2:
+            continue
+        sides = [_timeout_row_side(entries[i], home_name, away_name) for i in idxs]
+        if drops is not None:
+            if not _cbs_plays_past(cbs_doc, q, secs):
+                continue                              # CBS has not settled here yet - every row stands for now
+            near = [d for d in drops if d["q"] == q and -_DUP_TO_WINDOW_AFTER <= d["secs"] - secs <= _DUP_TO_WINDOW_BEFORE]
+            keep_n = max(1, len(near))
+            if keep_n >= len(idxs):
+                continue
+            # keep the rows that name a charged side first (each drop claims one row), then the earliest typed
+            want = [d["side"] for d in near]
+            keep = []
+            for k, i in enumerate(idxs):
+                if sides[k] in want:
+                    want.remove(sides[k])
+                    keep.append(i)
+            for i in idxs:
+                if len(keep) >= keep_n:
+                    break
+                if i not in keep:
+                    keep.append(i)
+        else:
+            if len(set(sides)) != 1 or sides[0] is None:
+                continue                              # two teams named, nothing to tell them apart
+            keep = [idxs[0]]
+        for i in idxs:
+            if i in keep:
+                continue
+            e = entries[i]
+            e["ncaa_status"] = "superseded"
+            e["superseded_by"] = str(entries[keep[0]].get("espn_play_id"))
+            count += 1
+            if len(examples) < 5:
+                examples.append("Q%s %s duplicate timeout row removed: %s"
+                                % (e.get("quarter"), e.get("clock"), str(e.get("play_text"))[:40]))
+    return count, examples
+
+
 # Sep 19 2026 (Roger, Maryland vs Virginia Tech live): ESPN's crew typed 13 team timeouts in a half - three for
 # Virginia Tech in Q1 alone - while CBS's timeouts-remaining counters dropped exactly 3 times. "No one is going to
 # call a timeout before a kickoff after a scoring play." So when CBS has counters for the game they decide FIRST:
@@ -2092,7 +2201,8 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
                 or str(e.get("down", "")).strip().upper() == "OTO"
                 or bool(_TIMEOUT_TEXT.match(str(e.get("play_text") or ""))))
 
-    rows = [(i, e) for i, e in enumerate(entries) if _is_timeout(e)]
+    # a duplicate row _dedupe_timeout_rows superseded is off the coach's screen and must not take a counter drop
+    rows = [(i, e) for i, e in enumerate(entries) if _is_timeout(e) and e.get("ncaa_status") != "superseded"]
     if not rows:
         return 0, [], []
 
@@ -2214,7 +2324,7 @@ def _officials_already_at(entries, i):
     e = entries[i]
     q, c = str(e.get("quarter")), _norm_clock_str(e.get("clock"))
     for j, o in enumerate(entries):
-        if j != i and str(o.get("quarter")) == q \
+        if j != i and str(o.get("quarter")) == q and o.get("ncaa_status") != "superseded" \
                 and str(o.get("down", "")).strip().upper() == "OTO" \
                 and _norm_clock_str(o.get("clock")) == c:
             return True
@@ -2558,8 +2668,18 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     except Exception:
         game_date = ""
     try:
+        if league == "cfb":
+            _dup_n, _dup_examples = _dedupe_timeout_rows(entries, capp_home, capp_away, cbs_doc=_cbs_doc)
+            if _dup_n:
+                print(f"[timeouts] {game_id}: {_dup_n} duplicate timeout row(s) superseded", flush=True)
+                entry_fixes_extra = _dup_examples
+            else:
+                entry_fixes_extra = []
+        else:
+            entry_fixes_extra = []
         to_changed, to_examples, to_unresolved = _classify_timeouts(
             entries, capp_home, capp_away, league, game_date, cbs_doc=_cbs_doc)
+        to_examples = list(entry_fixes_extra) + list(to_examples)
     except Exception as e:
         print(f"WARNING: timeout classify failed for {game_id}: {e}", flush=True)
 
