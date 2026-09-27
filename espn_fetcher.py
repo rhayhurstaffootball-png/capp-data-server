@@ -475,6 +475,15 @@ _TEXT_END_RE = re.compile(r"\bclock\s+(\d{1,2}):(\d{2})", re.I)
 # J.Wright rush attempt failed" / "#3 L.Brooks pass attempt Successful" / "(Gio Lopez Run for Two-Point Conversion)".
 # A kick try never reads "rush/pass attempt" (Sep 14 2026, 125 games checked).
 _TWO_POINT_TRY_TEXT = re.compile(r"\b(?:rush|pass|run)\s+attempt\s+(?:failed|successful)\b|\btwo[- ]point\b", re.I)
+# One typed try attempt inside a touchdown's text, up to the next attempt phrase: "#9 S.Locklear pass attempt failed
+# PENALTY SMU Pass Interference (#11 J.Milliner-Jones) 1 yard from SMU03 to SMU02. NO PLAY". The player prefix is
+# optional (crews sometimes type just "pass attempt failed").
+_WIPED_TRY_SEGMENT = re.compile(
+    r"(?:#\d+\s+)?(?:[A-Za-z.'\-]+\s+)?(?:rush|pass|run)\s+attempt\s+(?:failed|successful)\b"
+    r"(?:(?!(?:#\d+\s+)?(?:[A-Za-z.'\-]+\s+)?(?:rush|pass|run)\s+attempt\s+(?:failed|successful)\b).)*",
+    re.I | re.S)
+# ...and it only counts as WIPED when its own tail carries the penalty and the no-play call.
+_WIPED_TRY_TAIL = re.compile(r"\bPENALTY\b.*\bNO PLAY\b", re.I | re.S)
 
 
 def _typed_secs(play):
@@ -1819,6 +1828,38 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         # (apply_text_snap_clocks), which would put the PAT 5 seconds early (SMU Q2 replay, Sep 13 2026).
         _end = re.search(r"clock\s+(\d{1,2}):(\d{2})", str(description or ""), re.I)
         pat_clock = f"{int(_end.group(1))}:{_end.group(2)}" if _end else clock
+        # A TRY WIPED OUT BY A PENALTY IS ITS OWN ROW (Roger, Sep 26 2026 - SMU vs Missouri State Q4 12:16). ESPN
+        # publishes ONE try per touchdown; a try that a penalty cancelled is only appended to the TD's text ("#9
+        # S.Locklear pass attempt failed PENALTY SMU Pass Interference ... NO PLAY") and the re-try that counted is the
+        # pointAfterAttempt. The film has a clip for the wiped try, so the coach needs a board for it: one row per
+        # wiped attempt, in the order typed, BEFORE the try that counted - same row as the try, the score the TD left
+        # (nothing was scored on it), and the attempt's own text. Measured on 249 saved games: 3 TDs carry one (Sep 12
+        # VT @ MD x2, Sep 19 LT @ LSU, Sep 19 FIU @ MSU) plus SMU live. Crews type fragments twice, so an exact repeat
+        # of a wiped attempt is skipped. A segment that ends with no penalty is the try that counted, not a wiped one.
+        _wiped_seen = set()
+        for _m in _WIPED_TRY_SEGMENT.finditer(str(description or "")):
+            _seg = " ".join(_m.group(0).split())
+            if not _WIPED_TRY_TAIL.search(_seg) or _seg in _wiped_seen:
+                continue
+            _wiped_seen.add(_seg)
+            results.append({
+                "home_score": td_home_score,
+                "away_score": td_away_score,
+                "clock": pat_clock,
+                "quarter": quarter,
+                "down": "2PT",
+                "distance": 3,
+                "gain": 0,
+                "field_position": 3,
+                "possession": possession,
+                "run_clock": "No",
+                "home_time_out": "No",
+                "away_time_out": "No",
+                "play_text": _seg,
+                "wallclock": play.get("wallclock", ""),
+                "espn_play_id": play.get("espn_play_id", ""),
+                "espn_seq": play.get("sequence_number"),
+            })
         pat_entry = {
             "home_score": home_score,
             "away_score": away_score,
