@@ -2206,6 +2206,9 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
     if not rows:
         return 0, [], []
 
+    # NCAA's labels, a LIST per quarter+clock. Both teams call one on the same second at the end of a half (Alabama at
+    # Kentucky Q2 0:34, Sep 12 2026) and a dict kept only the last label, so both rows were charged to one team - 5 of
+    # the 7 halves where the old order charged a team four timeouts (measure_timeout_sources.py, Sep 27 2026).
     labels = {}
     try:
         import ncaa_live
@@ -2214,64 +2217,91 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
             date=_ncaa_date(game_date) or None)
         if found.get("available"):
             for t in ncaa_live.timeouts(found["ncaa_game_id"]).get("timeouts", []):
-                labels[(str(t.get("quarter")), ncaa_live._norm_clock(t.get("clock")))] = t
+                labels.setdefault((str(t.get("quarter")), ncaa_live._norm_clock(t.get("clock"))), []).append(t)
     except Exception as e:
         print(f"WARNING: timeout classify: backup lookup failed "
               f"({home_name} v {away_name}): {e}", flush=True)
 
+    def _take_label(e, side):
+        """The NCAA label for this row, claimed so a second row on the same tick gets the other one. A label naming
+        the row's own team is taken first; otherwise the first one left."""
+        keys = [(str(e.get("quarter")), _norm_clock_str(e.get("clock")))]
+        m = re.search(r"clock\s+(\d{1,2}:\d{2})", str(e.get("play_text", "")), re.I)
+        if m:                                     # the clock in the text beats the clock field (often the play before)
+            keys.append((str(e.get("quarter")), _norm_clock_str(m.group(1))))
+        for k in keys:
+            cands = labels.get(k) or []
+            if not cands:
+                continue
+            pick = next((t for t in cands if side and t.get("charged") == side), cands[0])
+            cands.remove(pick)
+            return pick
+        return None
+
     changed, examples, unresolved = 0, [], []
     drops = _cbs_timeout_drops(cbs_doc) if TIMEOUTS_FROM_CBS else None
-    assigned = {}
+    assigned, _rq = {}, []
+    for _i, _e in rows:
+        try:
+            _q = int(str(_e.get('quarter', '')).strip() or 0)
+        except (TypeError, ValueError):
+            _q = None
+        # the clock in the row's own text beats the clock field (the field is often the previous play's)
+        _m = re.search(r'clock\s+(\d{1,2}):(\d{2})', str(_e.get('play_text', '')), re.I)
+        if not _m:
+            _m = re.match(r'^\s*(\d{1,2}):(\d{2})\s*$', str(_e.get('clock', '')))
+        _rq.append((_i, _q, int(_m.group(1)) * 60 + int(_m.group(2)) if _m else None,
+                    _timeout_row_side(_e, home_name, away_name)))
     if drops is not None:
-        _rq = []
-        for _i, _e in rows:
-            try:
-                _q = int(str(_e.get('quarter', '')).strip() or 0)
-            except (TypeError, ValueError):
-                _q = None
-            # the clock in the row's own text beats the clock field (the field is often the previous play's)
-            _m = re.search(r'clock\s+(\d{1,2}):(\d{2})', str(_e.get('play_text', '')), re.I)
-            if not _m:
-                _m = re.match(r'^\s*(\d{1,2}):(\d{2})\s*$', str(_e.get('clock', '')))
-            _side = 'home' if str(_e.get('home_time_out')) == 'Yes' else ('away' if str(_e.get('away_time_out')) == 'Yes' else None)
-            if _side is None:                     # no flag: the team the text names (loose: 'Arkansas' ~ 'Arkansas Razorbacks')
-                _tm = re.match(r'^\s*timeout\s+(.+?)\s*(,|$)', str(_e.get('play_text', '')), re.I)
-                _who = _fold_team(_tm.group(1)) if _tm else ''
-                _h, _a = _fold_team(home_name), _fold_team(away_name)
-                if _who and (_who == _h or _who in _h or _h in _who) and not (_who == _a or _who in _a or _a in _who):
-                    _side = 'home'
-                elif _who and (_who == _a or _who in _a or _a in _who):
-                    _side = 'away'
-            _rq.append((_i, _q, int(_m.group(1)) * 60 + int(_m.group(2)) if _m else None, _side))
         assigned = _assign_cbs_drops(_rq, drops)
-        named = {_i for _i, _q, _s, _side in _rq if _side in ('home', 'away')}
+    crew_of = {_i: _side for _i, _q, _s, _side in _rq}
+    at_of = {_i: (_q, _s) for _i, _q, _s, _side in _rq}
+    # THREE OBSERVERS VOTE (Roger, Sep 20 2026: "vote by observer"; built Sep 27 after Nebraska at Michigan State Q3
+    # 7:20, where the crew and CBS's counters both said Nebraska and NCAA's label alone said officials - and NCAA
+    # won). The crew's row names a team or nothing; CBS's counters confirm the named team (a drop lines up), say
+    # "no timeout charged" (none does, once CBS has posted two plays past the clock), or abstain (row names nobody,
+    # or CBS not settled yet); NCAA's label names a team, says officials, or abstains (no label). Majority wins. A
+    # tie between the crew and one backup goes to the backup - what the old order already did for a game with only
+    # one backup. A three-way split goes to CBS's counters. No backup vote at all -> the measured fallback rules.
+    # MEASURED (measure_timeout_sources.py, 137 games / 1,433 rows): halves where a rule charges one team FOUR or
+    # more - crew as typed 147, NCAA-label-first (old) 7, this vote 4; the 25 rows where two observers named the
+    # same team and NCAA's label alone overrode them now go to that team.
     for i, e in rows:
-        key = (str(e.get("quarter")), _norm_clock_str(e.get("clock")))
-        lab = labels.get(key)
-        if lab is None:
-            # the clock written into the play text beats the clock FIELD when
-            # they disagree - measured on real rows where ESPN's field was wrong
-            m = re.search(r"clock\s+(\d{1,2}:\d{2})", str(e.get("play_text", "")), re.I)
-            if m:
-                lab = labels.get((str(e.get("quarter")), _norm_clock_str(m.group(1))))
-
-        verdict = why = None
-        if lab is not None:
-            ch = lab.get("charged")
-            if ch in ("home", "away"):
-                verdict, why = ch, "backup source"
-            elif ch is None:
-                verdict, why = "officials", "backup source"
-        # MEASURED Sep 19 2026 (Sep 12 corpus, 69 CBS games, 682 timeout rows, 598 with an NCAA label): CBS's counters
-        # AHEAD of NCAA's label fell from 98.2% to 95.7% agreement with those labels (the two-minute TV break on the
-        # same second as a real drop, a duplicate typed row). So: NCAA's label first, CBS's counters where NCAA is
-        # silent (all 13 of Maryland's rows on Sep 19 - NCAA had no labels live), the fallback rules last.
-        if verdict is None and drops is not None and i in named:
+        crew = crew_of.get(i)
+        lab = _take_label(e, crew)
+        votes = {}
+        if crew in ("home", "away"):
+            votes["crew"] = crew
+        if drops is not None and crew in ("home", "away"):
             _hit = assigned.get(i)
             if _hit is not None:
-                verdict, why = _hit['side'], 'backup counters'
+                votes["counters"] = _hit["side"]
             else:
-                verdict, why = 'officials', 'backup counters (no timeout charged)'
+                _q, _s = at_of[i]
+                if _q is not None and _s is not None and _cbs_plays_past(cbs_doc, _q, _s):
+                    votes["counters"] = "officials"
+                # else: CBS has not posted two plays past this timeout yet - it abstains for now
+        if lab is not None:
+            ch = lab.get("charged")
+            votes["source"] = ch if ch in ("home", "away") else "officials"
+
+        verdict = why = None
+        backups = [k for k in ("counters", "source") if k in votes]
+        if backups:
+            tally = {}
+            for k, v in votes.items():
+                tally.setdefault(v, []).append(k)
+            top = sorted(tally.items(), key=lambda kv: -len(kv[1]))
+            if len(top) == 1 or len(top[0][1]) > len(top[1][1]):
+                verdict, voters = top[0]
+            elif "counters" in votes:                   # a tie: the counters, then the label
+                verdict, voters = votes["counters"], tally[votes["counters"]]
+            else:
+                verdict, voters = votes["source"], tally[votes["source"]]
+            names = {"crew": "the feed", "counters": "backup counters", "source": "backup source"}
+            why = " + ".join(names[k] for k in ("crew", "counters", "source") if k in voters)
+            if verdict == "officials" and voters == ["counters"] and len(votes) == 1:
+                why = "backup counters (no timeout charged)"
         if verdict is None:
             ok, reason = _assume_officials(entries, i)
             if ok:
