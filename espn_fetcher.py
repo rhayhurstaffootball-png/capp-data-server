@@ -2131,10 +2131,34 @@ def _dedupe_timeout_rows(entries, home_name, away_name, cbs_doc=None):
             q = int(str(e.get("quarter", "")).strip())
         except (TypeError, ValueError):
             continue
-        groups.setdefault((q, str(e.get("espn_seq")), int(m.group(1)) * 60 + int(m.group(2))), []).append(i)
+        groups.setdefault((q, int(m.group(1)) * 60 + int(m.group(2))), []).append(i)
+    # Within one tick, rows that share a sequence number OR name the same team are one group (Sep 27 2026, second
+    # pass - Air Force Q4 10:59 and Maryland Q4 12:36: the same team typed twice on one clock under two sequence
+    # numbers. MEASURED: 13 such pairs on 255 games, 10 in CBS games, and CBS's counters charged nobody at all 10).
+    # Two different teams under two sequence numbers stay apart - that is the real end-of-half pair.
     drops = _cbs_timeout_drops(cbs_doc) if TIMEOUTS_FROM_CBS else None
     count, examples = 0, []
-    for (q, _seq, secs), idxs in groups.items():
+    split = {}
+    for (q, secs), idxs in groups.items():
+        parent = {i: i for i in idxs}
+
+        def _root(x):
+            while parent[x] != x:
+                x = parent[x]
+            return x
+        by_seq, by_side = {}, {}
+        for i in idxs:
+            for table, key in ((by_seq, str(entries[i].get("espn_seq"))),
+                               (by_side, _timeout_row_side(entries[i], home_name, away_name))):
+                if key is None:
+                    continue
+                if key in table:
+                    parent[_root(i)] = _root(table[key])
+                else:
+                    table[key] = i
+        for i in idxs:
+            split.setdefault((q, _root(i), secs), []).append(i)
+    for (q, _seq, secs), idxs in split.items():
         if len({str(entries[i].get("espn_play_id")) for i in idxs}) < 2:
             continue
         sides = [_timeout_row_side(entries[i], home_name, away_name) for i in idxs]
