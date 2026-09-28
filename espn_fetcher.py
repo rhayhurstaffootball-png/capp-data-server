@@ -3385,8 +3385,20 @@ def get_replay_step(game_id, step, league="cfb"):
     trimmed["drives"] = {"previous": [dict(d, plays=[p for p in (d.get("plays") or []) if str(p.get("id")) in keep])
                                       for d in all_drives]}
     hdr = _copy.deepcopy(summ["header"])
+    by_id = {str(p["id"]): p for p in plays}
     if step < total:
         hdr["competitions"][0]["status"]["type"]["state"] = "in"
+        # THE STATUS LINE AS A LIVE GAME WOULD HAVE HAD IT (Roger, Sep 28 2026: "Is there anyway we can simulate
+        # this?"). A finished game's header says "Final" at every step, so the quarters boundary that reads the
+        # feed's status (espn_poller._status_boundary: "Halftime", "End of 1st") never fired in Simulate. At the
+        # step holding the last typed play of a quarter the line reads as the end of that quarter; in between it
+        # reads "MM:SS - 1st" like the live feed. A quarter is "over" only once no later typed play belongs to it,
+        # so a play the crew typed late keeps the quarter open exactly as it did live.
+        try:
+            hdr["competitions"][0]["status"]["type"]["shortDetail"] = replay_status_detail(by_id, typed, step)
+            hdr["competitions"][0]["status"]["type"]["detail"] = hdr["competitions"][0]["status"]["type"]["shortDetail"]
+        except Exception:
+            pass
     trimmed["header"] = hdr
     out = _fetch_game_plays_mapped(game_id, league, summary=trimmed)
     gap = 0.0
@@ -3398,8 +3410,48 @@ def get_replay_step(game_id, step, league="cfb"):
             gap = max(0.0, (b - a).total_seconds())
         except Exception:
             gap = 0.0
-    out["replay"] = {"step": step, "total": total, "next_gap_s": gap}
+    out["replay"] = {"step": step, "total": total, "next_gap_s": gap,
+                     "cut": str(by_id.get(typed[step - 1], {}).get("wallclock") or "")}
     return out
+
+
+_ORD = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}
+
+
+def replay_status_detail(by_id, typed, step):
+    """The feed's status line after `step` typed plays: "Halftime" / "End of 1st" when no later typed play belongs to
+    the last play's quarter, else "MM:SS - 1st". by_id: ESPN play id -> play; typed: play ids in typed order."""
+    last = by_id.get(typed[step - 1]) or {}
+    try:
+        q = int((last.get("period") or {}).get("number") or 0)
+    except (TypeError, ValueError):
+        q = 0
+    remaining = set()
+    for pid in typed[step:]:
+        try:
+            remaining.add(int(((by_id.get(pid) or {}).get("period") or {}).get("number") or 0))
+        except (TypeError, ValueError):
+            pass
+    if q and q not in remaining:
+        if q == 2:
+            return "Halftime"
+        return f"End of {_ORD.get(q, 'OT')}" if q <= 4 else "End of OT"
+    clock = str((last.get("clock") or {}).get("displayValue") or "0:00")
+    return f"{clock} - {_ORD.get(q, 'OT')}"
+
+
+def replay_cut_wallclock(game_id, step, league="cfb"):
+    """The wall clock of the step-th typed play: what the backup source had by then (cbs_backup.for_game cut=)."""
+    summ = _replay_summary(game_id, league)
+    drives = summ.get("drives", {}) or {}
+    all_drives = list(drives.get("previous", []) or []) + ([drives["current"]] if drives.get("current") else [])
+    plays = [p for d in all_drives for p in (d.get("plays") or []) if p.get("id")]
+    typed = sorted({str(p["id"]) for p in plays}, key=int)
+    if not typed:
+        return ""
+    step = max(1, min(int(step), len(typed)))
+    wall = {str(p["id"]): p.get("wallclock") for p in plays}
+    return str(wall.get(typed[step - 1]) or "")
 
 
 def get_game_plays(game_id, league="cfb", force_refresh=False):

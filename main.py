@@ -2342,17 +2342,28 @@ async def primary_backup_get(espn_game_id: str, league: str = Query("cfb", descr
 # primary backup is CBS"; NCAA's kept copy (/primary-backup) when CBS has no play-by-play for the game. Same item format
 # as Resolve (capp-backup-data); ready.through = the quarters the backup has finished.
 
-async def _backup_source_doc(gid: str, league: str) -> dict:
-    from espn_fetcher import get_game_plays
+async def _backup_source_doc(gid: str, league: str, replay_step: int = 0) -> dict:
+    from espn_fetcher import get_game_plays, replay_cut_wallclock
     import cbs_backup
     try:
         feed = await asyncio.to_thread(get_game_plays, gid, league)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not load the game's plays: {type(e).__name__}: {e}")
+    # Simulate (Sep 28 2026): a replay asks for the backup AS IT STOOD after `replay_step` typed plays, so the
+    # end-of-quarter check waits and shows progress in a simulation the way it does live.
+    cut = ""
+    if replay_step:
+        try:
+            cut = await asyncio.to_thread(replay_cut_wallclock, gid, int(replay_step), league)
+        except Exception as e:
+            print(f"WARNING: replay cut for {gid} step {replay_step} failed: {type(e).__name__}: {e}", flush=True)
     doc = await asyncio.to_thread(cbs_backup.for_game, feed.get("game_date", ""), feed.get("home_team_id", ""),
-                                  feed.get("away_team_id", ""), gid, league)
+                                  feed.get("away_team_id", ""), gid, league, cut)
     if doc.get("available"):
         return doc
+    if replay_step:
+        # the kept secondary copy is the FINISHED game - never hand that to a replay step
+        return {"available": False, "note": "No backup source for this replay step.", "espn_game_id": gid}
     try:
         ncaa = await primary_backup_get(gid, league)
     except HTTPException as e:
@@ -2363,10 +2374,11 @@ async def _backup_source_doc(gid: str, league: str) -> dict:
 
 
 @app.get("/backup-source/{espn_game_id}/status", dependencies=[Depends(verify_api_key)])
-async def backup_source_status(espn_game_id: str, league: str = Query("cfb", description="cfb or nfl")):
+async def backup_source_status(espn_game_id: str, league: str = Query("cfb", description="cfb or nfl"),
+                               replay_step: int = Query(0, ge=0, description="Simulate: the backup as of this typed play")):
     """Small answer for SBENTRY's end-of-quarter prompt: is there a backup, and through which quarter."""
     gid = _backup_game_id(espn_game_id)
-    doc = await _backup_source_doc(gid, league)
+    doc = await _backup_source_doc(gid, league, replay_step)
     ready = doc.get("ready") or {}
     return {"available": bool(doc.get("available")) and int(ready.get("through") or 0) >= 1, "espn_game_id": gid,
             "ready_through": int(ready.get("through") or 0), "label": ready.get("label", ""),
@@ -2374,10 +2386,11 @@ async def backup_source_status(espn_game_id: str, league: str = Query("cfb", des
 
 
 @app.get("/backup-source/{espn_game_id}", dependencies=[Depends(verify_api_key)])
-async def backup_source_get(espn_game_id: str, league: str = Query("cfb", description="cfb or nfl")):
+async def backup_source_get(espn_game_id: str, league: str = Query("cfb", description="cfb or nfl"),
+                            replay_step: int = Query(0, ge=0, description="Simulate: the backup as of this typed play")):
     """The backup source's items for a quarter swap (finished quarters are in ready.through)."""
     gid = _backup_game_id(espn_game_id)
-    doc = await _backup_source_doc(gid, league)
+    doc = await _backup_source_doc(gid, league, replay_step)
     if not doc.get("available"):
         raise HTTPException(status_code=404, detail=doc.get("note") or "There is no backup source for this game yet.")
     return doc

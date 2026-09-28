@@ -196,9 +196,11 @@ def _mmss(clock):
     return "%02d:%02d" % divmod(s, 60) if s is not None else ""
 
 
-def for_game(game_date, home_team_id, away_team_id, espn_game_id="", league="cfb"):
+def for_game(game_date, home_team_id, away_team_id, espn_game_id="", league="cfb", cut=""):
     """Find the CBS game for an ESPN game and build its backup items. Never raises.
-    league picks CBS's per-league table (see cbs_live.find_game) - an ESPN team id alone does not say which sport."""
+    league picks CBS's per-league table (see cbs_live.find_game) - an ESPN team id alone does not say which sport.
+    cut (Simulate, Sep 28 2026): an ISO wall clock - only plays CBS had posted by then, and the board is "in
+    progress", so a replay sees the backup as it stood at that step, never the finished game."""
     try:
         cg = cbs_live.find_game(game_date, home_team_id, away_team_id, league)
         if not cg.get("available"):
@@ -206,7 +208,12 @@ def for_game(game_date, home_team_id, away_team_id, espn_game_id="", league="cfb
         pbp = cbs_live.play_by_play(cg["cbs_game_id"])
         if not pbp.get("available"):
             return {"available": False, "note": pbp.get("note") or "The backup source has no play-by-play for this game."}
-        out = build(pbp["plays"], cbs_live.scoreboard(cg["cbs_game_id"]), cg["home_code"], cg["away_code"],
+        plays = pbp["plays"]
+        board = cbs_live.scoreboard(cg["cbs_game_id"])
+        if cut:
+            plays = [p for p in plays if str(p.get("real_clock") or "") <= str(cut)]
+            board = dict(board, status="")
+        out = build(plays, board, cg["home_code"], cg["away_code"],
                     cg.get("swapped", False), espn_game_id)
         out["available"] = True
         out["cbs_game_id"] = cg["cbs_game_id"]
