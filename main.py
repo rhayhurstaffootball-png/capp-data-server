@@ -3553,11 +3553,38 @@ async def admin_reset_single_seat(username: str, seat: int = Body(..., embed=Tru
 
 BROADCAST_AUDIENCES = ("licensed", "licensed_trial", "all")
 
+_BC_EMAIL_RE = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+$")
 
-async def _broadcast_recipients(audience: str) -> list:
+
+def _parse_extra_emails(raw) -> tuple:
+    """
+    Addresses typed into the panel's "Also send to" box, on top of the
+    accounts the audience picks. Separated by commas, semicolons, spaces or
+    new lines. Returns (valid, invalid), each de-duplicated, order kept.
+    """
+    text = raw if isinstance(raw, str) else " ".join(str(x) for x in (raw or []))
+    valid, invalid, seen = [], [], set()
+    for tok in re.split(r"[\s,;]+", text or ""):
+        tok = tok.strip().strip("<>").strip()
+        if not tok:
+            continue
+        key = tok.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        (valid if _BC_EMAIL_RE.match(tok) else invalid).append(tok)
+    return valid, invalid
+
+
+async def _broadcast_recipients(audience: str, extra_emails=None) -> list:
     """
     Who a blast would go to. Also used by /preview, so what you review is
     produced by the same code that does the sending - never a separate guess.
+
+    `extra_emails` (Roger, Sep 30 2026): addresses added by hand in the panel.
+    They go on the end of the list, marked `added`; an address the audience
+    already includes is not added twice. An invalid one refuses the whole call
+    - a typo must be seen, not silently dropped.
     """
     if audience not in BROADCAST_AUDIENCES:
         raise HTTPException(status_code=400, detail=f"Unknown audience '{audience}'.")
@@ -3590,6 +3617,18 @@ async def _broadcast_recipients(audience: str) -> list:
             "school": u.get("username"),
             "licensed": bool(u.get("licensed")),
         })
+
+    valid, invalid = _parse_extra_emails(extra_emails)
+    if invalid:
+        raise HTTPException(status_code=400,
+                            detail="Not a valid email address: " + ", ".join(invalid))
+    have = {p["email"].lower() for p in out}
+    for e in valid:
+        if e.lower() in have:
+            continue
+        have.add(e.lower())
+        out.append({"username": e, "email": e, "school": e,
+                    "licensed": True, "added": True})
     return out
 
 
@@ -3727,9 +3766,10 @@ def _send_broadcast_email(to_email: str, school: str, subject: str, body: str,
 
 
 @app.get("/admin/api/broadcast/preview", dependencies=[Depends(_require_admin)])
-async def broadcast_preview(audience: str = Query("licensed_trial")):
+async def broadcast_preview(audience: str = Query("licensed_trial"),
+                            extra: str = Query("")):
     """Exactly who would receive this. Always look before sending."""
-    people = await _broadcast_recipients(audience)
+    people = await _broadcast_recipients(audience, extra)
     return {"audience": audience, "count": len(people), "recipients": people}
 
 
@@ -3796,7 +3836,7 @@ async def broadcast_send(payload: dict = Body(...)):
     # before a single message goes out.
     attachments = _decode_attachments(payload.get("attachments"))
 
-    people = await _broadcast_recipients(audience)
+    people = await _broadcast_recipients(audience, payload.get("extra_emails"))
     if confirm_count is not None and int(confirm_count) != len(people):
         raise HTTPException(
             status_code=409,
@@ -7888,6 +7928,15 @@ _ADMIN_HTML = """<!DOCTYPE html>
             <button class="btn" onclick="testBlast()">Send test to me</button>
             <button class="btn btn-warning" onclick="sendBlast()">Send email now</button>
           </div>
+          <div style="margin-top:12px;">
+            <label for="bc-extra" class="small" style="display:block;margin-bottom:4px;">
+              Also send to (optional) - extra email addresses, separated by commas or new lines.
+              They get the same email on top of the audience above.
+            </label>
+            <textarea id="bc-extra" rows="2" oninput="bcExtraChanged()"
+                      placeholder="coach@school.edu, ad@school.edu"
+                      style="width:100%;"></textarea>
+          </div>
           <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
             <input type="file" id="bc-files" multiple onchange="bcFilesPicked()"
                    style="max-width:420px;"/>
@@ -8363,17 +8412,36 @@ function escN(s) { return String(s == null ? "" : s).replace(/</g, "&lt;"); }
 // send should never be the first time the message has been looked at.
 let _bcPreviewCount = null;
 
+// Raw text of the "Also send to" box. The server splits and checks it, so the
+// preview and the send read it the same way.
+function bcExtraText() {
+  const el = document.getElementById("bc-extra");
+  return el ? el.value.trim() : "";
+}
+
+// Changing the extra addresses changes who gets the email, so the reviewed
+// list no longer applies - make them press "Who gets this?" again.
+function bcExtraChanged() {
+  if (_bcPreviewCount !== null) {
+    _bcPreviewCount = null;
+    document.getElementById("bc-preview").innerHTML =
+      '<i>Addresses changed - press "Who gets this?" to see the updated list.</i>';
+  }
+}
+
 function previewBlast() {
   const aud = document.getElementById("bc-audience").value;
   const box = document.getElementById("bc-preview");
   _bcPreviewCount = null;
   box.innerHTML = "Checking...";
-  api("GET", "/broadcast/preview?audience=" + encodeURIComponent(aud))
+  api("GET", "/broadcast/preview?audience=" + encodeURIComponent(aud) +
+             "&extra=" + encodeURIComponent(bcExtraText()))
     .then(d => {
       _bcPreviewCount = d.count;
       if (!d.count) { box.innerHTML = '<b>No one matches that audience.</b>'; return; }
       const names = d.recipients.map(r =>
-        pbEsc(r.school) + ' &lt;' + pbEsc(r.email) + '&gt;' + (r.licensed ? '' : ' <i>(trial)</i>')
+        (r.added ? pbEsc(r.email) + ' <i>(added)</i>'
+                 : pbEsc(r.school) + ' &lt;' + pbEsc(r.email) + '&gt;' + (r.licensed ? '' : ' <i>(trial)</i>'))
       ).join("<br/>");
       box.innerHTML = '<b>' + d.count + ' recipient' + (d.count === 1 ? '' : 's') +
                       ':</b><br/>' + names;
@@ -8484,6 +8552,7 @@ function sendBlast() {
   // the preview - so what goes out is always what was reviewed.
   api("POST", "/broadcast/send", {
       subject: title, body: body, audience: aud,
+      extra_emails: bcExtraText(),
       send_email: true, show_in_app: false,
       attachments: bcAttachPayload(),
       confirm_count: _bcPreviewCount })
