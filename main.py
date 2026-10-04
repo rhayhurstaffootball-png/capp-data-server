@@ -3278,8 +3278,13 @@ async def admin_gameday_board(date: str = Query("", description="YYYYMMDD; defau
 
 @app.get("/admin/api/gameday/plays/{game_id}", dependencies=[Depends(_require_admin)])
 def admin_gameday_plays(game_id: str, league: str = Query("cfb")):
-    """The rows a keyed client receives for the game, trimmed for the board's expanded view."""
+    """The rows a keyed client receives for the game, trimmed for the board's expanded view.
+
+    Asking for a game's plays here counts as having it open (Roger, Sep 26 2026: "I thought the Wall would
+    open it"): the same heartbeat a coach's app sends, so the poller keeps the game fresh while the wall
+    shows it, and it ages out ACTIVE_GAME_TTL after the wall stops asking."""
     import gameday_board
+    mark_game_active(game_id, league)
     return gameday_board.plays(game_id, league)
 
 
