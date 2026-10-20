@@ -397,6 +397,26 @@ def _cache_inventory(sizes: bool) -> dict:
     return out
 
 
+def _malloc_trim_job():
+    """Hand glibc's freed-but-kept memory back to the OS (Oct 20 2026).
+    MEASURED on the live box 56 min after the Oct 20 deploy: VmRSS 264 MB with only 6 MB traced by Python;
+    malloc_trim(0) took it to 138 MB. The step climbs Render OOM-killed us for (Oct 7, Oct 18) are mostly this -
+    glibc keeps freed blocks in per-thread arenas and never returns them on its own. Runs every 30 min; a one-line
+    print only when it recovered something worth seeing. MALLOC_ARENA_MAX=2 in the Render environment is the other
+    half (fewer arenas to fragment); that has to be set before the process starts, so it lives in the dashboard."""
+    try:
+        import ctypes
+        import gc
+        before = _proc_status().get("VmRSS") or 0
+        gc.collect()
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        after = _proc_status().get("VmRSS") or 0
+        if before - after > 50_000_000:
+            print(f"malloc_trim: RSS {before // 1_000_000} -> {after // 1_000_000} MB", flush=True)
+    except Exception as e:
+        print(f"WARNING: malloc_trim failed: {type(e).__name__}: {e}", flush=True)
+
+
 def _memory_diag(deep: bool = False, trim: bool = False) -> dict:
     import gc
     import threading
@@ -429,8 +449,8 @@ def _memory_diag(deep: bool = False, trim: bool = False) -> dict:
         before = _proc_status().get("VmRSS")
         try:
             import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
             gc.collect()
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
             out["trim"] = {"rss_before": before, "rss_after": _proc_status().get("VmRSS")}
         except Exception as e:
             out["trim"] = {"error": f"{type(e).__name__}: {e}"}
@@ -459,6 +479,7 @@ def _build_health_payload() -> dict:
             "rss_bytes": _process_memory_bytes(),       # PEAK (ru_maxrss) - kept for the admin panel + nodes
             "proc": _proc_status(),                      # current RSS / peak / threads (Linux)
             "caches": _cache_inventory(sizes=False),
+            "malloc_arena_max": os.environ.get("MALLOC_ARENA_MAX", ""),   # "" = glibc default (8 x cores) - see _malloc_trim_job
         },
         # Empty list == Supabase wired up correctly. Non-empty means the storage
         # routes are down and WHY — check this first when nodes/downloads fail.
@@ -562,6 +583,8 @@ async def lifespan(app: FastAPI):
                       id="evict_game_stats", replace_existing=True)
     scheduler.add_job(_evict_stale_poll_buffers, "interval", hours=1,
                       id="evict_poll_buffers", replace_existing=True)
+    scheduler.add_job(_malloc_trim_job, "interval", minutes=30,
+                      id="malloc_trim", replace_existing=True)
     scheduler.start()
     SCHEDULER_STARTED_AT = time.time()
     # MUST live here, not in @app.on_event("startup") — FastAPI IGNORES on_event
