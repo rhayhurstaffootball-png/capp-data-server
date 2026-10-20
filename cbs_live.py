@@ -32,6 +32,19 @@ _CACHE_SECONDS = 20          # the live poller asks every ~10 s per open game; o
 
 _cache = {}
 _lock = threading.Lock()
+# Bounded (Oct 20 2026): the cache kept every URL ever fetched for the life of the process. Entries older than
+# five minutes are dropped on every write, and the oldest go if the count still passes the cap.
+_CACHE_MAX = 300
+_CACHE_EVICT_SECONDS = 300
+
+
+def _prune(now):
+    """Caller holds _lock."""
+    for k in [k for k, v in _cache.items() if now - v[0] > _CACHE_EVICT_SECONDS]:
+        del _cache[k]
+    if len(_cache) > _CACHE_MAX:
+        for k, _ in sorted(_cache.items(), key=lambda kv: kv[1][0])[:len(_cache) - _CACHE_MAX]:
+            del _cache[k]
 # Tables are PER LEAGUE, in separate files - never one table with a league column (Sep 16 2026). find_game resolves by
 # ESPN team id, and ESPN's NFL ids run 1-34 straight through the low college range: MEASURED, 14 of the 32 NFL teams
 # share an id with a college team already in the table (Auburn=2=Bills, Arkansas=8=Lions, Arizona=12=Chiefs,
@@ -60,6 +73,7 @@ def _call(url, ttl=_CACHE_SECONDS):
         status, body = 0, None
     with _lock:
         _cache[url] = (now, status, body)
+        _prune(now)
     return status, body
 
 

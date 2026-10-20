@@ -325,6 +325,118 @@ def _build_gameday_payload() -> dict:
     }
 
 
+# ── Memory diagnostics (Oct 20 2026) ───────────────────────────────────────
+# Render OOM-killed the box Oct 7 and Oct 18 at the 2 GiB limit. From outside we could measure the SHAPE (500-750 MB
+# climbs in 10-15 min with flat CPU and only worker/node polling in the logs, then flat for hours) but not WHAT holds
+# it. This is the inside view: current + peak RSS and thread count from /proc, gc counters, the size of every cache
+# this process keeps, and on request a tracemalloc top list. tracemalloc is started in lifespan (MEMORY_TRACE=0 turns
+# it off); its own cost is reported so it can be judged.
+def _proc_status() -> dict:
+    out = {}
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("VmRSS", "VmHWM", "VmSize", "Threads"):
+                    out[k] = int(v.strip().split()[0]) * (1024 if k != "Threads" else 1)
+    except Exception:
+        pass
+    return out
+
+
+def _deep_size(obj, _seen=None, _depth=0) -> int:
+    """Rough recursive sys.getsizeof - containers of str/dict/list, capped so a huge cache cannot stall the route."""
+    import sys as _sys
+    if _seen is None:
+        _seen = set()
+    oid = id(obj)
+    if oid in _seen or _depth > 6 or len(_seen) > 400_000:
+        return 0
+    _seen.add(oid)
+    try:
+        total = _sys.getsizeof(obj)
+    except Exception:
+        return 0
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            total += _deep_size(k, _seen, _depth + 1) + _deep_size(v, _seen, _depth + 1)
+    elif isinstance(obj, (list, tuple, set, frozenset, deque)):
+        for v in list(obj):
+            total += _deep_size(v, _seen, _depth + 1)
+    return total
+
+
+def _cache_inventory(sizes: bool) -> dict:
+    """len() of every long-lived dict this process keeps, by module; with sizes=True a rough byte count of each."""
+    import sys as _sys
+    wanted = {
+        "main": ["REQUEST_PATH_COUNTS", "GAME_REQUEST_STATS", "_key_cache", "_PB_PDF_CACHE", "_poll_frames",
+                 "_poll_inputs", "_poll_frame_seen", "_poll_get_seen", "_vnc_sessions", "_vnc_locks", "_active_relay",
+                 "_reset_last_sent", "_pb_reset_last_sent", "_TEAM_LOGO_NUMBERS"],
+        "espn_fetcher": ["_games_cache", "_plays_cache", "_active_games", "_historical_games_cache", "_feed_health",
+                         "_feed_alert_state", "_replay_summaries", "_team_list_cache", "_schedule_cache"],
+        "ncaa_live": ["_cache"], "cbs_live": ["_cache", "_tables"], "cfbd_live": ["_cache"],
+        "withdrawn_memory": ["_GAMES"], "gameday_board": ["_sb_cache", "_cbs_cache"], "primary_backup": ["_last"],
+    }
+    out = {}
+    for mod, names in wanted.items():
+        module = _sys.modules.get(mod)
+        if module is None:
+            continue
+        for name in names:
+            obj = getattr(module, name, None)
+            if obj is None:
+                continue
+            try:
+                entry = {"len": len(obj)}
+            except TypeError:
+                continue
+            if sizes:
+                entry["bytes"] = _deep_size(obj)
+            out[f"{mod}.{name}"] = entry
+    return out
+
+
+def _memory_diag(deep: bool = False, trim: bool = False) -> dict:
+    import gc
+    import threading
+    import tracemalloc
+    out = {"rss_peak_bytes": _process_memory_bytes(), "proc": _proc_status(),
+           "threads": threading.active_count(), "gc_counts": gc.get_count(), "gc_stats": gc.get_stats(),
+           "tracemalloc_on": tracemalloc.is_tracing(), "caches": _cache_inventory(sizes=deep)}
+    if tracemalloc.is_tracing():
+        out["tracemalloc_overhead_bytes"] = tracemalloc.get_tracemalloc_memory()
+        cur, peak = tracemalloc.get_traced_memory()
+        out["traced_bytes"] = cur
+        out["traced_peak_bytes"] = peak
+    if deep:
+        # Live objects by type - a leak shows up as one type with a count far out of proportion.
+        counts: dict = defaultdict(int)
+        for o in gc.get_objects():
+            counts[type(o).__name__] += 1
+        out["objects_by_type"] = dict(sorted(counts.items(), key=lambda kv: -kv[1])[:25])
+        if tracemalloc.is_tracing():
+            snap = tracemalloc.take_snapshot()
+            top = []
+            for st in snap.statistics("lineno")[:30]:
+                fr = st.traceback[0]
+                top.append({"file": fr.filename.replace("/opt/render/project/src/", ""), "line": fr.lineno,
+                            "bytes": st.size, "count": st.count})
+            out["tracemalloc_top"] = top
+    if trim:
+        # glibc keeps freed memory inside the process; if RSS drops after this, the "growth" was free space the
+        # allocator never returned, not live objects.
+        before = _proc_status().get("VmRSS")
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            gc.collect()
+            out["trim"] = {"rss_before": before, "rss_after": _proc_status().get("VmRSS")}
+        except Exception as e:
+            out["trim"] = {"error": f"{type(e).__name__}: {e}"}
+    return out
+
+
 def _build_health_payload() -> dict:
     fetcher = get_fetcher_metrics()
     db_meta = get_db_meta()
@@ -344,7 +456,9 @@ def _build_health_payload() -> dict:
             "meta": db_meta,
         },
         "memory": {
-            "rss_bytes": _process_memory_bytes(),
+            "rss_bytes": _process_memory_bytes(),       # PEAK (ru_maxrss) - kept for the admin panel + nodes
+            "proc": _proc_status(),                      # current RSS / peak / threads (Linux)
+            "caches": _cache_inventory(sizes=False),
         },
         # Empty list == Supabase wired up correctly. Non-empty means the storage
         # routes are down and WHY — check this first when nodes/downloads fail.
@@ -434,6 +548,9 @@ async def lifespan(app: FastAPI):
     # Download DB from Supabase if not present (Render ephemeral disk)
     _bootstrap_db()
     global BOOTSTRAP_FINISHED_AT, SCHEDULER_STARTED_AT
+    if os.environ.get("MEMORY_TRACE", "1") != "0":
+        import tracemalloc
+        tracemalloc.start(1)       # one frame: enough to name the line, cheapest setting
     BOOTSTRAP_FINISHED_AT = time.time()
     # Start scheduler
     scheduler = AsyncIOScheduler()
@@ -766,6 +883,15 @@ def beta_page():
 @app.get("/metrics/status")
 def metrics_status():
     return _build_health_payload()
+
+
+@app.get("/metrics/memory")
+def metrics_memory(deep: bool = Query(False), trim: bool = Query(False)):
+    """Inside view of the process memory (Oct 20 2026, after the Oct 7 + Oct 18 OOM restarts).
+    ?deep=1 adds rough byte sizes of every cache, live-object counts by type and the tracemalloc top-30 lines - a few
+    seconds of CPU, call it by hand, not from a poller.  ?trim=1 asks glibc to hand freed memory back and reports RSS
+    before/after."""
+    return _memory_diag(deep=deep, trim=trim)
 
 @app.get("/games", dependencies=[Depends(verify_api_key)])
 def games(
@@ -5187,6 +5313,26 @@ async def playbook_notes_put(doc_id: str, page: int, payload: dict = Body(...),
 # to R2, and the finished PDF is registered as a normal playbook_docs row.
 _PB_JOBS = "playbook_jobs"
 _PB_DEVICES = "playbook_converter_devices"
+
+# One shared client for the worker/Binder Supabase calls (Oct 20 2026). Every call used to build its own
+# httpx.AsyncClient - three per worker poll, every ~2 s per paired converter, ~90k clients in the 38 h before the
+# Oct 18 OOM, each with its own SSL context. Not proven to be the leak; it is the one unbounded thing on the only
+# route running during every climb, and a shared client is how httpx is meant to be used anyway.
+_SUPA_HTTP = None
+
+
+def _supa_http() -> httpx.AsyncClient:
+    global _SUPA_HTTP
+    if _SUPA_HTTP is None or _SUPA_HTTP.is_closed:
+        _SUPA_HTTP = httpx.AsyncClient(timeout=httpx.Timeout(30.0),
+                                       limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+    return _SUPA_HTTP
+
+
+@asynccontextmanager
+async def _supa_scope():
+    """Drop-in for `async with httpx.AsyncClient() as c:` that yields the shared client and never closes it."""
+    yield _supa_http()
 _PB_PAIR_TOKENS = "playbook_converter_pairing_tokens"
 PB_WORKER_TOKEN = os.environ.get("PB_WORKER_TOKEN", "")
 # Worker converts these to PDF. Keep in step with _convert() in BOTH pb_worker.py
@@ -5219,7 +5365,7 @@ async def _pb_device_by_token(token: str):
     time — see /converter/register). Returns the device row or None."""
     if not token:
         return None
-    async with httpx.AsyncClient() as c:
+    async with _supa_scope() as c:
         r = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}",
                         params={"select": "id,email,team_id", "token": f"eq.{token}", "limit": "1"},
                         headers=_supa_headers_json())
@@ -5247,7 +5393,7 @@ async def _worker_identity(x_worker_token: str = Header(""),
         # must degrade to "no version", never raise into a 500.
         ver = (x_converter_version if isinstance(x_converter_version, str) else "").strip()[:20]
         try:
-            async with httpx.AsyncClient() as c:
+            async with _supa_scope() as c:
                 url = f"{SUPABASE_URL}/rest/v1/{_PB_DEVICES}"
                 params = {"id": f"eq.{dev['id']}"}
                 hdrs = {**_supa_headers_json(), "Prefer": "return=minimal"}
@@ -5443,7 +5589,7 @@ async def admin_pb_delete_job(job_id: str):
 
 
 async def _pb_job_patch(job_id: str, fields: dict):
-    async with httpx.AsyncClient() as c:
+    async with _supa_scope() as c:
         r = await c.patch(f"{SUPABASE_URL}/rest/v1/{_PB_JOBS}",
                           params={"id": f"eq.{job_id}"},
                           json={**fields, "updated_at": _dtmod.datetime.utcnow().isoformat() + "Z"},
@@ -5462,7 +5608,7 @@ async def pb_worker_claim(payload: dict = Body(default={}), _wid: dict = Depends
     another coach's, even on the same team. See BINDER LOCAL PLAN.txt."""
     import uuid as _uuid
     worker = (payload.get("worker") or "worker").strip()[:64]
-    async with httpx.AsyncClient() as c:
+    async with _supa_scope() as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/rpc/claim_playbook_job_scoped",
                          json={"p_worker": worker, "p_uploader_email": _wid.get("email")},
                          headers=_supa_headers_json())
@@ -5493,7 +5639,7 @@ async def pb_worker_claim(payload: dict = Body(default={}), _wid: dict = Depends
         job_out["target_doc_id"] = job.get("target_doc_id")
         base_key = None
         if job.get("target_doc_id"):
-            async with httpx.AsyncClient() as c:
+            async with _supa_scope() as c:
                 gd = await c.get(f"{SUPABASE_URL}/rest/v1/{_PB_DOCS}",
                                  params={"select": "r2_key", "id": f"eq.{job['target_doc_id']}", "limit": "1"},
                                  headers=_supa_headers_json())

@@ -67,6 +67,19 @@ _CACHE_SECONDS = 45
 _SCOREBOARD_CACHE_SECONDS = 300     # scoreboards for a past week never change
 _cache: dict = {}
 _lock = threading.Lock()
+# Bounded (Oct 20 2026): the cache kept every path ever fetched for the life of the process. Entries past the
+# longest TTL are dropped on every write, and the oldest go if the count still passes the cap.
+_CACHE_MAX = 300
+_CACHE_EVICT_SECONDS = 2 * _SCOREBOARD_CACHE_SECONDS
+
+
+def _prune(now):
+    """Caller holds _lock."""
+    for k in [k for k, v in _cache.items() if now - v[0] > _CACHE_EVICT_SECONDS]:
+        del _cache[k]
+    if len(_cache) > _CACHE_MAX:
+        for k, _ in sorted(_cache.items(), key=lambda kv: kv[1][0])[:len(_cache) - _CACHE_MAX]:
+            del _cache[k]
 
 
 def _api_key() -> str:
@@ -105,6 +118,7 @@ def _call(path: str, ttl: int = _CACHE_SECONDS):
 
     with _lock:
         _cache[path] = (now, status, body)
+        _prune(now)
     return status, body
 
 
