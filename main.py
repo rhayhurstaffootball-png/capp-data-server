@@ -13,6 +13,8 @@ import asyncio
 import httpx
 import sqlite3
 import time
+import threading
+import uuid
 from collections import deque, defaultdict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
@@ -958,6 +960,15 @@ def plays(
                     payload["withdrawn_keys"] = sorted(set(payload.get("withdrawn_keys") or []) | set(_gone))
             except Exception as _e:
                 print(f"WARNING: withdrawn memory failed for {game_id}: {type(_e).__name__}: {_e}", flush=True)
+        # A pop-up message Roger posted for this game rides along (see _coach_message_post). Copy first: the
+        # payload may be the cached dict shared by every client of the game.
+        try:
+            _msgs = _coach_messages_active(game_id)
+            if _msgs:
+                payload = dict(payload)
+                payload["coach_messages"] = _msgs
+        except Exception as _e:
+            print(f"WARNING: coach messages failed for {game_id}: {type(_e).__name__}: {_e}", flush=True)
         latency_ms = (time.perf_counter() - started) * 1000
         try:
             payload_bytes = len(json.dumps(payload).encode("utf-8"))
@@ -3408,6 +3419,95 @@ async def admin_list_clients():
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=r.text)
     return r.json()
+
+
+# ── Coach messages (Roger, Oct 24 2026: "I would love a way to send them a pop up message about something I see") ──
+# A message typed on the Game Day board for ONE game rides on that game's /plays payload for a set time, so every
+# coach app polling the game (the poller asks every ~15 s) shows it once. In memory, like _active_games: the live
+# server is one process, and a message that outlives a restart was not worth a table. Nothing here can break a poll.
+_COACH_MSG_DEFAULT_MINUTES = 20
+_COACH_MSG_MAX_MINUTES = 240
+_coach_messages = {}            # game_id -> [ {id, game_id, text, created_at, expires_at, retracted} ]
+_coach_messages_lock = threading.Lock()
+
+
+def _coach_message_post(game_id, text, minutes=_COACH_MSG_DEFAULT_MINUTES):
+    """Store a message for a game. Returns the row. Raises ValueError on bad input."""
+    game_id = str(game_id or "").strip()
+    text = " ".join(str(text or "").split())
+    if not game_id or not game_id.isdigit():
+        raise ValueError("game_id must be the game's id")
+    if not text:
+        raise ValueError("The message is empty.")
+    if len(text) > 600:
+        raise ValueError("Keep the message under 600 characters - it is a pop-up.")
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        minutes = _COACH_MSG_DEFAULT_MINUTES
+    minutes = max(1, min(_COACH_MSG_MAX_MINUTES, minutes))
+    now = time.time()
+    row = {"id": uuid.uuid4().hex[:12], "game_id": game_id, "text": text, "minutes": minutes,
+           "created_at": now, "expires_at": now + minutes * 60, "retracted": False}
+    with _coach_messages_lock:
+        rows = [r for r in _coach_messages.get(game_id, []) if r["expires_at"] > now]
+        rows.append(row)
+        _coach_messages[game_id] = rows
+    print(f"[message] {game_id}: posted {row['id']} for {minutes} min: {text[:80]}", flush=True)
+    return row
+
+
+def _coach_messages_active(game_id, now=None):
+    """What a coach app polling this game should be shown right now: [{id, text, created_at}] oldest first."""
+    prune = now is None
+    now = time.time() if now is None else now
+    with _coach_messages_lock:
+        rows = _coach_messages.get(str(game_id), [])
+        live = [r for r in rows if r["expires_at"] > now and not r.get("retracted")]
+        if prune and len(live) != len(rows):          # real time only: a what-if `now` must not throw rows away
+            _coach_messages[str(game_id)] = [r for r in rows if r["expires_at"] > now]
+    return [{"id": r["id"], "text": r["text"], "created_at": r["created_at"]} for r in live]
+
+
+def _coach_message_retract(message_id):
+    with _coach_messages_lock:
+        for rows in _coach_messages.values():
+            for r in rows:
+                if r["id"] == message_id:
+                    r["retracted"] = True
+                    return r
+    return None
+
+
+@app.post("/admin/api/gameday/message", dependencies=[Depends(_require_admin)])
+def admin_gameday_message_post(payload: dict = Body(...)):
+    """Post a pop-up message to everyone who has this game open. {game_id, text, minutes?}"""
+    try:
+        return _coach_message_post(payload.get("game_id"), payload.get("text"),
+                                   payload.get("minutes", _COACH_MSG_DEFAULT_MINUTES))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/admin/api/gameday/messages", dependencies=[Depends(_require_admin)])
+def admin_gameday_messages(game_id: str = Query("")):
+    """Active messages (all games, or one)."""
+    now = time.time()
+    with _coach_messages_lock:
+        gids = [str(game_id)] if game_id else list(_coach_messages.keys())
+    out = []
+    for g in gids:
+        for m in _coach_messages_active(g, now):
+            out.append({**m, "game_id": g})
+    return {"messages": out}
+
+
+@app.delete("/admin/api/gameday/message/{message_id}", dependencies=[Depends(_require_admin)])
+def admin_gameday_message_retract(message_id: str):
+    row = _coach_message_retract(message_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such message (it may have expired).")
+    return {"retracted": row["id"]}
 
 
 @app.get("/admin/api/gameday/board", dependencies=[Depends(_require_admin)])
@@ -9079,7 +9179,8 @@ function gdCardHead(c) {
       escN(c.requests_last_60s || 0) + " req/min · " + escN(c.requests_last_300s || 0) + " req/5m</span>"
     : (c.has_game ? '<span class="badge badge-gray">' + escN(c.requests_last_300s || 0) + " req/5m</span>" : "");
   const btn = c.has_game
-    ? '<button class="btn' + (open ? "" : " btn-primary") + '" onclick="gdToggle(' + escN(c.game_id) + ')" style="font-size:12px;padding:4px 12px;">' + (open ? "Hide plays" : "Show plays") + "</button>"
+    ? '<button class="btn' + (open ? "" : " btn-primary") + '" onclick="gdToggle(' + escN(c.game_id) + ')" style="font-size:12px;padding:4px 12px;">' + (open ? "Hide plays" : "Show plays") + "</button>" +
+      '<button class="btn" onclick="gdMessage(' + escN(c.game_id) + ', this)" title="Pop-up message to everyone who has this game open in CAPP (shows within 15 seconds, stays 20 minutes)" style="font-size:12px;padding:4px 12px;">Message</button>'
     : "";
   return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
     '<b class="gd-school" style="font-size:18px;">' + escN(c.school) + '</b><span style="display:flex;align-items:center;gap:10px;">' + gdState(c) + btn + "</span></div>" +
@@ -9125,6 +9226,20 @@ function renderGameDayCards(data) {
   const un = document.getElementById("gd-unmapped");
   if (un) un.textContent = (data.unmapped || []).length ? "Licensed but no team mapped: " + data.unmapped.join(", ") : "";
   gdApplyCols();
+}
+
+function gdMessage(gid, btn) {
+  // One pop-up to every coach app polling this game. The server keeps it 20 minutes; a client shows each message once.
+  const card = ((_gdBoard || {}).cards || []).find(c => String(c.game_id) === String(gid));
+  const who = card ? card.school + " (" + (card.home_away === "home" ? "vs " : "at ") + card.opponent + ")" : "game " + gid;
+  const text = window.prompt("Message to " + who + " - it pops up in their CAPP within 15 seconds:", "");
+  if (text === null) return;
+  if (!text.trim()) { alert("Nothing sent - the message was empty."); return; }
+  if (btn) btn.disabled = true;
+  api("POST", "/gameday/message", { game_id: String(gid), text: text.trim(), minutes: 20 })
+    .then(d => alert("Sent to " + who + ".\\n\\nIt shows on their next poll (within 15 seconds) and stays available for 20 minutes.\\nMessage id " + d.id))
+    .catch(e => alert("Not sent: " + e.message))
+    .then(() => { if (btn) btn.disabled = false; });
 }
 
 function gdSlot(gid) {
