@@ -1019,8 +1019,14 @@ def _auto_fix_entries(entries):
 # The score ESPN itself publishes (scoringPlays)
 # ============================================================
 
-def score_events(data):
+def score_events(data, nullified=()):
     """ESPN's own scoring summary as (period, clock seconds, home, away), in game order.
+
+    nullified: (period, clock seconds, posted home, posted away) of touchdowns the play text says were nullified by
+    penalty - the summary keeps their event (UCF vs BYU Q3 10:32 "20-17", live Oct 24 2026; 7 of 903 finished corpus
+    games still carry one), and an event that never happened must not raise a single row. Only the event that REPEATS
+    the nullified play's posted score goes: a real touchdown on the same clock keeps its event (Alabama State at
+    Southern, Aug 29 2026, a real TD typed on the nullified play's 3:38 - the first version dropped it too).
 
     ⚠ THE AUTHORITY ON THE SCORE, AND WE WERE NOT READING IT. ESPN's play rows lag: a field goal at the end of a half
     leaves every row of the next period carrying the old score until ESPN's own numbers catch up. MEASURED on
@@ -1038,9 +1044,12 @@ def score_events(data):
         if q is None or h is None or a is None or not re.match(r"^\d{1,2}:\d{2}$", raw):
             continue
         try:
-            out.append((int(q), _clock_to_seconds(raw), int(h), int(a)))
+            ev = (int(q), _clock_to_seconds(raw), int(h), int(a))
         except (TypeError, ValueError):
             continue
+        if any(ev[0] == nq and abs(ev[1] - ns) <= 5 and (ev[2], ev[3]) == (nh, na) for nq, ns, nh, na in (nullified or ())):
+            continue
+        out.append(ev)
     out.sort(key=lambda x: (x[0], -x[1]))
     return out
 
@@ -1614,6 +1623,32 @@ def _infer_missing_pats(all_plays):
     return inferred
 
 
+_NULLIFIED_TD = re.compile(r"touchdown[^.]{0,40}?\bnullified\b|\bnullified\b[^.]{0,60}?touchdown", re.I)
+
+
+def _undo_nullified_scores(all_plays):
+    """A nullified touchdown's own score fields take the score of the play before it. ESPN leaves the crew's
+    six points on the play (UCF vs BYU 20-17); apply_scoreboard_lag hands each row the score of the row BEFORE it,
+    so without this the next row - and every board after it - would show points that were taken off the field.
+    Returns (quarter, clock-seconds) of each nullified touchdown, for score_events to drop the summary's copy."""
+    marks = []
+    prev_h = prev_a = 0
+    for play in all_plays:
+        if play.get("_nullified_td"):
+            posted_h, posted_a = play.get("home_score", prev_h), play.get("away_score", prev_a)
+            play["home_score"], play["away_score"] = prev_h, prev_a
+            raw = str(play.get("clock") or "")
+            if re.match(r"^\d{1,2}:\d{2}$", raw):
+                try:
+                    # the score the crew POSTED on it - score_events drops only the summary event that repeats it
+                    marks.append((int(play.get("period")), _clock_to_seconds(raw), int(posted_h), int(posted_a)))
+                except (TypeError, ValueError):
+                    pass
+        prev_h = play.get("home_score", prev_h)
+        prev_a = play.get("away_score", prev_a)
+    return marks
+
+
 def _parse_play(play, drive_team_id, home_team_id, away_team_id):
     play_id = str(play.get("id", ""))
     if not play_id:
@@ -1698,6 +1733,17 @@ def _parse_play(play, drive_team_id, home_team_id, away_team_id):
     scoring_play = play.get("scoringPlay", False)
     score_value = play.get("scoreValue", 0)
     point_after = play.get("pointAfterAttempt")
+    # A TOUCHDOWN NULLIFIED BY PENALTY IS NOT A SCORE, whatever ESPN's flags say. UCF vs BYU, Oct 24 2026 (live): the
+    # crew scored P.Rex's Q3 10:32 run (scoringPlay True, 20-17, in the scoring summary), then typed "nullified by
+    # penalty" - and left the flag, the score and the summary event in place. CAPP drew a 6-point jump plus a "Not
+    # Available" extra point, then the real touchdown at 9:45 only added one: two touchdowns on the boards for one
+    # on the field (Roger: "it looks like there are two touchdowns but there is only one"). MEASURED on 903 finished
+    # games: 245 nullified touchdowns, the flag was cleared on every one by the final and the summary still carried
+    # 7 of them - so this is a LIVE problem the final data hides. The play keeps its text and its row; only the
+    # scoring goes. The play's own score is carried from the play before it in _undo_nullified_scores.
+    _nullified_td = bool(_NULLIFIED_TD.search(text or ""))
+    if _nullified_td:
+        scoring_play, score_value, point_after = False, 0, None
     pat_data = None
     if point_after:
         pat_data = {
@@ -1705,6 +1751,7 @@ def _parse_play(play, drive_team_id, home_team_id, away_team_id):
             "value": int(point_after.get("value", 0)),
         }
     return {
+        "_nullified_td": _nullified_td,
         "espn_play_id": play_id,
         "sequence_number": sequence_number,
         "period": period_num,
@@ -2805,6 +2852,11 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
 
     all_plays.sort(key=lambda p: p.get("sequence_number", 0))
 
+    # A nullified touchdown carries the score of the play before it (see _undo_nullified_scores)
+    _nullified_marks = _undo_nullified_scores(all_plays)
+    if _nullified_marks:
+        print(f"[score] {game_id}: {len(_nullified_marks)} nullified touchdown(s) kept off the score", flush=True)
+
     # Infer missing PAT data from score jumps
     inferred_pat_fixes = _infer_missing_pats(all_plays)
     # Annotate which team scored each TD (uses score deltas, not drive_team_id)
@@ -2863,7 +2915,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # was already on the board (a half-ending field goal used to leave the whole next period 3 points short). Runs
     # BEFORE the gap check on purpose - with the scores right, a boundary that only looked like a missing play stops
     # looking like one.
-    _events = score_events(data)
+    _events = score_events(data, nullified=_nullified_marks)
     for _i, _msg in _raise_lagging_scores(entries, _events).items():
         entry_fixes.setdefault(_i, _msg)
     # (_lower_spiked_scores, the raise's counterpart, runs later - after the CBS clock fixes and the timeout re-slot,

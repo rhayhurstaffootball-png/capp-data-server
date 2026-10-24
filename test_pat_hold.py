@@ -14,8 +14,7 @@ import ncaa_live as N
 
 N.resolve_game = lambda *a, **k: {"available": False, "ncaa_game_id": ""}
 RAW = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.environ.get("LOCALAPPDATA", ""), "Temp", "claude", "T--CAPP-FINAL",
-    "b8479e99-5a4e-456c-a427-72bc48db82bf", "scratchpad", "smu_raw_espn.json")
+    os.path.dirname(os.path.abspath(__file__)), "test_fixtures", "smu_cal_401858270_final.json")
 if not os.path.exists(RAW):
     print("SKIP - raw summary not found:", RAW)
     sys.exit(0)
