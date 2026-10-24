@@ -2832,6 +2832,27 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         )
         entries.extend(mapped)
 
+    # HOLD THE EXTRA POINT UNTIL THE NEXT PLAY (Roger, Oct 24 2026). The stat crew publishes the touchdown and the
+    # kick result in ONE entry, before the kick is kicked: on SMU vs California every one of 10 touchdowns arrived
+    # with "kick attempt good" already in its first copy, 21-47 s after the previous play went out (Air Force at
+    # Wyoming: 3 of 3). CAPP split that into a TD row and an EP row at once, so the coach saw the extra point board
+    # before the kick ("Extra Points were coming in before it was even kicked"). While the game is on and the touchdown
+    # is the LAST play in the feed, its EP / 2PT rows wait for the next play (the kickoff, a minute later): if the kick
+    # is missed or they go for two, the crew's edit lands before anything was drawn. A finished game holds nothing.
+    # Only rows split off the touchdown itself are held (same ESPN play id as the TD row before them) - a try the
+    # crew typed as its own play keeps its own id and is drawn as it always was.
+    if game_status != "post" and all_plays:
+        _last_id = str(all_plays[-1].get("espn_play_id") or "")
+        _held_pat = 0
+        while (len(entries) > 1 and _last_id
+               and str(entries[-1].get("espn_play_id") or "") == _last_id
+               and str(entries[-1].get("down", "")).strip().upper() in ("EP", "2PT")
+               and str(entries[-2].get("espn_play_id") or "") == _last_id):
+            entries.pop()
+            _held_pat += 1
+        if _held_pat:
+            print(f"[pat] {game_id}: holding {_held_pat} try row(s) of the last play until the next play arrives", flush=True)
+
     fill_missing_field_positions(entries)
     actual_home, actual_away = apply_scoreboard_lag(entries)
 
