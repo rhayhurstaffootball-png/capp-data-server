@@ -2164,6 +2164,28 @@ def _cbs_drop_score(d, q, secs, side):
     return abs(lead)
 
 
+def _cbs_settled_after(cbs_doc, q, secs):
+    """Has CBS posted enough plays after this clock for a counter drop there to be visible? A drop is emitted only once
+    the following plays show the lower number (cbs_backup.TIMEOUT_HOLD = 2), so on a LIVE game the last timeout of
+    the feed can look uncharged for two plays. Fresno State Q3 8:15, Sep 19 2026: typed as Fresno's, no CBS play after
+    it yet, called officials' - wrong for two plays. Until CBS has settled, ESPN's own word stands."""
+    if q is None or secs is None:
+        return True
+    n = 0
+    for it in (cbs_doc or {}).get("items") or []:
+        if it.get("kind") not in ("play", "kickoff", "extra_point", "two_point"):
+            continue
+        try:
+            iq = int(str(it.get("quarter")).strip())
+        except (TypeError, ValueError):
+            continue
+        if iq > q or (iq == q and it.get("clock_secs") is not None and it["clock_secs"] < secs):
+            n += 1
+            if n >= 2:
+                return True
+    return False
+
+
 def _assign_cbs_drops(rows, drops):
     """{row index: drop} - BEST PAIR FIRST over the whole game, each row and each drop used once. (Row order was tried
     first and was wrong: an earlier row stole a later row's drop - Arkansas @ Utah Q4, the 2:00 row took 1:45's.)"""
@@ -2450,7 +2472,6 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
         if verdict is None:
             unresolved.append(i)
             continue
-
         # TWO OFFICIALS' STOPPAGES CANNOT SHARE A TICK. If an OTO row already sits at this quarter and clock, a row
         # the crew typed with a TEAM NAME is something else - and calling it officials would rewrite it into a second
         # identical row, and a second identical board, in front of the coach. Lincoln (PA) vs Mississippi Valley St
@@ -2580,6 +2601,117 @@ def _assume_officials(entries, index):
             return True, "after a kick"
         return False, ""
     return False, ""
+
+
+ADD_MISSING_TIMEOUTS = False     # OFF - MEASURED Oct 24 2026 (Sep 12 + Sep 19 corpus, 138 games with counters): the counters alone
+                                 # would add 18 timeouts, NCAA's label confirms 0 and contradicts 5, three halves end with a team
+                                 # charged four. Counters + NCAA label agreeing on a crew-missed timeout: 4 of 134 games, all OT 0:00.
+                                 # A crew-missed team timeout in regulation is too rare, and the counters too noisy, to add from.
+MISSING_TIMEOUT_NOTE = "Auto-added timeout (backup counters) - check"
+
+
+def _add_missing_backup_timeouts(entries, home_name, away_name, cbs_doc):
+    """Add the team timeouts the backup source's counters charge and the stat crew never typed. Returns (count, examples).
+
+    SMU vs California, Oct 24 2026: the crew never typed SMU's Q3 4:53 timeout; the backup's counters had it. Every
+    other timeout rule only re-labels rows that exist (_classify_timeouts, the client's Resolve) or swaps a whole
+    quarter (offered above 10% bad scoreboards - Q3 sat at 6.7%), so the coach's SMU timeouts-remaining ran one high
+    from mid-Q3 to the end. Roger: "Why arent our Back up sources fixing this before It hits the Client".
+
+    Rule: a counter drop that no typed timeout row claims (_assign_cbs_drops, the classifier's own pairing) and that has
+    no typed timeout row of ANY kind within the same window (an officials' row the vote already settled is still that
+    stoppage) becomes a row, charged to the drop's team, placed before the play the counter dropped on - the timeout was
+    called before that snap (cbs_backup.team_timeouts). Down / distance / spot / possession / scores come from that
+    play, as the quarter swap's timeout rows do (cbs_rows._timeout_row). Not added until the feed has that play (a live
+    game: the next poll). Keyed by quarter / clock / side so it stays one row from poll to poll. Never raises.
+    """
+    if not ADD_MISSING_TIMEOUTS or not TIMEOUTS_FROM_CBS:
+        return 0, []
+    drops = _cbs_timeout_drops(cbs_doc)
+    if not drops:
+        return 0, []
+
+    def _is_to(e):
+        return (str(e.get("home_time_out")) == "Yes" or str(e.get("away_time_out")) == "Yes"
+                or str(e.get("down", "")).strip().upper() == "OTO"
+                or bool(_TIMEOUT_TEXT.match(str(e.get("play_text") or ""))))
+
+    def _row_secs(e):
+        m = re.search(r"clock\s+(\d{1,2}):(\d{2})", str(e.get("play_text", "")), re.I) \
+            or re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(e.get("clock", "")))
+        return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
+    def _q(e):
+        try:
+            return int(str(e.get("quarter", "")).strip())
+        except (TypeError, ValueError):
+            return None
+
+    rows = [(i, e) for i, e in enumerate(entries) if _is_to(e) and e.get("ncaa_status") != "superseded"]
+    rq = [(i, _q(e), _row_secs(e), _timeout_row_side(e, home_name, away_name)) for i, e in rows]
+    claimed = {id(d) for d in _assign_cbs_drops(rq, drops).values()}
+    have = {str(e.get("_forced_key") or e.get("entry_key") or "") for e in entries}
+    adds = []
+    for d in drops:
+        if id(d) in claimed:
+            continue
+        q, secs, side = d["q"], d["secs"], d["side"]
+        key = f"cbsto:{q}:{secs}:{side}"
+        if key in have:
+            continue
+        # a typed stoppage of any kind in the window is this stoppage, whatever the vote called it - never a second row
+        if any(_rq == q and _rs is not None and -_CBS_TO_AFTER <= _rs - secs <= _CBS_TO_BEFORE
+               for _i, _rq, _rs, _side in rq):
+            continue
+        # the play the counter dropped on: the first snap in that quarter at or below the drop's clock
+        nxt = None
+        for k, e in enumerate(entries):
+            if _q(e) != q or _is_to(e) or e.get("ncaa_status") == "superseded":
+                continue
+            s = _row_secs(e)
+            if s is not None and s <= secs:
+                nxt = k
+                break
+        if nxt is None:
+            continue                                 # the feed has not reached that play yet
+        base = entries[nxt]
+        team = home_name if side == "home" else away_name
+        clock = "%d:%02d" % divmod(secs, 60)
+        down = str(base.get("down", "")).strip()
+        if not down.isdigit():                       # before a kickoff / try: no down to carry
+            down, dist = "1", 10
+        else:
+            dist = base.get("distance", 10)
+        adds.append((nxt, {
+            "home_score": base.get("home_score", 0),
+            "away_score": base.get("away_score", 0),
+            "clock": clock,
+            "quarter": base.get("quarter", q),
+            "down": down,
+            "distance": dist,
+            "gain": 0,
+            "field_position": base.get("field_position", 0),
+            "possession": base.get("possession", ""),
+            "run_clock": "No",
+            "home_time_out": "Yes" if side == "home" else "No",
+            "away_time_out": "Yes" if side == "away" else "No",
+            "play_text": "Timeout %s, clock %02d:%02d" % (team, *divmod(secs, 60)),
+            "wallclock": "",
+            "espn_play_id": "",
+            "espn_seq": None,
+            "_forced_key": key,
+            "ncaa_status": "added",
+            "ncaa_changes": [{"field": "row", "old": "", "new": "added",
+                              "why": "backup counters charge a timeout here, the feed has none"}],
+            "qc_issue": MISSING_TIMEOUT_NOTE,
+        }))
+    examples = []
+    for pos, row in sorted(adds, key=lambda x: x[0], reverse=True):
+        entries.insert(pos, row)
+        if len(examples) < 5:
+            examples.append("Q%s %s timeout added for %s (backup counters, not in the feed)"
+                            % (row["quarter"], row["clock"], home_name if row["home_time_out"] == "Yes" else away_name))
+    return len(adds), list(reversed(examples))
 
 
 def _assign_entry_keys(entries):
@@ -2851,6 +2983,16 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
         to_changed, to_examples, to_unresolved = _classify_timeouts(
             entries, capp_home, capp_away, league, game_date, cbs_doc=_cbs_doc)
         to_examples = list(entry_fixes_extra) + list(to_examples)
+        # A team timeout the crew never typed (SMU Q3 4:53, Oct 24 2026). Rows are inserted, so the keys are assigned
+        # again - _assign_entry_keys is deterministic, every existing key comes out the same.
+        if league == "cfb":
+            _unres_rows = [entries[_i] for _i in to_unresolved]
+            _add_n, _add_examples = _add_missing_backup_timeouts(entries, capp_home, capp_away, _cbs_doc)
+            if _add_n:
+                _assign_entry_keys(entries)
+                to_unresolved = [_k for _k, _r in enumerate(entries) if any(_r is _u for _u in _unres_rows)]
+                to_examples = list(to_examples) + list(_add_examples)
+                print(f"[timeouts] {game_id}: {_add_n} timeout(s) added from the backup counters", flush=True)
     except Exception as e:
         print(f"WARNING: timeout classify failed for {game_id}: {e}", flush=True)
 
