@@ -7,8 +7,10 @@ import shutil
 import sys
 import tempfile
 
-os.environ["CAPP_CBS"] = "0"
 HERE = os.path.dirname(os.path.abspath(__file__))
+# the primary backup's counters for the same game, offline from the corpus (the two-witness add needs them)
+os.environ["CAPP_CBS"] = "1"
+os.environ["CAPP_CBS_DIR"] = r"T:\CAPP_FINAL\_dev_tools\game_replay_test\data_cbs"
 FX = os.path.join(HERE, "test_fixtures")
 TMP = tempfile.mkdtemp(prefix="fox_voter_")
 _doc = json.load(open(os.path.join(FX, "fox_smu_cal_43822.json"), encoding="utf-8"))
@@ -66,9 +68,17 @@ check("the reason names the third backup, never the vendor", all("Fox" not in m 
 # The crew never typed SMU's Q3 4:53 timeout (Oct 24 2026). Fox has it ("Timeout #1 by SMU."), but a VOTER only
 # classifies rows that exist - adding a row is a separate, measured decision (ADD_MISSING_TIMEOUTS, off). So the
 # second half still shows SMU charged once, and the Fox row stays unclaimed.
-second = [s for q, c, s, _ in rows_fox if q in ("3", "4") and s == "home"]
-check("voter does not add rows: SMU still charged once in the second half", len(second), 1)
-check("Q3 4:53 is not in the table", [c for q, c, s, _ in rows_fox if q == "3"], [])
+# no second witness (counters off) -> the named row alone never adds
+os.environ["CAPP_CBS"] = "0"
+alone = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
+os.environ["CAPP_CBS"] = "1"
+check("named row alone (no counters) adds nothing", [c for q, c, s, _ in to_rows(alone) if q == "3"], [])
+F.NAMED_ADD_NEEDS_COUNTERS = False
+try:
+    solo = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
+finally:
+    F.NAMED_ADD_NEEDS_COUNTERS = True
+check("NAMED_ADD_NEEDS_COUNTERS=False: the named row alone adds (not Roger's setting)", [c for q, c, s, _ in to_rows(solo) if q == "3"], ["4:53"])
 
 # tolerance + claiming: a Fox row can only answer one crew row
 rq = [(0, 2, 43, "away"), (1, 2, 40, "away"), (2, 2, 7, "home"), (3, 4, 700, None)]
@@ -77,13 +87,12 @@ check("nearest row wins, each Fox row claimed once, far rows abstain", F._named_
 check("no named rows -> no votes", F._named_votes(rq, None), {})
 check("a Fox team row with no side votes nothing", F._named_votes([(0, 1, 100, "home")], [{"quarter": 1, "secs": 100, "charged": None}]), {})
 
-# ── the ADD: the named row as the trigger for a timeout the crew never typed (flag off until measured) ──
-F.ADD_NAMED_TIMEOUTS = True
-try:
-    added = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
-finally:
-    F.ADD_NAMED_TIMEOUTS = False
+# ── the ADD (ON, Roger Oct 25): named row + the counters' drop agree on the team, no crew row near -> a row is added ──
+# with_fox above ran with the flag ON and the real counters of this game (data_cbs/50028359): SMU's Q3 4:53 is added there.
+added = with_fox
 rows_add = to_rows(added)
+check("flag is ON with two witnesses required", (F.ADD_NAMED_TIMEOUTS, F.NAMED_ADD_NEEDS_COUNTERS), (True, True))
+check("counters were read for the replay", bool(added["qc_summary"]["ncaa_check"].get("cbs_game_id")), True)
 q3 = [(c, s, n) for q, c, s, n in rows_add if q == "3"]
 check("SMU's Q3 4:53 timeout is added, charged to SMU, marked for a look", q3, [("4:53", "home", F.NAMED_TIMEOUT_NOTE)])
 new_row = next(e for e in added["entries"] if e.get("quarter") == "3" and e.get("clock") == "4:53")
@@ -91,11 +100,10 @@ check("added row keyed by quarter/clock/side, text in the feed's shape", (new_ro
       ("nmto:3:293:home", "Timeout SMU, clock 04:53", "added"))
 i_new = added["entries"].index(new_row)
 check("placed before the first snap at or below 4:53 in Q3", (added["entries"][i_new + 1]["quarter"], int(added["entries"][i_new + 1]["clock"].split(":")[0]) * 60 + int(added["entries"][i_new + 1]["clock"].split(":")[1]) <= 293), ("3", True))
-check("every other timeout row unchanged", [r for r in rows_add if r[0] != "3"], rows_fox)
+check("every other timeout row as without the add", [r for r in rows_add if r[0] != "3"], [r for r in to_rows(alone) if r[0] != "3"])
 check("SMU now charged 2 in the second half", len([s for q, c, s, _ in rows_add if q in ("3", "4") and s == "home"]), 2)
 check("example names the third backup", [m for m in added["qc_summary"]["auto_fixed_examples"] if "added" in m], ["Q3 4:53 timeout added for SMU (third backup, not in the feed)"])
-check("no add while the flag is off", [c for q, c, s, _ in rows_fox if q == "3"], [])
-check("one more row than before", len(added["entries"]) - len(with_fox["entries"]), 1)
+check("one more row than without the add", len(added["entries"]) - len(alone["entries"]), 1)
 check("named rows the crew DID type add nothing (4 team rows, 1 add)", sum(1 for e in added["entries"] if str(e.get("entry_key", "")).startswith("nmto:")), 1)
 
 shutil.rmtree(TMP, ignore_errors=True)
