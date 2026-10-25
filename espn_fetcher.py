@@ -2707,7 +2707,10 @@ ADD_NAMED_TIMEOUTS = True        # ON (Roger, Oct 25 2026: "I wanted it to be ab
                                  # witnesses agree on 84 (~1 per 9 games); where the secondary backup's label exists it confirms 28 and
                                  # contradicts 30 - but that same label missed SMU's, so it is not ground truth for these. The added row
                                  # is red with NAMED_TIMEOUT_NOTE so the coach looks at it.
-NAMED_ADD_NEEDS_COUNTERS = True  # False = the named row alone adds (184 per season measured; not Roger's ask)
+NAMED_ADD_NEEDS_COUNTERS = True  # a second witness is required: the counters' drop OR the secondary backup's label naming the
+                                 # same team within 90 s (Roger, Oct 25 2026, option 1: "any two of the three backups agree").
+                                 # Measured: counters back 84 of the 184, the label alone backs 36 more -> 120 (~1 per 6.5 games).
+                                 # False = the named row alone adds (184; a third contested where a label exists - not chosen).
 NAMED_TIMEOUT_NOTE = "Auto-added timeout (third backup) - check"
 
 
@@ -2737,7 +2740,28 @@ def _add_missing_backup_timeouts(entries, home_name, away_name, cbs_doc):
                              before=_CBS_TO_BEFORE, after=_CBS_TO_AFTER)
 
 
-def _add_missing_named_timeouts(entries, home_name, away_name, named, cbs_doc=None):
+def _ncaa_timeout_labels(home_name, away_name, game_date):
+    """The secondary backup's team timeout labels as [{q, secs, side}] (officials' labels left out). Never raises."""
+    out = []
+    try:
+        import ncaa_live
+        found = ncaa_live.resolve_game(_season_guess(game_date), home_name, away_name, date=_ncaa_date(game_date) or None)
+        if found.get("available"):
+            for t in ncaa_live.timeouts(found["ncaa_game_id"]).get("timeouts", []):
+                side = t.get("charged")
+                m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(ncaa_live._norm_clock(t.get("clock")) or ""))
+                try:
+                    q = int(str(t.get("quarter")).strip())
+                except (TypeError, ValueError):
+                    continue
+                if side in ("home", "away") and m:
+                    out.append({"q": q, "secs": int(m.group(1)) * 60 + int(m.group(2)), "side": side})
+    except Exception as e:
+        print(f"WARNING: timeout labels for the add failed ({home_name} v {away_name}): {e}", flush=True)
+    return out
+
+
+def _add_missing_named_timeouts(entries, home_name, away_name, named, cbs_doc=None, labels=None):
     """Add the team timeouts the third backup prints as a row ("Timeout #1 by SMU.") that the stat crew never typed.
     Returns (count, examples). With NAMED_ADD_NEEDS_COUNTERS the primary backup's counters must ALSO show an unclaimed
     drop for that team near the row (-30 s .. +60 s, the counters' own window) - two witnesses, never one. Same
@@ -2749,16 +2773,22 @@ def _add_missing_named_timeouts(entries, home_name, away_name, named, cbs_doc=No
                 if r.get("kind") == "team" and r.get("charged") in ("home", "away")
                 and r.get("secs") is not None and r.get("quarter")]
     if triggers and NAMED_ADD_NEEDS_COUNTERS:
-        drops = _cbs_timeout_drops(cbs_doc) if TIMEOUTS_FROM_CBS else None
-        if not drops:
-            return 0, []                                  # no second witness -> no add
-        rows = [(i, e) for i, e in enumerate(entries) if _is_timeout_row(e) and e.get("ncaa_status") != "superseded"]
-        rq = [(i, _row_quarter(e), _row_secs(e), _timeout_row_side(e, home_name, away_name)) for i, e in rows]
-        claimed = {id(d) for d in _assign_cbs_drops(rq, drops).values()}
-        free = [d for d in drops if id(d) not in claimed]
-        triggers = [t for t in triggers
-                    if any(d["side"] == t["side"] and d["q"] == t["q"] and -_CBS_TO_AFTER <= d["secs"] - t["secs"] <= _CBS_TO_BEFORE
-                           for d in free)]
+        drops = (_cbs_timeout_drops(cbs_doc) if TIMEOUTS_FROM_CBS else None) or []
+        free = []
+        if drops:
+            rows = [(i, e) for i, e in enumerate(entries) if _is_timeout_row(e) and e.get("ncaa_status") != "superseded"]
+            rq = [(i, _row_quarter(e), _row_secs(e), _timeout_row_side(e, home_name, away_name)) for i, e in rows]
+            claimed = {id(d) for d in _assign_cbs_drops(rq, drops).values()}
+            free = [d for d in drops if id(d) not in claimed]
+        labels = labels if labels is not None else []
+
+        def _backed(t):
+            if any(d["side"] == t["side"] and d["q"] == t["q"] and -_CBS_TO_AFTER <= d["secs"] - t["secs"] <= _CBS_TO_BEFORE
+                   for d in free):
+                return True
+            return any(l["side"] == t["side"] and l["q"] == t["q"] and l["secs"] is not None
+                       and abs(l["secs"] - t["secs"]) <= 90 for l in labels)
+        triggers = [t for t in triggers if _backed(t)]
     if not triggers:
         return 0, []
     return _add_timeout_rows(entries, home_name, away_name, triggers, "nmto", "third backup", NAMED_TIMEOUT_NOTE,
@@ -3209,7 +3239,9 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                 to_examples = list(to_examples) + list(_add_examples)
                 print(f"[timeouts] {game_id}: {_add_n} timeout(s) added from the backup counters", flush=True)
             _unres_rows = [entries[_i] for _i in to_unresolved]
-            _nadd_n, _nadd_examples = _add_missing_named_timeouts(entries, capp_home, capp_away, _named, _cbs_doc)
+            _nadd_n, _nadd_examples = _add_missing_named_timeouts(
+                entries, capp_home, capp_away, _named, _cbs_doc,
+                labels=_ncaa_timeout_labels(capp_home, capp_away, game_date) if _named else None)
             if _nadd_n:
                 _assign_entry_keys(entries)
                 to_unresolved = [_k for _k, _r in enumerate(entries) if any(_r is _u for _u in _unres_rows)]

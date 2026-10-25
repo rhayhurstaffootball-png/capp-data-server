@@ -72,7 +72,21 @@ check("the reason names the third backup, never the vendor", all("Fox" not in m 
 os.environ["CAPP_CBS"] = "0"
 alone = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
 os.environ["CAPP_CBS"] = "1"
-check("named row alone (no counters) adds nothing", [c for q, c, s, _ in to_rows(alone) if q == "3"], [])
+check("named row alone (no counters, no label) adds nothing", [c for q, c, s, _ in to_rows(alone) if q == "3"], [])
+# the secondary backup's LABEL as the second witness (Roger, option 1): same team within 90 s -> adds; other team -> no
+N.resolve_game = lambda *a, **k: {"available": True, "ncaa_game_id": "x"}
+N.timeouts = lambda _g: {"timeouts": [{"quarter": 3, "clock": "4:50", "charged": "home"}]}
+os.environ["CAPP_CBS"] = "0"
+lab = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
+N.timeouts = lambda _g: {"timeouts": [{"quarter": 3, "clock": "4:50", "charged": "away"}]}
+lab_other = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
+N.timeouts = lambda _g: {"timeouts": [{"quarter": 3, "clock": "2:50", "charged": "home"}]}
+lab_far = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
+os.environ["CAPP_CBS"] = "1"
+N.resolve_game = lambda *a, **k: {"available": False, "ncaa_game_id": ""}
+check("label names SMU within 90 s, counters off -> added", [c for q, c, s, _ in to_rows(lab) if q == "3"], ["4:53"])
+check("label names the other team -> not added", [c for q, c, s, _ in to_rows(lab_other) if q == "3"], [])
+check("label 2 minutes away -> not added", [c for q, c, s, _ in to_rows(lab_far) if q == "3"], [])
 F.NAMED_ADD_NEEDS_COUNTERS = False
 try:
     solo = F._fetch_game_plays_mapped("401858270", "cfb", summary=summ)
