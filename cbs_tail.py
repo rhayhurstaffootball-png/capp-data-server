@@ -39,7 +39,10 @@ def _q(v):
     t = str(v or "").strip().upper()
     if t.isdigit():
         return int(t)
-    if t.endswith("OT"):
+    if t.startswith("OT"):                      # "OT" (= OT1), "OT1", "OT2"
+        n = t[2:]
+        return 4 + (int(n) if n.isdigit() else 1)
+    if t.endswith("OT"):                        # "2OT", "3OT" (the feed's own wording, told apart since Oct 25 2026)
         n = t[:-2]
         return 4 + (int(n) if n.isdigit() else 1)
     return 0

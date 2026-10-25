@@ -1789,7 +1789,8 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
     description = play.get("description", "")
     drive_team_id = play.get("drive_team_id", "")
     period = play.get("period", 1)
-    quarter = str(period) if period <= 4 else "OT"
+    # Overtime periods told apart (Roger, Oct 25 2026): 5 -> "OT", 6 -> "2OT", 7 -> "3OT" - the primary feed's own wording.
+    quarter = str(period) if period <= 4 else ("OT" if period == 5 else f"{period - 4}OT")
     clock = play.get("clock", "0:00")
     home_score = play.get("home_score", 0)
     away_score = play.get("away_score", 0)
