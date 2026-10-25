@@ -2390,9 +2390,46 @@ def _dedupe_timeout_rows(entries, home_name, away_name, cbs_doc=None):
 # an ESPN timeout row that lines up with a counter drop is charged to that team; one that lines up with nothing is
 # an officials' timeout (no charge, OTO). NCAA's labels and the measured fallback rules stay for games CBS does not
 # have. MEASURED before it went in: _dev_tools/game_replay_test/measure_timeouts_cbs.py.
-def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_doc=None):
+NAMED_TIMEOUT_TOLERANCE = 15     # seconds between a crew row's clock and the third backup's named row to be the same stoppage.
+                                 # MEASURED Oct 25 2026 (measure_fox_timeouts.py, 785 games, 7,948 timeout rows): the named row
+                                 # agrees with the three-observer vote 2,941/2,976 at 0 s, 370/384 at 1-5 s, 145/171 at 6-15 s,
+                                 # and only 144/207 at 16-60 s - past 15 s it is usually a different stoppage.
+_NAMED_TIE_ORDER = ("counters", "source", "named")   # who wins an even split, in order. MEASURED: against the secondary
+                                 # backup's label the existing vote is right 3,036/3,162 (96%), the named row 2,929/3,162
+                                 # (92.6%), so the named row ranks LAST - it breaks ties the others leave, never beats them.
+
+
+def _named_votes(rows_q_secs, named):
+    """Fox's named timeout rows matched to the crew's timeout rows: {row index: "home"|"away"|"officials"}.
+    Same quarter, nearest clock within NAMED_TIMEOUT_TOLERANCE, each Fox row claimed once (closest pair first).
+    A Fox team row whose code matched neither of our teams votes nothing. No Fox row near -> no vote (Fox abstains;
+    it never says "no timeout happened" - that is the counters' job)."""
+    out = {}
+    if not named:
+        return out
+    cands = []
+    for i, q, s, _side in rows_q_secs:
+        if q is None or s is None:
+            continue
+        for k, r in enumerate(named):
+            if r.get("quarter") != q or r.get("secs") is None or not r.get("charged"):
+                continue
+            d = abs(int(r["secs"]) - int(s))
+            if d <= NAMED_TIMEOUT_TOLERANCE:
+                cands.append((d, i, k))
+    used_rows, used_fox = set(), set()
+    for d, i, k in sorted(cands):
+        if i in used_rows or k in used_fox:
+            continue
+        used_rows.add(i); used_fox.add(k)
+        out[i] = named[k]["charged"]
+    return out
+
+
+def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_doc=None, named=None):
     """Rewrite timeout rows to say who they are actually charged to.
 
+    named: the third backup's explicit timeout rows (fox_live.timeouts), a fourth observer (Oct 25 2026).
     Returns (changed_count, examples, unresolved_count). Never raises: a second
     source must not be able to break play delivery.
     """
@@ -2464,6 +2501,11 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
                     _timeout_row_side(_e, home_name, away_name)))
     if drops is not None:
         assigned = _assign_cbs_drops(_rq, drops)
+    try:
+        named_of = _named_votes(_rq, named)
+    except Exception as _e:
+        print(f"WARNING: timeout classify: named rows failed ({home_name} v {away_name}): {_e}", flush=True)
+        named_of = {}
     crew_of = {_i: _side for _i, _q, _s, _side in _rq}
     at_of = {_i: (_q, _s) for _i, _q, _s, _side in _rq}
     # THREE OBSERVERS VOTE (Roger, Sep 20 2026: "vote by observer"; built Sep 27 after Nebraska at Michigan State Q3
@@ -2494,9 +2536,12 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
         if lab is not None:
             ch = lab.get("charged")
             votes["source"] = ch if ch in ("home", "away") else "officials"
+        # FOURTH OBSERVER (Oct 25 2026): the third backup's explicit row - "Timeout #2 by SMU." / "Two minute timeout."
+        if i in named_of:
+            votes["named"] = named_of[i]
 
         verdict = why = None
-        backups = [k for k in ("counters", "source") if k in votes]
+        backups = [k for k in ("counters", "source", "named") if k in votes]
         if backups:
             tally = {}
             for k, v in votes.items():
@@ -2504,12 +2549,11 @@ def _classify_timeouts(entries, home_name, away_name, league, game_date="", cbs_
             top = sorted(tally.items(), key=lambda kv: -len(kv[1]))
             if len(top) == 1 or len(top[0][1]) > len(top[1][1]):
                 verdict, voters = top[0]
-            elif "counters" in votes:                   # a tie: the counters, then the label
-                verdict, voters = votes["counters"], tally[votes["counters"]]
-            else:
-                verdict, voters = votes["source"], tally[votes["source"]]
-            names = {"crew": "the feed", "counters": "backup counters", "source": "backup source"}
-            why = " + ".join(names[k] for k in ("crew", "counters", "source") if k in voters)
+            else:                                       # an even split: the named row, then the counters, then the label
+                _pick = next(k for k in _NAMED_TIE_ORDER if k in votes)
+                verdict, voters = votes[_pick], tally[votes[_pick]]
+            names = {"crew": "the feed", "counters": "backup counters", "source": "backup source", "named": "third backup"}
+            why = " + ".join(names[k] for k in ("crew", "counters", "source", "named") if k in voters)
             if verdict == "officials" and voters == ["counters"] and len(votes) == 1:
                 why = "backup counters (no timeout charged)"
         if verdict is None:
@@ -2655,6 +2699,13 @@ ADD_MISSING_TIMEOUTS = False     # OFF - MEASURED Oct 24 2026 (Sep 12 + Sep 19 c
                                  # charged four. Counters + NCAA label agreeing on a crew-missed timeout: 4 of 134 games, all OT 0:00.
                                  # A crew-missed team timeout in regulation is too rare, and the counters too noisy, to add from.
 MISSING_TIMEOUT_NOTE = "Auto-added timeout (backup counters) - check"
+ADD_NAMED_TIMEOUTS = False       # OFF - MEASURED Oct 25 2026 (measure_fox_timeouts.py, 785 games): the third backup names 184 team
+                                 # timeouts the crew never typed. The secondary backup's label confirms 64, names the OTHER team 27,
+                                 # says officials 20, has no label 73. With the counters agreeing too (84 rows): label confirms 28,
+                                 # contradicts 30. No witness pattern gets a crew-missed timeout right more than about half the
+                                 # time, and a wrong added board is worse than a missing one - so no source adds rows yet. The
+                                 # code stays, keyed nmto:, for the day a better witness turns up.
+NAMED_TIMEOUT_NOTE = "Auto-added timeout (third backup) - check"
 
 
 def _add_missing_backup_timeouts(entries, home_name, away_name, cbs_doc):
@@ -2677,6 +2728,33 @@ def _add_missing_backup_timeouts(entries, home_name, away_name, cbs_doc):
     drops = _cbs_timeout_drops(cbs_doc)
     if not drops:
         return 0, []
+    return _add_timeout_rows(entries, home_name, away_name, drops, "cbsto", "backup counters", MISSING_TIMEOUT_NOTE,
+                             "backup counters charge a timeout here, the feed has none",
+                             claimed_fn=lambda rq: {id(d) for d in _assign_cbs_drops(rq, drops).values()},
+                             before=_CBS_TO_BEFORE, after=_CBS_TO_AFTER)
+
+
+def _add_missing_named_timeouts(entries, home_name, away_name, named):
+    """Add the team timeouts the third backup prints as a row ("Timeout #1 by SMU.") that the stat crew never typed.
+    Returns (count, examples). The counters version above was measured too noisy to add from (Oct 24 2026); a named
+    row is an explicit statement, not an inferred drop. Same placement and shape as the counters' adds; keyed
+    nmto:<q>:<secs>:<side>. A typed stoppage of any kind within NAMED_TIMEOUT_TOLERANCE is that stoppage - never a
+    second row. Never raises."""
+    if not ADD_NAMED_TIMEOUTS or not named:
+        return 0, []
+    triggers = [{"q": r.get("quarter"), "secs": r.get("secs"), "side": r.get("charged")} for r in named
+                if r.get("kind") == "team" and r.get("charged") in ("home", "away")
+                and r.get("secs") is not None and r.get("quarter")]
+    if not triggers:
+        return 0, []
+    return _add_timeout_rows(entries, home_name, away_name, triggers, "nmto", "third backup", NAMED_TIMEOUT_NOTE,
+                             "the third backup lists a team timeout here, the feed has none",
+                             before=NAMED_TIMEOUT_TOLERANCE, after=NAMED_TIMEOUT_TOLERANCE)
+
+
+def _add_timeout_rows(entries, home_name, away_name, triggers, key_prefix, label, note, why, claimed_fn=None,
+                      before=60, after=30):
+    """Insert one timeout row per unclaimed trigger {q, secs, side}. See _add_missing_backup_timeouts for the rule."""
 
     def _is_to(e):
         return (str(e.get("home_time_out")) == "Yes" or str(e.get("away_time_out")) == "Yes"
@@ -2696,18 +2774,18 @@ def _add_missing_backup_timeouts(entries, home_name, away_name, cbs_doc):
 
     rows = [(i, e) for i, e in enumerate(entries) if _is_to(e) and e.get("ncaa_status") != "superseded"]
     rq = [(i, _q(e), _row_secs(e), _timeout_row_side(e, home_name, away_name)) for i, e in rows]
-    claimed = {id(d) for d in _assign_cbs_drops(rq, drops).values()}
+    claimed = claimed_fn(rq) if claimed_fn else set()
     have = {str(e.get("_forced_key") or e.get("entry_key") or "") for e in entries}
     adds = []
-    for d in drops:
+    for d in triggers:
         if id(d) in claimed:
             continue
         q, secs, side = d["q"], d["secs"], d["side"]
-        key = f"cbsto:{q}:{secs}:{side}"
+        key = f"{key_prefix}:{q}:{secs}:{side}"
         if key in have:
             continue
         # a typed stoppage of any kind in the window is this stoppage, whatever the vote called it - never a second row
-        if any(_rq == q and _rs is not None and -_CBS_TO_AFTER <= _rs - secs <= _CBS_TO_BEFORE
+        if any(_rq == q and _rs is not None and -after <= _rs - secs <= before
                for _i, _rq, _rs, _side in rq):
             continue
         # the play the counter dropped on: the first snap in that quarter at or below the drop's clock
@@ -2748,16 +2826,15 @@ def _add_missing_backup_timeouts(entries, home_name, away_name, cbs_doc):
             "espn_seq": None,
             "_forced_key": key,
             "ncaa_status": "added",
-            "ncaa_changes": [{"field": "row", "old": "", "new": "added",
-                              "why": "backup counters charge a timeout here, the feed has none"}],
-            "qc_issue": MISSING_TIMEOUT_NOTE,
+            "ncaa_changes": [{"field": "row", "old": "", "new": "added", "why": why}],
+            "qc_issue": note,
         }))
     examples = []
     for pos, row in sorted(adds, key=lambda x: x[0], reverse=True):
         entries.insert(pos, row)
         if len(examples) < 5:
-            examples.append("Q%s %s timeout added for %s (backup counters, not in the feed)"
-                            % (row["quarter"], row["clock"], home_name if row["home_time_out"] == "Yes" else away_name))
+            examples.append("Q%s %s timeout added for %s (%s, not in the feed)"
+                            % (row["quarter"], row["clock"], home_name if row["home_time_out"] == "Yes" else away_name, label))
     return len(adds), list(reversed(examples))
 
 
@@ -3034,6 +3111,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     # and a team timeout identically, so without this every stoppage is charged
     # and teams sit at zero by the second quarter.
     to_changed, to_examples, to_unresolved = 0, [], []
+    _fox_note = ""                               # what the third backup gave the timeout vote (qc_summary)
     # Kickoff date, used to pin the game in the backup source's scoreboard. It is
     # ESPN's UTC stamp, so a late kickoff reads as the next day - the resolver
     # retries on team names alone when the date finds nothing.
@@ -3053,8 +3131,28 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                 entry_fixes_extra = []
         else:
             entry_fixes_extra = []
+        # Third backup's named timeout rows (Oct 25 2026). Resolved by date + ESPN's names; never raises, never
+        # blocks longer than one 12 s call (cached 20 s, so one fetch serves two polls).
+        _named = None
+        _fox_note = ""
+        if league == "cfb":
+            try:
+                import fox_live
+                if fox_live.enabled():
+                    _fx = fox_live.for_game(game_id, game_date, home_team_name, away_team_name,
+                                            home_team_abbrev, away_team_abbrev)
+                    if _fx.get("available"):
+                        _named = _fx.get("timeouts") or []
+                        _fox_note = f"{len(_named)} named rows (event {_fx.get('fox_id')})"
+                    else:
+                        _fox_note = str(_fx.get("note") or "not available")
+                else:
+                    _fox_note = "disabled"
+            except Exception as _e:
+                _fox_note = f"{type(_e).__name__}: {_e}"
+                print(f"WARNING: third backup timeouts failed for {game_id}: {_fox_note}", flush=True)
         to_changed, to_examples, to_unresolved = _classify_timeouts(
-            entries, capp_home, capp_away, league, game_date, cbs_doc=_cbs_doc)
+            entries, capp_home, capp_away, league, game_date, cbs_doc=_cbs_doc, named=_named)
         to_examples = list(entry_fixes_extra) + list(to_examples)
         # A team timeout the crew never typed (SMU Q3 4:53, Oct 24 2026). Rows are inserted, so the keys are assigned
         # again - _assign_entry_keys is deterministic, every existing key comes out the same.
@@ -3066,6 +3164,13 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                 to_unresolved = [_k for _k, _r in enumerate(entries) if any(_r is _u for _u in _unres_rows)]
                 to_examples = list(to_examples) + list(_add_examples)
                 print(f"[timeouts] {game_id}: {_add_n} timeout(s) added from the backup counters", flush=True)
+            _unres_rows = [entries[_i] for _i in to_unresolved]
+            _nadd_n, _nadd_examples = _add_missing_named_timeouts(entries, capp_home, capp_away, _named)
+            if _nadd_n:
+                _assign_entry_keys(entries)
+                to_unresolved = [_k for _k, _r in enumerate(entries) if any(_r is _u for _u in _unres_rows)]
+                to_examples = list(_nadd_examples) + list(to_examples)      # a NEW row is the thing worth reading first
+                print(f"[timeouts] {game_id}: {_nadd_n} timeout(s) added from the third backup", flush=True)
     except Exception as e:
         print(f"WARNING: timeout classify failed for {game_id}: {e}", flush=True)
 
@@ -3076,7 +3181,9 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     for _i in to_unresolved:
         qc_flags.setdefault(_i, TIMEOUT_UNVERIFIED_NOTE)
     for i, entry in enumerate(entries):
-        entry["qc_issue"] = qc_flags.get(i, "")
+        # a row a rule ADDED carries its own note (which backup it came from); a flag on the row beats it, nothing else does
+        _own_note = str(entry.get("qc_issue") or "") if entry.get("ncaa_status") == "added" else ""
+        entry["qc_issue"] = qc_flags.get(i, "") or _own_note
         if entry.get("cbs_tail"):
             import cbs_tail as _ct
             entry["qc_issue"] = _ct.NOTE                         # a tail row's note is always "backup source"
@@ -3144,6 +3251,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
             # {quarter: {rows, issues, share}} - what SBENTRY's end-of-quarter backup prompt reads (see above).
             "quarter_issues": quarter_issues,
             "cbs_tail_rows": cbs_tail_added,
+            "third_backup_timeouts": _fox_note,
             # True only when CBS has TAKEN OVER (not a hole filled): the coach app paints those rows
             # white and raises its one-time "Now using backup source" alert instead of red.
             "backup_primary": cbs_backup_primary,

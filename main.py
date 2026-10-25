@@ -377,7 +377,7 @@ def _cache_inventory(sizes: bool) -> dict:
                  "_reset_last_sent", "_pb_reset_last_sent", "_TEAM_LOGO_NUMBERS"],
         "espn_fetcher": ["_games_cache", "_plays_cache", "_active_games", "_historical_games_cache", "_feed_health",
                          "_feed_alert_state", "_replay_summaries", "_team_list_cache", "_schedule_cache"],
-        "ncaa_live": ["_cache"], "cbs_live": ["_cache", "_tables"], "cfbd_live": ["_cache"],
+        "ncaa_live": ["_cache"], "cbs_live": ["_cache", "_tables"], "cfbd_live": ["_cache"], "fox_live": ["_cache"],
         "withdrawn_memory": ["_GAMES"], "gameday_board": ["_sb_cache", "_cbs_cache"], "primary_backup": ["_last"],
     }
     out = {}
@@ -1270,6 +1270,25 @@ def ncaa_timeouts_for_game(
         return out
     except Exception as e:
         print(f"WARNING: ncaa_timeouts_for_game failed {home}/{away}: {e}", flush=True)
+        return {"available": False, "timeouts": [], "note": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/fox/timeouts", dependencies=[Depends(verify_api_key)])
+def fox_timeouts_for_game(
+    date: str = Query(..., description="kickoff, ESPN's UTC stamp"),
+    home: str = Query(...),
+    away: str = Query(...),
+    home_abbrev: str = Query(""),
+    away_abbrev: str = Query(""),
+    game_id: str = Query(""),
+):
+    """Third backup's named timeout rows for a game (Oct 25 2026) - what the timeout vote reads. Diagnostics: the
+    coach app never calls this; the fetcher reads fox_live directly."""
+    try:
+        import fox_live
+        return fox_live.for_game(game_id, date, home, away, home_abbrev, away_abbrev)
+    except Exception as e:
+        print(f"WARNING: fox_timeouts_for_game failed {home}/{away}: {e}", flush=True)
         return {"available": False, "timeouts": [], "note": f"{type(e).__name__}: {e}"}
 
 
