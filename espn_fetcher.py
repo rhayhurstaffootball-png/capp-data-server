@@ -1249,6 +1249,157 @@ def _lower_spiked_scores(entries, events):
 # Scoring Gap Detection (period boundaries)
 # ============================================================
 
+# ============================================================
+# Second score voter: the backup source's trail (Oct 31 2026)
+# ============================================================
+
+_LEGAL_STEP = {1, 2, 3, 6}
+
+
+def _trail_is_legal(trail):
+    """[(h, a)] after each scoring play - one side moves by 1/2/3/6, the other stands still, never backwards."""
+    h = a = 0
+    for th, ta in trail:
+        dh, da = th - h, ta - a
+        if not ((dh in _LEGAL_STEP and da == 0) or (da in _LEGAL_STEP and dh == 0)):
+            return False
+        h, a = th, ta
+    return True
+
+
+def _espn_summary_disagrees(events, cbs_events):
+    """True when ESPN's own scoring summary cannot be trusted against the backup's: its steps are not legal scores, or
+    its last event posts a score the backup does not have at that moment (same quarter, within 75 s)."""
+    if not events:
+        return bool(cbs_events)
+    posted = [(h, a) for (_q, _s, h, a) in events]
+    if not _trail_is_legal(posted):
+        return True
+    q, s, h, a = events[-1]
+    near = [c for c in cbs_events if c[0] == q and abs(c[1] - s) <= 75]
+    if not near:
+        return False
+    c = min(near, key=lambda c: abs(c[1] - s))
+    return (c[2], c[3]) != (h, a)
+
+
+def _set_scores_from_backup(entries, doc, events):
+    """SET (raise or lower) the score on every row from the backup source's scoring trail - the one cbs_backup builds
+    from the play TYPES (TD 6, PAT 1, 2PT 2, FG 3, safety 2 to the defense), never from anyone's typed numbers.
+
+    THE CASE (SMU at Syracuse, Oct 31 2026, Roger live: "In the wall its 23-27 but in my feed its 23-21"): ESPN's
+    per-play score jumped 20-10 -> 20-21 on a TD + PAT, then never moved for a safety or a TD + 2PT, and only caught
+    up (23-27) on an ordinary rush a drive later. `_raise_lagging_scores` lifts rows to ESPN's scoring SUMMARY - and
+    the summary carried the same 20-21 on the safety and the TD. The authority was wrong. The backup's trail read
+    20-17 / 20-19 / 20-27 / 23-27 the whole time, and the server already had it (cbs_backup.scores_after).
+
+    Runs ONLY when `_espn_summary_disagrees` - a healthy game is never touched. Each backup scoring play is pinned
+    to ITS ESPN row (same quarter, nearest clock within 75 s, type-compatible: TD text / try row / FG row / safety
+    text) so the conventions hold: the scoring row keeps the score BEFORE its points, the try row shows the TD's six,
+    the kickoff shows the full total. A scoring play with no ESPN row is pinned to the first row after its clock.
+    Rows past the backup's newest play are left alone (live: the backup may be behind). One note per run of rows.
+    Aborts, touching nothing, when the backup's trail is not a legal sequence of scores or the pins come out of order.
+    """
+    fixes = {}
+    items = (doc or {}).get("items") if isinstance(doc, dict) else None
+    if not items or not (doc.get("available") or doc.get("ready")):
+        return fixes
+    scoring = [it for it in items if it.get("score_type") and it.get("score_home") is not None
+               and it.get("score_away") is not None and it.get("clock_secs") is not None]
+    if not scoring:
+        return fixes
+    try:
+        trail = [(int(it["score_home"]), int(it["score_away"])) for it in scoring]
+        cbs_events = [(int(it["quarter"]), int(it["clock_secs"]), h, a) for it, (h, a) in zip(scoring, trail)]
+    except (TypeError, ValueError):
+        return fixes
+    if not _trail_is_legal(trail) or not _espn_summary_disagrees(events, cbs_events):
+        return fixes
+
+    def _pos(e):
+        raw = str(e.get("clock") or "")
+        try:
+            q = int(e.get("quarter"))
+        except (TypeError, ValueError):
+            return None
+        if not re.match(r"^\d{1,2}:\d{2}$", raw):
+            return None
+        return (q, _clock_to_seconds(raw))
+
+    pos = [_pos(e) for e in entries]
+    _TD = re.compile(r"touchdown|for a td\b", re.I)
+    _TRY = re.compile(r"extra point|two.point|kick attempt|conversion", re.I)
+    _FG = re.compile(r"field goal", re.I)
+    _SAFE = re.compile(r"safety", re.I)
+
+    def _compatible(kind, e):
+        down = str(e.get("down") or "").strip().upper()
+        txt = str(e.get("play_text") or "")
+        if kind == "Touchdown":
+            return down not in ("EP", "2PT", "FG", "KO") and bool(_TD.search(txt))
+        if kind in ("PointAfterTouchdown", "TwoPointConversion"):
+            return down in ("EP", "2PT") or bool(_TRY.search(txt))
+        if kind == "FieldGoal":
+            return down == "FG" or (bool(_FG.search(txt)) and "no good" not in txt.lower())
+        if kind == "Safety":
+            return bool(_SAFE.search(txt))
+        return False
+
+    used = set()
+    anchors = []                                   # (row index, after_home, after_away)
+    for it, (q, s, h, a) in zip(scoring, cbs_events):
+        best = None
+        for i, p in enumerate(pos):
+            if p is None or i in used or p[0] != q or abs(p[1] - s) > 75:
+                continue
+            if _compatible(it.get("score_type"), entries[i]):
+                d = abs(p[1] - s)
+                if best is None or d < best[0]:
+                    best = (d, i)
+        if best is not None:
+            used.add(best[1])
+            anchors.append((best[1], h, a))
+            continue
+        later = [i for i, p in enumerate(pos) if p is not None and (p[0], -p[1]) > (q, -s)]
+        if later:
+            anchors.append((min(later) - 0.5, h, a))   # between rows: every row after the clock carries the points
+    if not anchors or any(anchors[k][0] >= anchors[k + 1][0] for k in range(len(anchors) - 1)):
+        return fixes
+
+    last = items[-1]
+    try:
+        cover = (int(last.get("quarter")), int(last.get("clock_secs")))
+    except (TypeError, ValueError):
+        cover = None
+    in_run = False
+    for i, e in enumerate(entries):
+        p = pos[i]
+        if p is None or (cover is not None and (p[0], -p[1]) > (cover[0], -cover[1])):
+            in_run = False
+            continue
+        eh = ea = 0
+        for (k, h, a) in anchors:
+            if k < i:
+                eh, ea = h, a
+            else:
+                break
+        ch, ca = e.get("home_score"), e.get("away_score")
+        if ch is None or ca is None:
+            in_run = False
+            continue
+        if (ch, ca) != (eh, ea):
+            was = f"{ch}-{ca}"
+            e["home_score"], e["away_score"] = eh, ea
+            if not in_run:
+                note = f"Auto-fixed: score {was} → {eh}-{ea} (backup source)"
+                fixes[i] = note
+                e["_score_fix_note"] = note
+                in_run = True
+        else:
+            in_run = False
+    return fixes
+
+
 def _fill_scoring_gaps(entries, home_display, away_display, events=None):
     """
     After scoreboard lag: detect period-opening KOs where the score
@@ -3177,6 +3328,19 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                 _cbs_doc = cbs_backup.for_game(_gd, home_team_id, away_team_id, game_id, league, cut=_cut)
         except Exception as e:
             print(f"WARNING: CBS document for replay failed for {game_id}: {type(e).__name__}: {e}", flush=True)
+
+    # SECOND SCORE VOTER (Oct 31 2026): when ESPN's scoring summary contradicts the backup source's trail, the rows take
+    # the backup's score - built from play types, not typed numbers. See _set_scores_from_backup.
+    if _cbs_doc is not None:
+        try:
+            _n_bs = 0
+            for _i, _msg in _set_scores_from_backup(entries, _cbs_doc, _events).items():
+                entry_fixes.setdefault(_i, _msg)
+                _n_bs += 1
+            if _n_bs:
+                print(f"[score] {game_id}: {_n_bs} run(s) of rows set to the backup source's score trail", flush=True)
+        except Exception as e:
+            print(f"WARNING: backup score pass failed for {game_id}: {type(e).__name__}: {e}", flush=True)
 
     # Stable identity per row, AFTER every step that adds rows. Live clients
     # take new plays by this key instead of by count - see _assign_entry_keys.
