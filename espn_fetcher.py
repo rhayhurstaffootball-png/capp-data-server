@@ -433,6 +433,11 @@ _initial_poll_done = threading.Event()
 # Populated by mark_game_active() from client traffic; the ONLY thing the
 # poller will ever fetch. Empty dict == zero ESPN calls.
 _active_games = {}
+# The last poll's ESPN drives per game (Nov 1 2026). Nebraska vs Washington Oct 31 (and Sep 19): ESPN's summary came
+# back with ZERO plays while the game was still "in"; the mapper rebuilt the game from that blank, the backup tail saw
+# no ESPN play to start after and filled the WHOLE game. Roger: "The Server should have still had the ESPN game data
+# before it was cleared. We should store it." game_id -> {"drives", "scoringPlays", "plays": count, "at": time}.
+_last_drives = {}
 _games_cache_at = 0.0   # when the on-demand scoreboard list was last refreshed
 
 # ============================================================
@@ -3121,26 +3126,44 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     capp_away = espn_name_to_capp_name(away_team_name, league) or away_team_name
 
     # Parse all plays
-    all_plays = []
-    seen_ids = set()
-    drives_data = data.get("drives", {})
+    def _parse_drives(drives_data):
+        plays, seen_ids = [], set()
+        for drive in drives_data.get("previous", []):
+            drive_team_id = str(drive.get("team", {}).get("id", ""))
+            for play in drive.get("plays", []):
+                parsed = _parse_play(play, drive_team_id, home_team_id, away_team_id)
+                if parsed and parsed["espn_play_id"] not in seen_ids:
+                    seen_ids.add(parsed["espn_play_id"])
+                    plays.append(parsed)
+        current_drive = drives_data.get("current", {})
+        if current_drive:
+            drive_team_id = str(current_drive.get("team", {}).get("id", ""))
+            for play in current_drive.get("plays", []):
+                parsed = _parse_play(play, drive_team_id, home_team_id, away_team_id)
+                if parsed and parsed["espn_play_id"] not in seen_ids:
+                    seen_ids.add(parsed["espn_play_id"])
+                    plays.append(parsed)
+        return plays
 
-    for drive in drives_data.get("previous", []):
-        drive_team_id = str(drive.get("team", {}).get("id", ""))
-        for play in drive.get("plays", []):
-            parsed = _parse_play(play, drive_team_id, home_team_id, away_team_id)
-            if parsed and parsed["espn_play_id"] not in seen_ids:
-                seen_ids.add(parsed["espn_play_id"])
-                all_plays.append(parsed)
+    all_plays = _parse_drives(data.get("drives", {}) or {})
 
-    current_drive = drives_data.get("current", {})
-    if current_drive:
-        drive_team_id = str(current_drive.get("team", {}).get("id", ""))
-        for play in current_drive.get("plays", []):
-            parsed = _parse_play(play, drive_team_id, home_team_id, away_team_id)
-            if parsed and parsed["espn_play_id"] not in seen_ids:
-                seen_ids.add(parsed["espn_play_id"])
-                all_plays.append(parsed)
+    # ESPN WENT BLANK: HOLD THE LAST POLL'S PLAYS (Nov 1 2026, see _last_drives). A live poll (summary is None - never
+    # a replay step, which may legitimately start at zero) whose summary parses to NO plays for a game this server
+    # already had plays for keeps the previous poll's drives and scoring summary; the header (status, clock, final)
+    # still comes from the new poll. The backup tail then starts after the last ESPN play the server really had,
+    # instead of after nothing. Nebraska Oct 31: would have kept Q1-Q3 as ESPN rows and let the backup carry Q4.
+    espn_blank_held = 0
+    if summary is None and not all_plays and game_status in ("in", "post"):
+        with _lock:
+            _held = _last_drives.get(game_id)
+        if _held and _held.get("plays"):
+            data = dict(data)
+            data["drives"] = _held["drives"]
+            data["scoringPlays"] = _held.get("scoringPlays") or []
+            all_plays = _parse_drives(data.get("drives", {}) or {})
+            espn_blank_held = len(all_plays)
+            print(f"[hold] {game_id}: ESPN summary came back with 0 plays while {game_status!r} - keeping the last "
+                  f"poll's {espn_blank_held} play(s)", flush=True)
 
     all_plays.sort(key=lambda p: p.get("sequence_number", 0))
 
@@ -3460,6 +3483,14 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     for _qi in quarter_issues.values():
         _qi["share"] = round(_qi["issues"] / _qi["rows"], 3) if _qi["rows"] else 0.0
 
+    # Remember this poll's ESPN drives for the hold above. Only a live poll that actually carried plays (a held poll
+    # re-stores the same drives it was handed, so the memory never shrinks to a blank).
+    if summary is None and all_plays:
+        with _lock:
+            _last_drives[game_id] = {"drives": data.get("drives", {}) or {},
+                                     "scoringPlays": data.get("scoringPlays") or [],
+                                     "plays": len(all_plays), "at": time.time()}
+
     return {
         "entries":    entries,
         "actual_home": actual_home,
@@ -3492,6 +3523,8 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
             # {quarter: {rows, issues, share}} - what SBENTRY's end-of-quarter backup prompt reads (see above).
             "quarter_issues": quarter_issues,
             "cbs_tail_rows": cbs_tail_added,
+            # >0 = ESPN's summary had no plays this poll and these many were kept from the last poll (see _last_drives)
+            "espn_blank_held": espn_blank_held,
             "third_backup_timeouts": _fox_note,
             # True only when CBS has TAKEN OVER (not a hole filled): the coach app paints those rows
             # white and raises its one-time "Now using backup source" alert instead of red.
@@ -3584,6 +3617,7 @@ def _evict_caches(now=None):
         ]
         for gid in stale:
             del _plays_cache[gid]
+            _last_drives.pop(gid, None)
         # Schedule cache entries are TTL-checked on read, but ones never
         # re-requested would otherwise sit in memory forever.
         _sched_cutoff = now - _SCHEDULE_CACHE_SECONDS
