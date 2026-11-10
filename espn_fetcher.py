@@ -1655,6 +1655,109 @@ def _qc_flag_entries(entries, home_name, away_name):
     return {idx: " · ".join(msgs) for idx, msgs in flags.items()}
 
 
+def _kickoff_team_after_score(entries, home_name, away_name):
+    """The kicking team on a kickoff that follows a score (Roger, Nov 10 2026: "The team that scores is always KO and the
+    team that was on Defense is KOR").
+
+    A kickoff row's `possession` is the kicking team - the client labels that team KO and the other KOR. map_espn_play
+    takes it as "not the team ESPN files the kick under", and ESPN files an onside kick the kicking team recovers, or a
+    return the receivers lose, under the KICKING team's drive - so those rows named the receivers as the kickers.
+    MEASURED Oct 17 2026 (107 games): 880 kickoffs after a score, 862 already named the scorer.
+
+    Here: after a touchdown or field goal the scoring team kicks; after a safety the team that gave it up kicks. Only
+    inside one half - the opening and second-half kickoffs are left exactly as they were. Returns [(index, old, new)].
+    """
+    def _half(q):
+        q = str(q)
+        return 1 if q in ("1", "2") else 2 if q in ("3", "4") else 0
+
+    def _n(v):
+        try:
+            return int(float(str(v)))
+        except (TypeError, ValueError):
+            return 0
+
+    changed = []
+    kicks, wanted = [], {}  # every kickoff row; the rows whose kicking team should change -> the new team
+    kicker, half = None, None
+    tried = None           # the team on the last extra point / two-point try / field goal row
+    safety = False
+    top_h = top_a = None
+    for i, e in enumerate(entries):
+        hf = _half(e.get("quarter"))
+        new_half = hf != half
+        if new_half:
+            half, kicker, tried, safety = hf, None, None, False   # a score before the break does not decide the next half's kick
+        if str(e.get("down") or "") in ("EP", "2PT", "FG") and e.get("possession") in (home_name, away_name):
+            tried = e.get("possession")
+        h, a = _n(e.get("home_score")), _n(e.get("away_score"))
+        if top_h is None:
+            top_h, top_a = h, a
+        dh, da = h - top_h, a - top_a
+        top_h, top_a = max(top_h, h), max(top_a, a)
+        # A scoring row carries the score from BEFORE it, so the rise shows on the next row. On the first row of a half
+        # that rise belongs to the last play before the break (a field goal as the half ends) - not a reason to kick.
+        if (dh > 0) != (da > 0) and not new_half:
+            rise = dh if dh > 0 else da
+            riser, other = (home_name, away_name) if dh > 0 else (away_name, home_name)
+            if rise >= 3:
+                kicker, safety = riser, False            # touchdown / field goal
+            elif rise == 2:
+                near = " ".join(str(x.get("play_text") or "") for x in entries[max(0, i - 3):i + 1]).lower()
+                if "safety" in near:
+                    kicker, safety = other, True         # the team that gave up the safety kicks
+                # otherwise a two-point try: the touchdown already set the kicker
+        # A kickoff row: typed as one (down KO), or one the client labels KO / KOR from its text (sbentry_qt._calc_odk
+        # uses this same test) - a return that ends in a fumble, a touchdown or a penalty is typed as something else.
+        down = str(e.get("down") or "")
+        pt = str(e.get("play_text") or "").lower()
+        # The kick must be what the row IS: the word comes before any run, pass, punt or field goal in the text. (A
+        # touchdown pass whose text ends "... kickoff" and a row typed kickoff whose text is a field goal attempt were
+        # both in the Nov 10 measurement - neither is a kickoff row.)
+        _k = _KO_WORD.search(pt)
+        _o = _KO_OTHER_PLAY.search(pt)
+        is_kick = (bool(_k) and (not _o or _k.start() < _o.start())
+                   and down not in ("OTO", "2PT", "EP", "FG") and not pt.startswith("timeout"))
+        if not is_kick:
+            continue
+        kicks.append(i)
+        # TWO signals must agree before a row is changed: the score column that rose AND the team on the try / field
+        # goal row. MEASURED Nov 10 2026 (901 games): on the score column alone 217 rows changed and some were wrong -
+        # Alabama State @ Southern (Aug 29) carries its scores in the other team's column, so every kickoff flipped the
+        # wrong way. When the two disagree the row is left exactly as it was.
+        if kicker and hf and e.get("possession") != kicker and (safety or tried == kicker):
+            wanted[i] = kicker
+        # A re-kick after a penalty is kicked by the same team; after a clean kick the next kickoff needs its own score
+        # (Missouri State, Sep 12 2026: a kickoff typed ABOVE its touchdown took the previous score's team).
+        if "penalty" not in pt and "no play" not in pt:
+            kicker, safety = None, False
+
+    # Third signal: the kicker's own name. A player who kicks off for one team on the rows NOT being changed does not
+    # kick for the other team on this one (3 wrong changes in 901 games before this guard, all in jumbled sequences).
+    votes = {}
+    for i in kicks:
+        if i in wanted:
+            continue
+        m = _KO_KICKER.search(str(entries[i].get("play_text") or ""))
+        if m:
+            v = votes.setdefault(m.group(1).lower(), {})
+            v[entries[i].get("possession")] = v.get(entries[i].get("possession"), 0) + 1
+    for i in sorted(wanted):
+        e, new = entries[i], wanted[i]
+        m = _KO_KICKER.search(str(e.get("play_text") or ""))
+        v = votes.get(m.group(1).lower(), {}) if m else {}
+        if v.get(e.get("possession"), 0) > v.get(new, 0):
+            continue
+        changed.append((i, e.get("possession"), new))
+        e["possession"] = new
+    return changed
+
+
+_KO_WORD = re.compile(r"\bkicks off\b|\bkickoff\b")
+_KO_OTHER_PLAY = re.compile(r"\brush\b|\bpass\b|\bpunt\b|field goal|\bsacked\b|\bkneel\b")
+_KO_KICKER = re.compile(r"(#\d+\s+\S+(?:\s\S+)?)\s+(?:onside\s+)?kickoff", re.I)
+
+
 # ============================================================
 # Play Parsing
 # ============================================================
@@ -3437,6 +3540,14 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
                 print(f"[timeouts] {game_id}: {_nadd_n} timeout(s) added from the third backup", flush=True)
     except Exception as e:
         print(f"WARNING: timeout classify failed for {game_id}: {e}", flush=True)
+
+    # Kicking team on a kickoff after a score (Roger, Nov 10 2026). Last, so no earlier pass reads the changed value.
+    try:
+        _ko_fixed = _kickoff_team_after_score(entries, capp_home, capp_away)
+        if _ko_fixed:
+            print(f"[kickoff] {game_id}: kicking team set to the scoring team on {len(_ko_fixed)} kickoff(s)", flush=True)
+    except Exception as e:
+        print(f"WARNING: kickoff team pass failed for {game_id}: {e}", flush=True)
 
     # QC-flag remaining issues — operator sees these as red rows in CAPP
     qc_flags = _qc_flag_entries(entries, capp_home, capp_away)
