@@ -1656,8 +1656,11 @@ def _qc_flag_entries(entries, home_name, away_name):
 
 
 def _kickoff_team_after_score(entries, home_name, away_name):
-    """The kicking team on a kickoff that follows a score (Roger, Nov 10 2026: "The team that scores is always KO and the
-    team that was on Defense is KOR").
+    """The kicking team on every kickoff row (Roger, Nov 10 2026: "The team that scores is always KO and the team that
+    was on Defense is KOR" / "you should get info from our sources about who is kicking off").
+
+    Source order: (1) the feed's own start-of-play team on the row; (2) only when a row has none, the score rule
+    described below. Returns [(index, old, new, "feed" | "score")].
 
     A kickoff row's `possession` is the kicking team - the client labels that team KO and the other KOR. map_espn_play
     takes it as "not the team ESPN files the kick under", and ESPN files an onside kick the kicking team recovers, or a
@@ -1678,7 +1681,8 @@ def _kickoff_team_after_score(entries, home_name, away_name):
             return 0
 
     changed = []
-    kicks, wanted = [], {}  # every kickoff row; the rows whose kicking team should change -> the new team
+    kicks, wanted = [], {}  # every kickoff row; the rows whose kicking team should change -> the new team (score rule)
+    direct = {}             # the rows the feed itself names a different kicking team on -> that team
     kicker, half = None, None
     tried = None           # the team on the last extra point / two-point try / field goal row
     safety = False
@@ -1721,6 +1725,18 @@ def _kickoff_team_after_score(entries, home_name, away_name):
         if not is_kick:
             continue
         kicks.append(i)
+        # FIRST: the feed's own answer (Roger, Nov 10 2026: "you should get info from our sources about who is kicking
+        # off"). Every play carries the team that starts it with the ball; on a kickoff that is the kicking team -
+        # opening and second-half kickoffs included. MEASURED on 901 games / 9,677 kickoff plays: present on every one,
+        # and right on all 8,646 that could be checked against the kicker's own name (the old "not the drive team"
+        # reading was right on 8,528). The score rule below is only for a row with no such value (a backup-source row).
+        feed = e.get("_start_team")
+        if feed in (home_name, away_name):
+            if e.get("possession") != feed:
+                direct[i] = feed
+            if "penalty" not in pt and "no play" not in pt:
+                kicker, safety = None, False
+            continue
         # TWO signals must agree before a row is changed: the score column that rose AND the team on the try / field
         # goal row. MEASURED Nov 10 2026 (901 games): on the score column alone 217 rows changed and some were wrong -
         # Alabama State @ Southern (Aug 29) carries its scores in the other team's column, so every kickoff flipped the
@@ -1734,6 +1750,11 @@ def _kickoff_team_after_score(entries, home_name, away_name):
 
     # Third signal: the kicker's own name. A player who kicks off for one team on the rows NOT being changed does not
     # kick for the other team on this one (3 wrong changes in 901 games before this guard, all in jumbled sequences).
+    for i in sorted(direct):
+        changed.append((i, entries[i].get("possession"), direct[i], "feed"))
+        entries[i]["possession"] = direct[i]
+    for e in entries:
+        e.pop("_start_team", None)
     votes = {}
     for i in kicks:
         if i in wanted:
@@ -1748,7 +1769,7 @@ def _kickoff_team_after_score(entries, home_name, away_name):
         v = votes.get(m.group(1).lower(), {}) if m else {}
         if v.get(e.get("possession"), 0) > v.get(new, 0):
             continue
-        changed.append((i, e.get("possession"), new))
+        changed.append((i, e.get("possession"), new, "score"))
         e["possession"] = new
     return changed
 
@@ -2235,6 +2256,11 @@ def map_espn_play(play, home_team_id, away_team_id, home_team_display, away_team
         # (espn_seq, espn_play_id). Clients save it with the play so a reopened game keeps its order.
         "espn_seq": play.get("sequence_number"),
     }
+    # The team the feed says STARTS the play with the ball - on a kickoff, the kicking team. Read by
+    # _kickoff_team_after_score and removed there; never sent to a client.
+    _stid = str(play.get("start_team_id") or "")
+    if _stid and _stid in (str(home_team_id), str(away_team_id)):
+        entry["_start_team"] = home_team_display if _stid == str(home_team_id) else away_team_display
     results.append(entry)
 
     if pat and not is_kickoff and not is_field_goal and not is_extra_point and not is_two_point:
@@ -3545,7 +3571,7 @@ def _fetch_game_plays_mapped(game_id, league="cfb", summary=None):
     try:
         _ko_fixed = _kickoff_team_after_score(entries, capp_home, capp_away)
         if _ko_fixed:
-            print(f"[kickoff] {game_id}: kicking team set to the scoring team on {len(_ko_fixed)} kickoff(s)", flush=True)
+            print(f"[kickoff] {game_id}: kicking team corrected on {len(_ko_fixed)} kickoff(s)", flush=True)
     except Exception as e:
         print(f"WARNING: kickoff team pass failed for {game_id}: {e}", flush=True)
 
